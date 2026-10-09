@@ -1,0 +1,55 @@
+[Unit]
+Description=CLM v0.1-8B System One API
+Wants=network-online.target
+After=network-online.target clm-encoder.service
+Requires=clm-encoder.service
+ConditionPathExists=/srv/ai/models/clm-v0.1-8b/CLM_v0.1-8B.pt
+ConditionPathExists=/srv/ai/clm/venv/bin/clm-serve
+ConditionPathExists=/srv/ai/secrets/redqueen-adapters.env
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Slice=ai-inference.slice
+WorkingDirectory=/srv/ai/clm
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/srv/ai/secrets/redqueen-adapters.env
+ExecStart=/srv/ai/clm/venv/bin/clm-serve --port 8700 --emb-url http://127.0.0.1:8090/v1/embeddings --emb-model qwen3-8b --max-tokens 2048 --ckpt /srv/ai/models/clm-v0.1-8b/CLM_v0.1-8B.pt --device cpu --action-cache 512MiB --no-ui
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGINT
+KillMode=mixed
+
+CPUQuota=400%
+MemoryHigh=1G
+MemoryMax=2G
+TasksMax=256
+LimitNOFILE=8192
+UMask=0077
+
+NoNewPrivileges=true
+KeyringMode=private
+LockPersonality=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/ai/models/clm-v0.1-8b
+ReadOnlyPaths=/srv/ai/secrets/redqueen-adapters.env
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

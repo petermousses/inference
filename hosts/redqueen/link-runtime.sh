@@ -118,8 +118,8 @@ link_path "$host_root/archive/backup.sh" \
 link_path "$host_root/archive/passcommand.sh" \
   /srv/ai/bin/redqueen-archive-passcommand.sh file no
 
-for name in clef-flash.sha256 clef.sha256 embeddinggemma-2.sha256 \
-  jevk5-4b-v0.3.sha256 qwen3.8-27b.sha256 versions.env \
+for name in clef-flash.sha256 clef.sha256 clm-v0.1-8b.sha256 \
+  embeddinggemma-2.sha256 jevk5-4b-v0.3.sha256 qwen3.8-27b.sha256 versions.env \
   download-llama-models.sh; do
   replace=no
   [[ "$name" != download-llama-models.sh ]] || replace=yes
@@ -144,6 +144,8 @@ done
 
 for unit in \
   ai-inference.slice \
+  clm-api.service \
+  clm-encoder.service \
   comfyui-control.service \
   comfyui.service \
   jevk5-adapter.service \

@@ -215,7 +215,7 @@ download_embeddinggemma() {
   (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
 }
 
-download_large_clef_file() {
+download_large_model_file() {
   local model_root="$1"
   local repository="$2"
   local revision="$3"
@@ -234,7 +234,7 @@ download_large_clef_file() {
     }
     [[ "$(stat -c '%s' -- "${destination}")" == "${expected_size}" ]] && \
       printf '%s  %s\n' "${expected_sha256}" "${destination}" | sha256sum --check --status || {
-        printf 'existing Clef artifact has the wrong size or SHA-256; preserving it: %s\n' \
+        printf 'existing large model artifact has the wrong size or SHA-256; preserving it: %s\n' \
           "${destination}" >&2
         return 1
       }
@@ -305,7 +305,7 @@ download_large_clef_file() {
   done
 
   printf '%s  %s\n' "${expected_sha256}" "${partial}" | sha256sum --check --status || {
-    printf 'downloaded Clef artifact has the wrong SHA-256; preserving it: %s\n' \
+    printf 'downloaded large model artifact has the wrong SHA-256; preserving it: %s\n' \
       "${partial}" >&2
     return 1
   }
@@ -328,13 +328,13 @@ download_clef_flash() {
     return 1
   }
 
-  download_large_clef_file "${model_root}" ggml-org/Clef-Flash-GGUF "${gguf_revision}" \
+  download_large_model_file "${model_root}" ggml-org/Clef-Flash-GGUF "${gguf_revision}" \
     Clef-Flash-BF16.gguf 18164488352 \
     92ecea391fdf03b514dd43abc1ba9d62d984047092fed97d985b3e513e3a8be6
-  download_large_clef_file "${model_root}" ggml-org/Clef-Flash-GGUF "${gguf_revision}" \
+  download_large_model_file "${model_root}" ggml-org/Clef-Flash-GGUF "${gguf_revision}" \
     Clef-Flash-Q8_0.gguf 9657260192 \
     d7c352faf1bdd9ea24d0b9347e8eb1eb4bbadeff6c02383bf750215a74f2f1f1
-  download_large_clef_file "${model_root}" ggml-org/Clef-Flash-GGUF "${gguf_revision}" \
+  download_large_model_file "${model_root}" ggml-org/Clef-Flash-GGUF "${gguf_revision}" \
     Clef-Flash-Q4_K_M.gguf 6486448288 \
     fd3e90605e8103307dca37cb5a8cdb036267e2fe3cb2d908d80a8ceb9ec0638c
   download "${model_root}" "${gguf_base}/mmproj-Clef-Flash-Q8_0.gguf" \
@@ -371,7 +371,7 @@ download_clef() {
     return 1
   }
 
-  download_large_clef_file "${model_root}" ggml-org/Clef-GGUF "${gguf_revision}" \
+  download_large_model_file "${model_root}" ggml-org/Clef-GGUF "${gguf_revision}" \
     Clef-Q4_K_M.gguf 19232219200 \
     bd9b8ae24c5752a2bb5e2733d5168340d5f04457e02b8bf0d1bc9285ec3d4f61
   download "${model_root}" "${gguf_base}/mmproj-Clef-Q8_0.gguf" \
@@ -394,8 +394,57 @@ download_clef() {
   (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
 }
 
+download_clm() {
+  local model_root="${CLM_MODEL_ROOT:-/srv/ai/models/clm-v0.1-8b}"
+  local revision="e939398d4556fcd9400c76fa8c5a513202f42b0a"
+  local base="https://huggingface.co/Contrastive-LM/CLM-v0.1-8B/resolve/${revision}"
+  local encoder_revision="2473489dc243ccaffb4ce569c55bf1df66b2088f"
+  local encoder_base="https://huggingface.co/ggml-org/Qwen3-8B-GGUF/resolve/${encoder_revision}"
+
+  mkdir -p -- "${model_root}"
+  exec 4>"${model_root}/.download.lock"
+  flock -n 4 || {
+    printf 'another CLM download is already running\n' >&2
+    return 1
+  }
+
+  download "${model_root}" "${base}/CLM_v0.1-8B.pt" \
+    CLM_v0.1-8B.pt \
+    b2b4a8c9c2d39263eff78a351eb909a342ce9b3bf21a3f07c1d1bf15f1c4eda5
+  download "${model_root}" "${base}/LICENSE" LICENSE \
+    bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a
+  download_large_model_file "${model_root}" ggml-org/Qwen3-8B-GGUF \
+    "${encoder_revision}" Qwen3-8B-f16.gguf 16388043968 \
+    dbc8b6ba7073bf9543abfa30f33103170aba5c9ccda3d64944c7484b4839e2fd
+  download "${model_root}" "${encoder_base}/LICENSE" ENCODER_LICENSE \
+    bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a
+
+  install_metadata "${script_dir}/clm-v0.1-8b.sha256" \
+    "${model_root}/SHA256SUMS"
+  install_metadata "${script_dir}/metadata/clm-v0.1-8b/MODEL_CARD.md" \
+    "${model_root}/MODEL_CARD.md"
+  write_source_revision "${model_root}" \
+    'repository=Contrastive-LM/CLM-v0.1-8B' \
+    "revision=${revision}" \
+    'checkpoint=CLM_v0.1-8B.pt' \
+    'checkpoint_sha256=b2b4a8c9c2d39263eff78a351eb909a342ce9b3bf21a3f07c1d1bf15f1c4eda5' \
+    'package=contrastive-lm==0.1.0' \
+    'encoder_gguf_repository=ggml-org/Qwen3-8B-GGUF' \
+    "encoder_gguf_revision=${encoder_revision}" \
+    'encoder_gguf_file=Qwen3-8B-f16.gguf' \
+    'encoder_gguf_sha256=dbc8b6ba7073bf9543abfa30f33103170aba5c9ccda3d64944c7484b4839e2fd' \
+    'encoder_gguf_size=16388043968' \
+    'encoder_source_repository=Qwen/Qwen3-8B' \
+    'encoder_source_revision=b968826d9c46dd6066d109eabc6255188de91218' \
+    'encoder_model=qwen3-8b' \
+    'encoder_pooling=last-token' \
+    'encoder_max_tokens=2048'
+  (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
+}
+
 download_qwen
 download_jevk5
 download_embeddinggemma
 download_clef_flash
 download_clef
+download_clm

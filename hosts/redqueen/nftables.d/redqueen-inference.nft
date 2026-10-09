@@ -10,7 +10,9 @@ table inet redqueen_inference {
     policy accept
 
     ct state established,related accept
+    iifname "lo" accept
     ip daddr 10.9.20.242 ip saddr @clients_v4 tcp dport { 8081, 8190, 8191 } accept
+    tcp dport { 8090, 8700 } drop
     ip daddr 10.9.20.242 tcp dport { 8081, 8190, 8191 } drop
   }
 }
