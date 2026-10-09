@@ -1,0 +1,6 @@
+gguf_repository=ggml-org/gemma-4-26B-A4B-it-GGUF
+gguf_revision=bb4531cda34d1ea09d9814959ed4d5833cf2a4c8
+source_model_repository=google/gemma-4-26B-A4B-it
+source_model_revision=4d7ae4984b7db7de8f8457170b3f1a419ee76d52
+quantization=Q4_0; Q8_0 vision projector
+license=Apache-2.0

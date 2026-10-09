@@ -23,6 +23,11 @@ download() {
     printf 'verified existing %s\n' "${destination}"
     return
   fi
+  if [[ -L "${destination}" ]]; then
+    printf 'linked destination differs from the pinned artifact; preserving source link: %s\n' \
+      "${destination}" >&2
+    return 1
+  fi
 
   if [[ -f "${partial}" ]] && printf '%s  %s\n' "${expected_sha256}" "${partial}" | sha256sum --check --status; then
     mv -- "${partial}" "${destination}"
@@ -63,6 +68,41 @@ download() {
   printf 'downloaded and verified %s\n' "${destination}"
 }
 
+install_metadata() {
+  local source="$1"
+  local destination="$2"
+  if [[ -L "${destination}" ]]; then
+    cmp -s -- "${source}" "${destination}" || {
+      printf 'linked model metadata differs from its pinned source: %s\n' \
+        "${destination}" >&2
+      return 1
+    }
+    return 0
+  fi
+  install -m 0440 -- "${source}" "${destination}"
+}
+
+write_source_revision() {
+  local model_root="$1"
+  shift
+  local destination="${model_root}/SOURCE_REVISION"
+  local temporary
+  temporary="$(mktemp "${model_root}/.SOURCE_REVISION.XXXXXXXX")"
+  printf '%s\n' "$@" >"${temporary}"
+  chmod 0440 "${temporary}"
+  if [[ -L "${destination}" ]]; then
+    cmp -s -- "${temporary}" "${destination}" || {
+      rm -f -- "${temporary}"
+      printf 'linked source revision differs from pinned source metadata: %s\n' \
+        "${destination}" >&2
+      return 1
+    }
+    rm -- "${temporary}"
+  else
+    mv -- "${temporary}" "${destination}"
+  fi
+}
+
 download_qwen() {
   local model_root="${QWEN_MODEL_ROOT:-/srv/ai/models/qwen3.8-27b}"
   local gguf_revision="71bc7b627595dc8a91039addd9c791ae548d6747"
@@ -93,17 +133,12 @@ download_qwen() {
     GGUF_MODEL_CARD.md \
     4a1ddebc85fd59b14650bb04757dea42cfefa63b75173e15fd5bc919d2861adb
 
-  install -m 0440 "${script_dir}/qwen3.8-27b.sha256" "${model_root}/SHA256SUMS"
-  local source_revision_partial
-  source_revision_partial="$(mktemp "${model_root}/.SOURCE_REVISION.XXXXXX")"
-  printf '%s\n' \
+  install_metadata "${script_dir}/qwen3.8-27b.sha256" "${model_root}/SHA256SUMS"
+  write_source_revision "${model_root}" \
     'gguf_repository=ggml-org/Qwen3.8-27B-GGUF' \
     "gguf_revision=${gguf_revision}" \
     'source_repository=Qwen/Qwen3.8-27B' \
-    "source_revision=${source_revision}" \
-    >"${source_revision_partial}"
-  chmod 0440 "${source_revision_partial}"
-  mv -- "${source_revision_partial}" "${model_root}/SOURCE_REVISION"
+    "source_revision=${source_revision}"
   (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
 }
 
@@ -134,17 +169,12 @@ download_jevk5() {
     UPSTREAM_SHA256SUMS \
     ad21b6c0b7a21fb6cc6980495a91bb2a1c97078beacfc065d4f19e934d6d9422
 
-  install -m 0440 "${script_dir}/jevk5-4b-v0.3.sha256" "${model_root}/SHA256SUMS"
-  local source_revision_partial
-  source_revision_partial="$(mktemp "${model_root}/.SOURCE_REVISION.XXXXXX")"
-  printf '%s\n' \
+  install_metadata "${script_dir}/jevk5-4b-v0.3.sha256" "${model_root}/SHA256SUMS"
+  write_source_revision "${model_root}" \
     'gguf_repository=alibiserikbay/JevK5-GGUF' \
     "gguf_revision=${gguf_revision}" \
     'source_repository=allebee/jevk5' \
-    "source_revision=${source_revision}" \
-    >"${source_revision_partial}"
-  chmod 0440 "${source_revision_partial}"
-  mv -- "${source_revision_partial}" "${model_root}/SOURCE_REVISION"
+    "source_revision=${source_revision}"
   (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
 }
 
@@ -173,20 +203,15 @@ download_embeddinggemma() {
     printf 'the host Apache-2.0 license text is missing or changed\n' >&2
     return 1
   fi
-  install -m 0440 /usr/share/common-licenses/Apache-2.0 "${model_root}/LICENSE"
+  install_metadata /usr/share/common-licenses/Apache-2.0 "${model_root}/LICENSE"
 
-  install -m 0440 "${script_dir}/embeddinggemma-2.sha256" "${model_root}/SHA256SUMS"
-  local source_revision_partial
-  source_revision_partial="$(mktemp "${model_root}/.SOURCE_REVISION.XXXXXX")"
-  printf '%s\n' \
+  install_metadata "${script_dir}/embeddinggemma-2.sha256" "${model_root}/SHA256SUMS"
+  write_source_revision "${model_root}" \
     'gguf_repository=unsloth/embeddinggemma-2-GGUF' \
     "gguf_revision=${gguf_revision}" \
     'source_repository=google/embeddinggemma-2' \
     "source_revision=${source_revision}" \
-    'quantization=Q8_0' \
-    >"${source_revision_partial}"
-  chmod 0440 "${source_revision_partial}"
-  mv -- "${source_revision_partial}" "${model_root}/SOURCE_REVISION"
+    'quantization=Q8_0'
   (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
 }
 
@@ -322,18 +347,13 @@ download_clef_flash() {
   download "${model_root}" "${gguf_base}/README.md" MODEL_CARD.md \
     30b244b7a978fe38d7d859c049b9b229470de276ec51ba918f758fec2a79ba80
 
-  install -m 0440 "${script_dir}/clef-flash.sha256" "${model_root}/SHA256SUMS"
-  local source_revision_partial
-  source_revision_partial="$(mktemp "${model_root}/.SOURCE_REVISION.XXXXXX")"
-  printf '%s\n' \
+  install_metadata "${script_dir}/clef-flash.sha256" "${model_root}/SHA256SUMS"
+  write_source_revision "${model_root}" \
     'gguf_repository=ggml-org/Clef-Flash-GGUF' \
     "gguf_revision=${gguf_revision}" \
     'source_repository=Cloudflare/clef-flash' \
     "source_revision=${source_revision}" \
-    'precision=BF16, Q8_0, Q4_K_M' \
-    >"${source_revision_partial}"
-  chmod 0440 "${source_revision_partial}"
-  mv -- "${source_revision_partial}" "${model_root}/SOURCE_REVISION"
+    'precision=BF16, Q8_0, Q4_K_M'
   (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
 }
 
@@ -364,18 +384,13 @@ download_clef() {
   download "${model_root}" "${gguf_base}/README.md" MODEL_CARD.md \
     c3a5cc3e2092dd6dd6dd10bf8cd878b02c973333588a38ac22aefca1fbfe98f6
 
-  install -m 0440 "${script_dir}/clef.sha256" "${model_root}/SHA256SUMS"
-  local source_revision_partial
-  source_revision_partial="$(mktemp "${model_root}/.SOURCE_REVISION.XXXXXX")"
-  printf '%s\n' \
+  install_metadata "${script_dir}/clef.sha256" "${model_root}/SHA256SUMS"
+  write_source_revision "${model_root}" \
     'gguf_repository=ggml-org/Clef-GGUF' \
     "gguf_revision=${gguf_revision}" \
     'source_repository=Cloudflare/clef' \
     "source_revision=${source_revision}" \
-    'quantization=Q4_K_M' \
-    >"${source_revision_partial}"
-  chmod 0440 "${source_revision_partial}"
-  mv -- "${source_revision_partial}" "${model_root}/SOURCE_REVISION"
+    'quantization=Q4_K_M'
   (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
 }
 

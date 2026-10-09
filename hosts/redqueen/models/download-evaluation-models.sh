@@ -313,7 +313,17 @@ write_source_revision() {
 
   printf '%s\n' "$@" >"${temporary}"
   chmod 0440 "${temporary}"
-  mv -- "${temporary}" "${root}/SOURCE_REVISION"
+  if [[ -L "${root}/SOURCE_REVISION" ]]; then
+    cmp -s -- "${temporary}" "${root}/SOURCE_REVISION" || {
+      rm -- "${temporary}"
+      printf 'linked source revision differs from generated model metadata: %s\n' \
+        "${root}/SOURCE_REVISION" >&2
+      return 1
+    }
+    rm -- "${temporary}"
+  else
+    mv -- "${temporary}" "${root}/SOURCE_REVISION"
+  fi
 }
 
 finish_model() {
@@ -322,8 +332,17 @@ finish_model() {
   (
     cd -- "${root}"
     sha256sum LICENSE MODEL_CARD.md SOURCE_REVISION >>.SHA256SUMS.tmp
-    mv -- .SHA256SUMS.tmp SHA256SUMS
-    chmod 0440 SHA256SUMS
+    if [[ -L SHA256SUMS ]]; then
+      cmp -s -- .SHA256SUMS.tmp SHA256SUMS || {
+        printf 'linked checksum manifest differs from generated model metadata: %s/SHA256SUMS\n' \
+          "${root}" >&2
+        exit 1
+      }
+      rm -- .SHA256SUMS.tmp
+    else
+      mv -- .SHA256SUMS.tmp SHA256SUMS
+      chmod 0440 SHA256SUMS
+    fi
     sha256sum --check SHA256SUMS
   )
 }

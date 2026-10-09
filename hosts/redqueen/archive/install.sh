@@ -16,10 +16,6 @@ readonly ssh_key="${HOME}/.ssh/redqueen-nas-archive"
 readonly known_hosts="${HOME}/.ssh/redqueen-nas-archive.known_hosts"
 readonly user_unit_dir="${HOME}/.config/systemd/user"
 readonly env_target="${HOME}/.config/redqueen-archive.env"
-readonly unit_source="${host_root}/systemd/redqueen-archive.service"
-readonly timer_source="${host_root}/systemd/redqueen-archive.timer"
-readonly unit_target="${user_unit_dir}/redqueen-archive.service"
-readonly timer_target="${user_unit_dir}/redqueen-archive.timer"
 if [[ "$(id -u)" -eq 0 ]]; then
   printf 'run this installer as ai, not root\n' >&2
   exit 1
@@ -43,6 +39,7 @@ source "${release_file}"
 install -d -m 0755 -- "${target_bin}"
 install -d -m 0700 -- "${target_root}/secrets" "${target_root}/archive-state" \
   "${state_root}" "${HOME}/.ssh" "${user_unit_dir}" "${HOME}/.config"
+"${host_root}/link-runtime.sh"
 
 readonly temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/redqueen-archive-install.XXXXXXXX")"
 cleanup() {
@@ -129,12 +126,6 @@ if [[ -e "${env_target}" ]]; then
 else
   install -m 0600 -- "${expected_env}" "${env_target}"
 fi
-
-install -m 0755 -- "${source_root}/passcommand.sh" "${passcommand_target}"
-install -m 0755 -- "${source_root}/backup.sh" "${target_bin}/redqueen-archive-backup.sh"
-install -m 0644 -- "${unit_source}" "${unit_target}"
-install -m 0644 -- "${timer_source}" "${timer_target}"
-systemctl --user daemon-reload
 
 printf 'Borg %s installed and signature-verified; archive job installed but not enabled\n' \
   "${BORG_RELEASE}"

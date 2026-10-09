@@ -1,0 +1,6 @@
+gguf_repository=ggml-org/Qwen3.6-35B-A3B-GGUF
+gguf_revision=baec3ebee244827cda0f4557eafa8b28f7545fa6
+source_model_repository=Qwen/Qwen3.6-35B-A3B
+source_model_revision=995ad96eacd98c81ed38be0c5b274b04031597b0
+quantization=Q4_K_M; all experts retained in the GGUF
+license=Apache-2.0

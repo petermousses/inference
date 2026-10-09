@@ -1,0 +1,4 @@
+gguf_repository=ggml-org/Qwen3.8-27B-GGUF
+gguf_revision=71bc7b627595dc8a91039addd9c791ae548d6747
+source_repository=Qwen/Qwen3.8-27B
+source_revision=1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0

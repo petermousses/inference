@@ -1,0 +1,11 @@
+repository=huihui-ai/Huihui-GLM-5.3-Flash-abliterated-GGUF
+revision=06f66b01ee15bc22b326f733fcc1518ec472e373
+base_model_repository=zai-org/GLM-5.3-Flash
+base_model_revision=eb9eb208eb0d988989d07a6a12d0fdeb5f52574a
+license_repository=zai-org/GLM-5.3-Flash
+license_file=LICENSE
+license=MIT (requested repository metadata)
+variant=abliterated
+quantization=UD-IQ1_S
+weights_bytes=93087245408
+retrieved_utc=2026-10-05

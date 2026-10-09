@@ -1,0 +1,5 @@
+gguf_repository=ggml-org/Clef-Flash-GGUF
+gguf_revision=4a192915ef971886004b5b13294f2b4c7a7fc39d
+source_repository=Cloudflare/clef-flash
+source_revision=17f0b0ad64efb65d273590632833508766b2aae6
+precision=BF16, Q8_0, Q4_K_M

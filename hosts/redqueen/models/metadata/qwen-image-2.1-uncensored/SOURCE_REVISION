@@ -1,0 +1,8 @@
+gguf_repository=abenzerps/Qwen-Image-2.1-Uncensored-GGUF
+gguf_revision=6b34e59458d3eb7ba6a6f86a116aed5253dc02c3
+source_model_repository=Qwen/Qwen-Image-2.1
+source_model_revision=b3179ad355be050328e483a9dfdd9e60cd62adfa
+text_encoder=Qwen3-VL-8B INT8 ConvRot
+diffusion_model=Q4_K_M; VAE=BF16
+license=Qwen Research License; non-commercial research/evaluation only
+safety=the artifact has no built-in safety checker or content filter

@@ -1,0 +1,5 @@
+gguf_repository=ggml-org/Clef-GGUF
+gguf_revision=63840a1a68cb7084c88610cffc328509356b04cb
+source_repository=Cloudflare/clef
+source_revision=2f3de3dd85f379784083b0814d997ab627200f0c
+quantization=Q4_K_M

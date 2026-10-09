@@ -1,0 +1,5 @@
+gguf_repository=unsloth/embeddinggemma-2-GGUF
+gguf_revision=ba3888272494be64ed88c9eb536ddc61a1be73d5
+source_repository=google/embeddinggemma-2
+source_revision=914f7f89142e33e77833254d9c9b90c3cef7303b
+quantization=Q8_0

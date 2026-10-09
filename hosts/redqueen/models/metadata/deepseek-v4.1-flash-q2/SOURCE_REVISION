@@ -1,0 +1,7 @@
+repository=antirez/deepseek-v4.1-flash-gguf
+revision=dd8a266f7145edc19e2334b46e19b6821f221dc7
+source_model_repository=deepseek-ai/DeepSeek-V4.1-Flash
+source_model_revision=df42c109f1defefcbfcedbe7d905718a12266e40
+quantization=Q2 hybrid; 188.83 GiB FP8 Engram tables included
+runtime_target=DwarfStar experimental DeepSeek-V4.1 path; not stock llama.cpp
+license=MIT

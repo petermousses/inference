@@ -6,6 +6,8 @@ readonly revision=d81235049384534c167caea52b85a694f6103d14
 readonly version=0.6.0
 readonly target="/srv/ai/runtimes/llama.cpp-v${version}-d812350"
 readonly repository=https://github.com/ggml-org/llama.cpp.git
+readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly runtime_metadata="${script_dir}/runtime-manifests/llama.cpp-v${version}-d812350"
 
 if [[ "$(id -u)" -eq 0 ]]; then
   printf 'run this as ai, not root\n' >&2
@@ -119,9 +121,8 @@ readonly install_rpath='$ORIGIN/../lib;/opt/rocm/lib;/opt/rocm/core-7.14/lib'
 install -d -m 0755 -- /srv/ai/runtimes
 stage="$(mktemp -d /srv/ai/runtimes/.llama.cpp-v${version}-d812350.XXXXXXXX)"
 "${cmake_bin}" --install "${build_root}" --prefix "${stage}"
-printf '%s\n' "${revision}" >"${stage}/SOURCE_REVISION"
-printf '%s\n' 'GGML_HIP=ON AMDGPU_TARGETS=gfx1151' >"${stage}/BUILD_OPTIONS"
-chmod 0644 "${stage}/SOURCE_REVISION" "${stage}/BUILD_OPTIONS"
+ln -s -- "${runtime_metadata}/SOURCE_REVISION" "${stage}/SOURCE_REVISION"
+ln -s -- "${runtime_metadata}/BUILD_OPTIONS" "${stage}/BUILD_OPTIONS"
 runtime_version="$("${stage}/bin/llama-server" --version 2>&1)"
 if [[ "${runtime_version}" != *"commit ${revision:0:7}"* ]]; then
   printf 'built llama-server does not report the pinned commit\n' >&2

@@ -35,6 +35,11 @@ download() {
     printf 'verified existing %s\n' "${relative_path}"
     return
   fi
+  if [[ -L "${destination}" ]]; then
+    printf 'linked destination differs from the pinned artifact; preserving source link: %s\n' \
+      "${destination}" >&2
+    return 1
+  fi
 
   if [[ -f "${partial}" ]] && printf '%s  %s\n' "${expected_sha256}" "${partial}" | sha256sum --check --status; then
     mv -- "${partial}" "${destination}"
@@ -75,6 +80,20 @@ download() {
   printf 'downloaded and verified %s\n' "${relative_path}"
 }
 
+install_metadata() {
+  local source="$1"
+  local destination="$2"
+  if [[ -L "${destination}" ]]; then
+    cmp -s -- "${source}" "${destination}" || {
+      printf 'linked model metadata differs from its pinned source: %s\n' \
+        "${destination}" >&2
+      return 1
+    }
+    return 0
+  fi
+  install -m 0440 -- "${source}" "${destination}"
+}
+
 readonly weights_base="https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/${weight_revision}"
 download "${weights_base}/diffusion_models/qwen_image_2.1_bf16.safetensors" \
   diffusion_models/qwen_image_2.1_bf16.safetensors \
@@ -103,7 +122,7 @@ download "${weights_base}/README.md" \
   COMFYUI_MODEL_CARD.md \
   2bc1a021663ae28110cd0b18a9486aa87161efb6a4550c3ecca3e1b84619052e
 
-install -m 0440 "${script_dir}/qwen-image-2.1.sha256" "${model_root}/SHA256SUMS"
+install_metadata "${script_dir}/qwen-image-2.1.sha256" "${model_root}/SHA256SUMS"
 source_revision_partial="$(mktemp "${model_root}/.SOURCE_REVISION.XXXXXX")"
 readonly source_revision_partial
 printf '%s\n' \
@@ -113,7 +132,16 @@ printf '%s\n' \
   "license_revision=${license_revision}" \
   >"${source_revision_partial}"
 chmod 0440 "${source_revision_partial}"
-mv -- "${source_revision_partial}" "${model_root}/SOURCE_REVISION"
+if [[ -L "${model_root}/SOURCE_REVISION" ]]; then
+  cmp -s -- "${source_revision_partial}" "${model_root}/SOURCE_REVISION" || {
+    rm -- "${source_revision_partial}"
+    printf 'linked source revision differs from pinned source metadata; preserving it\n' >&2
+    exit 1
+  }
+  rm -- "${source_revision_partial}"
+else
+  mv -- "${source_revision_partial}" "${model_root}/SOURCE_REVISION"
+fi
 
 (
   cd -- "${model_root}"
