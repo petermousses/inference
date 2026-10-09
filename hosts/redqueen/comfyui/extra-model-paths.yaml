@@ -1,0 +1,12 @@
+qwen_image_2_1:
+  base_path: /srv/ai/models/qwen-image-2.1
+  is_default: false
+  diffusion_models: diffusion_models
+  text_encoders: text_encoders
+  vae: vae
+qwen_image_2_1_uncensored:
+  base_path: /srv/ai/models/qwen-image-2.1-uncensored
+  is_default: false
+  diffusion_models: diffusion_models
+  text_encoders: text_encoders
+  vae: vae

@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redqueen-adapters"
+version = "0.1.0"
+description = "Private OpenAI Images and Decisions plus TypeSafe-compatible JevK5 adapter"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+dependencies = ["aiohttp==3.14.3", "Pillow==11.1.0"]
+
+[tool.setuptools.packages.find]
+include = ["redqueen_adapters*"]

@@ -1,0 +1,39 @@
+[Unit]
+Description=Restrict redqueen inference listeners to cluster sources
+Documentation=man:nft(8)
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target
+ConditionPathExists=/etc/nftables.d/redqueen-inference.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/nft delete table inet redqueen_inference
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/redqueen-inference.nft
+ExecReload=-/usr/sbin/nft delete table inet redqueen_inference
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/redqueen-inference.nft
+ExecStop=-/usr/sbin/nft delete table inet redqueen_inference
+
+CapabilityBoundingSet=CAP_NET_ADMIN
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

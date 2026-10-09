@@ -1,0 +1,56 @@
+[Unit]
+Description=JevK5 and Cloudflare Clef System One adapter
+Wants=network-online.target
+After=network-online.target jevk5.service
+Requires=jevk5.service
+ConditionPathIsDirectory=/srv/ai/adapters/source/redqueen_adapters
+ConditionPathIsDirectory=/srv/ai/adapters/venv
+ConditionPathExists=/srv/ai/secrets/redqueen-adapters.env
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Slice=ai-inference.slice
+WorkingDirectory=/srv/ai/adapters/source
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/srv/ai/adapters/source
+EnvironmentFile=/srv/ai/secrets/redqueen-adapters.env
+ExecStart=/srv/ai/adapters/venv/bin/python -m redqueen_adapters.jev_api --host 10.9.20.242 --port 8191
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+KillSignal=SIGINT
+KillMode=mixed
+
+CPUQuota=400%
+MemoryHigh=512M
+MemoryMax=1G
+TasksMax=256
+LimitNOFILE=8192
+UMask=0077
+
+NoNewPrivileges=true
+KeyringMode=private
+LockPersonality=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/ai/adapters
+ReadOnlyPaths=/srv/ai/secrets/redqueen-adapters.env
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

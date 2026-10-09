@@ -1,0 +1,42 @@
+redqueen adapters
+
+The JevK5 GGUF readout in redqueen_adapters/jevk5_gguf.py is adapted from
+JevK5 v0.3.0 at commit 6c6522fe5462a05fdb82bceeb0e8c624c11f1517.
+The upstream NOTICE follows in full.
+
+JevK5
+Copyright 2026 the JevK5 authors (github.com/allebee, huggingface.co/alibiserikbay)
+
+This product includes software and model weights developed by others:
+
+- Qwen3.5-4B and Qwen3.5-9B (base weights) and Qwen3.6-27B (teacher), by the Qwen team, Apache
+  License 2.0.
+
+- GPT-6 Luna by OpenAI wrote and checked 14,138 of JevK5 v0.3's training questions, through
+  OpenAI's API; those outputs are subject to OpenAI's terms.
+
+- The decision prompt (system instruction and JSON payload of evidence, criterion and lettered
+  options) and the one-pass readout (softmax over the answer letters' next-token logits) are
+  adapted from SemIf by TheoLeeCJ (https://github.com/TheoLeeCJ/SemIf), MIT License:
+
+    Copyright (c) TheoLeeCJ
+    Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+    and associated documentation files (the "Software"), to deal in the Software without
+    restriction, including without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions: The above copyright
+    notice and this permission notice shall be included in all copies or substantial portions of
+    the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+- Training replay data, under their own licenses:
+  - v0.3, JevK5 and JevK5-9B (train splits only; no MMLU, MMLU-Pro, ANLI or NLI4CT): GSM8K (MIT),
+    WinoGrande (Apache-2.0), HellaSwag (MIT), When2Call (CC BY 4.0), HoVer (CC BY-SA 4.0, with
+    Wikipedia introductions, CC BY-SA), iSarcasmEval (MIT), ARC (CC BY-SA 4.0), CommonsenseQA (MIT),
+    CLINC150 (CC BY 3.0), Schema-Guided Dialogue (CC BY-SA 4.0), Amazon ESCI (Apache-2.0), RAGTruth
+    (MIT), ToolACE (Apache-2.0), WANLI (CC BY 4.0), AQuA-RAT (Apache-2.0), OpenBookQA (Apache-2.0),
+    Cosmos QA (CC BY 4.0), SWAG (MIT), BoolQ (CC BY-SA 3.0), MultiNLI (OANC / CC BY 3.0 / CC BY-SA
+    3.0 / MIT by genre), BANKING77 (CC BY 4.0), MASSIVE (CC BY 4.0), the New Yorker caption contest
+    (CC BY 4.0), QASC (CC BY 4.0), RuleTaker (Apache-2.0) and Glaive function calling v2
+    (Apache-2.0).
+  - v0.1 and v0.2: MMLU-Pro (MIT), WANLI (CC BY 4.0), MultiNLI, BoolQ (CC BY-SA 3.0), banking77
+    (CC BY 4.0), ARC (CC BY-SA 4.0) and CommonsenseQA (MIT).

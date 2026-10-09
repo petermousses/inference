@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily redqueen AI runtime archive
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=30min
+Persistent=true
+Unit=redqueen-archive.service
+
+[Install]
+WantedBy=timers.target

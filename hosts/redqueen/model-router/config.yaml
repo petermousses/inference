@@ -1,0 +1,300 @@
+healthCheckTimeout: 900
+startPort: 5800
+globalTTL: 300
+unloadTimeout: 120
+apiKeys:
+  - "${env.QWEN_API_KEY}"
+
+models:
+  qwen3.8-27b:
+    cmd: >-
+      /usr/bin/llama-server
+      --model /srv/ai/models/qwen3.8-27b/Qwen3.8-27B-Q4_K_M.gguf
+      --mmproj /srv/ai/models/qwen3.8-27b/mmproj-Qwen3.8-27B-Q8_0.gguf
+      --alias qwen3.8-27b
+      --ctx-size 65536
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+  gemma-4-e4b-it:
+    cmd: >-
+      /usr/bin/llama-server
+      --model /srv/ai/models/gemma-4-e4b-it/gemma-4-E4B-it-Q4_0.gguf
+      --mmproj /srv/ai/models/gemma-4-e4b-it/mmproj-gemma-4-E4B-it-Q8_0.gguf
+      --alias gemma-4-e4b-it
+      --ctx-size 32768
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+  gemma-4-12b-it:
+    cmd: >-
+      /usr/bin/llama-server
+      --model /srv/ai/models/gemma-4-12b-it/gemma-4-12B-it-Q4_0.gguf
+      --mmproj /srv/ai/models/gemma-4-12b-it/mmproj-gemma-4-12B-it-Q8_0.gguf
+      --alias gemma-4-12b-it
+      --ctx-size 32768
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+  gemma-4-26b-a4b-it:
+    cmd: >-
+      /usr/bin/llama-server
+      --model /srv/ai/models/gemma-4-26b-a4b-it/gemma-4-26B-A4B-it-Q4_0.gguf
+      --mmproj /srv/ai/models/gemma-4-26b-a4b-it/mmproj-gemma-4-26B-A4B-it-Q8_0.gguf
+      --alias gemma-4-26b-a4b-it
+      --ctx-size 32768
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+  qwen3.6-35b-a3b:
+    cmd: >-
+      /usr/bin/llama-server
+      --model /srv/ai/models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-Q4_K_M.gguf
+      --mmproj /srv/ai/models/qwen3.6-35b-a3b/mmproj-Qwen3.6-35B-A3B-Q8_0.gguf
+      --alias qwen3.6-35b-a3b
+      --ctx-size 32768
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+  glm-5.3-flash-abliterated:
+    cmd: >-
+      /srv/ai/model-router/bin/glm-5.3-flash-abliterated-launcher.sh
+      --model /srv/ai/models/huihui-glm-5.3-flash-abliterated-gguf/UD-IQ1_S/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf
+      --alias glm-5.3-flash-abliterated
+      --ctx-size 220000
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 38
+      --parallel 1
+      --batch-size 128
+      --ubatch-size 32
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --chat-template-kwargs '{"clear_thinking":true}'
+      --metrics
+      --slots
+      --no-ui
+      --threads 24
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 60
+    concurrencyLimit: 1
+
+  embeddinggemma-2:
+    cmd: >-
+      /srv/ai/runtimes/llama.cpp-b11457-5ad1c5d/bin/llama-server
+      --model /srv/ai/models/embeddinggemma-2/embeddinggemma-2-Q8_0.gguf
+      --alias embeddinggemma-2
+      --ctx-size 8192
+      --pooling mean
+      --embedding
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --metrics
+      --slots
+      --no-ui
+      --threads 16
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+  clef-flash-bf16:
+    cmd: >-
+      /srv/ai/runtimes/llama.cpp-b11457-5ad1c5d/bin/llama-server
+      --model /srv/ai/models/clef-flash/Clef-Flash-BF16.gguf
+      --mmproj /srv/ai/models/clef-flash/mmproj-Clef-Flash-Q8_0.gguf
+      --alias clef-flash-bf16
+      --ctx-size 65536
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+  clef-flash-q8:
+    cmd: >-
+      /srv/ai/runtimes/llama.cpp-b11457-5ad1c5d/bin/llama-server
+      --model /srv/ai/models/clef-flash/Clef-Flash-Q8_0.gguf
+      --mmproj /srv/ai/models/clef-flash/mmproj-Clef-Flash-Q8_0.gguf
+      --alias clef-flash-q8
+      --ctx-size 65536
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+  clef-flash-q4:
+    cmd: >-
+      /srv/ai/runtimes/llama.cpp-b11457-5ad1c5d/bin/llama-server
+      --model /srv/ai/models/clef-flash/Clef-Flash-Q4_K_M.gguf
+      --mmproj /srv/ai/models/clef-flash/mmproj-Clef-Flash-Q8_0.gguf
+      --alias clef-flash-q4
+      --ctx-size 65536
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+  clef-q4:
+    cmd: >-
+      /srv/ai/runtimes/llama.cpp-b11457-5ad1c5d/bin/llama-server
+      --model /srv/ai/models/clef/Clef-Q4_K_M.gguf
+      --mmproj /srv/ai/models/clef/mmproj-Clef-Q8_0.gguf
+      --alias clef-q4
+      --ctx-size 65536
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 999
+      --parallel 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 300
+    concurrencyLimit: 1
+
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        text-models:
+          swap: true
+          exclusive: true
+          members:
+            - qwen3.8-27b
+            - gemma-4-e4b-it
+            - gemma-4-12b-it
+            - gemma-4-26b-a4b-it
+            - qwen3.6-35b-a3b
+            - glm-5.3-flash-abliterated
+            - embeddinggemma-2
+            - clef-flash-bf16
+            - clef-flash-q8
+            - clef-flash-q4
+            - clef-q4

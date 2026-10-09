@@ -1,0 +1,26 @@
+.DS_Store
+*.part
+
+# downloaded model weights and checkpoints
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# host-local secrets and generated state
+**/.env
+**/secrets/**
+**/.venv/
+**/venv/
+**/__pycache__/
+**/.cache/
+**/cache/
+**/state/
+**/input/
+**/output/
+**/model-router/run/
+**/comfyui/source/
+**/runtimes/

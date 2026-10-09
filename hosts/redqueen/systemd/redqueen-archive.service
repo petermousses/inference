@@ -1,0 +1,37 @@
+[Unit]
+Description=Deduplicated encrypted archive of redqueen AI runtime to OpenMediaVault
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=6h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/redqueen-archive.env
+ExecStart=/srv/ai/bin/redqueen-archive-backup.sh
+Restart=on-failure
+RestartSec=15min
+TimeoutStartSec=infinity
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=20
+IOWeight=20
+MemoryMax=8G
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/srv/ai/archive-state
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native

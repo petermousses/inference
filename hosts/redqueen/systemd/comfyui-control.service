@@ -1,0 +1,46 @@
+[Unit]
+Description=Restricted localhost control for pausing ComfyUI during GLM inference
+PartOf=llama-swap.service
+After=network.target
+ConditionPathExists=/srv/ai/model-router/run/comfyui-paused-by-glm
+
+[Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=30
+Slice=ai-inference.slice
+ExecStart=/usr/bin/python3 /srv/ai/model-router/bin/comfyui-control.py
+ExecStopPost=/usr/bin/rm -f /srv/ai/model-router/run/comfyui-control.sock
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+UMask=0077
+
+NoNewPrivileges=true
+KeyringMode=private
+LockPersonality=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+InaccessiblePaths=/home/ai
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/ai/model-router/bin/comfyui-control.py
+ReadWritePaths=/srv/ai/model-router/run
+InaccessiblePaths=/srv/ai/secrets/llama-swap.env
+InaccessiblePaths=/srv/ai/secrets/qwen38-api-keys
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+CPUQuota=10%
+MemoryMax=128M
+TasksMax=32
+
+[Install]
+WantedBy=default.target

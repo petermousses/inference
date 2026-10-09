@@ -1,0 +1,16 @@
+table inet redqueen_inference {
+  set clients_v4 {
+    type ipv4_addr
+    flags interval
+    elements = { 10.9.20.14, 10.9.20.242, 10.42.0.0/16 }
+  }
+
+  chain input {
+    type filter hook input priority filter + 10;
+    policy accept
+
+    ct state established,related accept
+    ip daddr 10.9.20.242 ip saddr @clients_v4 tcp dport { 8081, 8190, 8191 } accept
+    ip daddr 10.9.20.242 tcp dport { 8081, 8190, 8191 } drop
+  }
+}
