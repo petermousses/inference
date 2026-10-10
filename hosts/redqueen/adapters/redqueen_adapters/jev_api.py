@@ -23,6 +23,9 @@ from .jevk5_gguf import JevK5GGUF
 
 MODEL = "jevk5-4b-v0.3"
 MODEL_ALIASES = {MODEL, "jev-latest", "jevk5"}
+CLM_MODEL = "clm-v0.1-8b"
+CLM_MODEL_ALIASES = {CLM_MODEL, "clm-latest"}
+CLM_UPSTREAM_MODEL = "clm-latest"
 MAX_QUESTIONS = 32
 MAX_CLEF_QUESTIONS = 64
 MAX_OPTIONS = 256
@@ -42,6 +45,7 @@ CLEF_FAMILY_DEFAULTS = {
 }
 SYSTEMONE_MODEL_ALIASES = (
     MODEL_ALIASES
+    | CLM_MODEL_ALIASES
     | set(CLEF_MODEL_FAMILIES)
     | set(CLEF_FAMILY_DEFAULTS)
 )
@@ -58,6 +62,8 @@ class JevSettings:
     llama_url: str = "http://127.0.0.1:8082"
     router_api_key: str = ""
     router_url: str = "http://10.9.20.242:8081"
+    clm_api_key: str = ""
+    clm_url: str = "http://127.0.0.1:8700"
     max_concurrency: int = 4
 
     def __post_init__(self) -> None:
@@ -128,6 +134,38 @@ class RouterClefBackend:
                     except (UnicodeDecodeError, json.JSONDecodeError) as error:
                         raise ValueError("Clef upstream returned invalid JSON") from error
         return validate_clef_response(model, payload["questions"], result)
+
+
+class CLMBackend(Protocol):
+    async def evaluate(self, payload: dict) -> dict: ...
+
+
+class LocalCLMBackend:
+    def __init__(self, settings: JevSettings) -> None:
+        self.url = settings.clm_url.rstrip("/")
+        self.api_key = settings.clm_api_key
+        self.timeout = aiohttp.ClientTimeout(total=900, connect=10)
+        self._slot = asyncio.Semaphore(1)
+
+    async def evaluate(self, payload: dict) -> dict:
+        async with self._slot:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.post(
+                    f"{self.url}/v1/systemone",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                ) as response:
+                    body = await response.content.read(8 * 1024 * 1024 + 1)
+                    if len(body) > 8 * 1024 * 1024:
+                        raise ValueError("CLM response exceeded 8 MiB")
+                    if response.status != 200:
+                        raise RuntimeError(
+                            f"CLM upstream returned HTTP {response.status}"
+                        )
+                    try:
+                        return json.loads(body)
+                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        raise ValueError("CLM upstream returned invalid JSON") from error
 
 
 def _instructions(value: object) -> str:
@@ -521,12 +559,16 @@ def normalize_openai_decision_request(
         requested_model = requested_model.removeprefix("openai/")
     if requested_model in MODEL_ALIASES:
         model = MODEL
+    elif requested_model in CLM_MODEL_ALIASES:
+        model = CLM_MODEL
     elif requested_model in CLEF_MODEL_FAMILIES:
         model = requested_model
     elif requested_model in CLEF_FAMILY_DEFAULTS:
         model = CLEF_FAMILY_DEFAULTS[requested_model]
     else:
-        raise ValueError("model must be one of the configured JevK5 or Clef aliases")
+        raise ValueError(
+            "model must be one of the configured JevK5, CLM, or Clef aliases"
+        )
 
     if "input" not in payload:
         raise ValueError("input is required")
@@ -664,6 +706,11 @@ def validate_clef_response(
     return body
 
 
+def validate_clm_response(questions: dict[str, dict], body: object) -> dict:
+    response = validate_clef_response(CLM_UPSTREAM_MODEL, questions, body)
+    return {**response, "model": CLM_MODEL}
+
+
 def validate_answer(question: dict, answer: object) -> dict:
     if not isinstance(answer, dict) or answer.get("type") != question["type"]:
         raise ValueError("backend returned the wrong answer type")
@@ -723,10 +770,14 @@ def create_jev_app(
     settings: JevSettings,
     backend: JevBackend | None = None,
     clef_backend: ClefBackend | None = None,
+    clm_backend: CLMBackend | None = None,
 ) -> web.Application:
     actual_backend = backend or LocalJevBackend(settings)
     actual_clef_backend = clef_backend or (
         RouterClefBackend(settings) if settings.router_api_key else None
+    )
+    actual_clm_backend = clm_backend or (
+        LocalCLMBackend(settings) if settings.clm_api_key else None
     )
     app = web.Application(
         client_max_size=13 * 1024 * 1024,
@@ -754,6 +805,26 @@ def create_jev_app(
             return error_response(502, "Clef backend failed", "upstream_error")
         return web.json_response(response, headers={"Cache-Control": "no-store"})
 
+    async def evaluate_clm(payload: object) -> web.Response:
+        state, questions = normalize_request(
+            payload, model_aliases=CLM_MODEL_ALIASES
+        )
+        if actual_clm_backend is None:
+            return error_response(503, "CLM runtime is not configured", "server_error")
+        normalized = {
+            "model": CLM_UPSTREAM_MODEL,
+            "state": state,
+            "questions": questions,
+        }
+        try:
+            upstream_response = await actual_clm_backend.evaluate(normalized)
+            response = validate_clm_response(questions, upstream_response)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return error_response(502, "CLM backend failed", "upstream_error")
+        return web.json_response(response, headers={"Cache-Control": "no-store"})
+
     async def models(_: web.Request) -> web.Response:
         return web.json_response(
             {
@@ -777,6 +848,8 @@ def create_jev_app(
                 "model must be one of "
                 + ", ".join(sorted(SYSTEMONE_MODEL_ALIASES))
             )
+        if requested_model in CLM_MODEL_ALIASES:
+            return await evaluate_clm(payload)
         if requested_model not in MODEL_ALIASES:
             model = CLEF_FAMILY_DEFAULTS.get(requested_model, requested_model)
             return await evaluate_clef(payload, model)
@@ -870,9 +943,14 @@ def main() -> None:
     router_api_key = os.environ.get("QWEN_API_KEY", "")
     if not router_api_key:
         raise SystemExit("QWEN_API_KEY is required for Clef routes")
+    clm_api_key = os.environ.get("CLM_API_KEY", "")
     web.run_app(
         create_jev_app(
-            JevSettings(api_key=api_key, router_api_key=router_api_key)
+            JevSettings(
+                api_key=api_key,
+                router_api_key=router_api_key,
+                clm_api_key=clm_api_key,
+            )
         ),
         host=args.host,
         port=args.port,

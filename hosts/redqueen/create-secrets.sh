@@ -33,10 +33,12 @@ trap cleanup EXIT
 readonly qwen_key="$(openssl rand -hex 32)"
 readonly image_key="$(openssl rand -hex 32)"
 readonly jev_key="$(openssl rand -hex 32)"
+readonly clm_key="$(openssl rand -hex 32)"
 
 printf '%s\n' "${qwen_key}" >"${temporary_dir}/qwen38-api-keys"
-printf 'REDQUEEN_IMAGE_API_KEY=%s\nREDQUEEN_JEV_API_KEY=%s\nQWEN_API_KEY=%s\n' \
-  "${image_key}" "${jev_key}" "${qwen_key}" >"${temporary_dir}/redqueen-adapters.env"
+printf 'REDQUEEN_IMAGE_API_KEY=%s\nREDQUEEN_JEV_API_KEY=%s\nQWEN_API_KEY=%s\nCLM_API_KEY=%s\n' \
+  "${image_key}" "${jev_key}" "${qwen_key}" "${clm_key}" \
+  >"${temporary_dir}/redqueen-adapters.env"
 chmod 0600 "${temporary_dir}/qwen38-api-keys" "${temporary_dir}/redqueen-adapters.env"
 mv -- "${temporary_dir}/qwen38-api-keys" "${qwen_file}"
 mv -- "${temporary_dir}/redqueen-adapters.env" "${adapter_file}"

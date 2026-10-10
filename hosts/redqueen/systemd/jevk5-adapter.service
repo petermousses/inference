@@ -1,6 +1,7 @@
 [Unit]
-Description=JevK5 and Cloudflare Clef System One adapter
+Description=JevK5, Cloudflare Clef and CLM System One adapter
 Wants=network-online.target
+Wants=clm-api.service
 After=network-online.target jevk5.service
 Requires=jevk5.service
 ConditionPathIsDirectory=/srv/ai/adapters/source/redqueen_adapters
