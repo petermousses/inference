@@ -39,6 +39,7 @@ ProtectClock=true
 ProtectControlGroups=true
 # systemctl --user needs the bus under /run/user; true hides that directory.
 ProtectHome=read-only
+InaccessiblePaths=/home/ai
 ProtectHostname=true
 ProtectKernelLogs=true
 ProtectKernelModules=true
