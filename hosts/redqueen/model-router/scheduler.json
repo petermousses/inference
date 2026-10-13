@@ -1,0 +1,47 @@
+{
+  "upstream_url": "http://127.0.0.1:8083",
+  "socket_path": "/srv/ai/model-router/run/scheduler.sock",
+  "profile_path": "/srv/ai/model-router/run/memory-profiles.json",
+  "router_config": "/srv/ai/model-router/config.yaml",
+  "estimator": "/srv/ai/runtimes/llama.cpp-v0.6.0-d812350/bin/llama-fit-params",
+  "gpu_reserve_mib": 4096,
+  "host_reserve_mib": 12288,
+  "host_budget_mib": 102400,
+  "estimate_margin": 1.08,
+  "model_overhead_mib": 512,
+  "load_timeout_s": 120,
+  "response_timeout_s": 120,
+  "request_timeout_s": 900,
+  "stop_timeout_s": 35,
+  "retry_after_s": 1,
+  "idle_timeout_s": 300,
+  "services": {
+    "jevk5": {
+      "units": ["jevk5.service"],
+      "command_unit": "/srv/ai/inference/hosts/redqueen/systemd/jevk5.service",
+      "health_url": "http://127.0.0.1:8082/health",
+      "slots_url": "http://127.0.0.1:8082/slots"
+    },
+    "clm": {
+      "units": ["clm-api.service", "clm-encoder.service"],
+      "command_unit": "/srv/ai/inference/hosts/redqueen/systemd/clm-encoder.service",
+      "health_url": "http://127.0.0.1:8090/health",
+      "ready_url": "http://127.0.0.1:8700/health",
+      "slots_url": "http://127.0.0.1:8090/slots",
+      "host_weights": ["/srv/ai/models/clm-v0.1-8b/CLM_v0.1-8B.pt"]
+    },
+    "comfyui": {
+      "units": ["comfyui.service"],
+      "health_url": "http://127.0.0.1:8189/system_stats",
+      "queue_url": "http://127.0.0.1:8189/queue",
+      "workspace_mib": 16384,
+      "weights": [
+        "/srv/ai/models/qwen-image-2.1/diffusion_models/qwen_image_2.1_bf16.safetensors",
+        "/srv/ai/models/qwen-image-2.1/text_encoders/qwen3vl_8b_bf16.safetensors",
+        "/srv/ai/models/qwen-image-2.1/vae/qwen_image_2.1_vae_bf16.safetensors",
+        "/srv/ai/models/qwen-image-2.1-uncensored/diffusion_models/qwen-image-2.1-UC-Q4_K_M.gguf",
+        "/srv/ai/models/qwen-image-2.1-uncensored/text_encoders/qwen3vl_8b_int8_convrot.safetensors"
+      ]
+    }
+  }
+}

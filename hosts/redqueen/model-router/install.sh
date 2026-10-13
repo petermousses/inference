@@ -16,6 +16,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
   exit 1
 fi
 "${host_root}/link-runtime.sh"
+bash "${host_root}/model-router/create-venv.sh"
 "${source_root}/install-glm53-runtime.sh"
 "${source_root}/install-embeddinggemma2-runtime.sh"
 for command in curl sha256sum tar cmp install systemctl python3; do

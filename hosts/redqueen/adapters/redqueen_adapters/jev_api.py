@@ -17,8 +17,9 @@ import aiohttp
 from aiohttp import web
 from PIL import Image
 
-from .common import auth_middleware, error_response, safe_errors
+from .common import AdmissionError, auth_middleware, error_response, safe_errors
 from .jevk5_gguf import JevK5GGUF
+from .scheduler_client import SchedulerClient
 
 
 MODEL = "jevk5-4b-v0.3"
@@ -65,6 +66,7 @@ class JevSettings:
     clm_api_key: str = ""
     clm_url: str = "http://127.0.0.1:8700"
     max_concurrency: int = 4
+    scheduler_socket: str = ""
 
     def __post_init__(self) -> None:
         if not self.api_key:
@@ -115,6 +117,8 @@ class RouterClefBackend:
         self._slot = asyncio.Semaphore(1)
 
     async def evaluate(self, model: str, payload: dict) -> dict:
+        if self._slot.locked():
+            raise AdmissionError(429, "decision model is busy", "model_busy")
         async with self._slot:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
                 async with session.post(
@@ -125,6 +129,8 @@ class RouterClefBackend:
                     body = await response.content.read(8 * 1024 * 1024 + 1)
                     if len(body) > 8 * 1024 * 1024:
                         raise ValueError("Clef upstream response exceeded 8 MiB")
+                    if response.status in {429, 503, 504}:
+                        raise AdmissionError(response.status, "decision model capacity is unavailable", "model_busy" if response.status == 429 else "capacity_unavailable")
                     if response.status != 200:
                         raise RuntimeError(
                             f"Clef upstream returned HTTP {response.status}"
@@ -148,6 +154,8 @@ class LocalCLMBackend:
         self._slot = asyncio.Semaphore(1)
 
     async def evaluate(self, payload: dict) -> dict:
+        if self._slot.locked():
+            raise AdmissionError(429, "decision model is busy", "model_busy")
         async with self._slot:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
                 async with session.post(
@@ -773,6 +781,7 @@ def create_jev_app(
     clm_backend: CLMBackend | None = None,
 ) -> web.Application:
     actual_backend = backend or LocalJevBackend(settings)
+    scheduler = SchedulerClient(settings.scheduler_socket)
     actual_clef_backend = clef_backend or (
         RouterClefBackend(settings) if settings.router_api_key else None
     )
@@ -788,6 +797,9 @@ def create_jev_app(
         return web.json_response({"ok": True, "model": MODEL})
 
     async def ready(_: web.Request) -> web.Response:
+        if settings.scheduler_socket:
+            ok = await scheduler.ready()
+            return web.json_response({"ok": ok}, status=200 if ok else 503)
         check = getattr(actual_backend, "ready", None)
         if check is not None and not await check():
             return web.json_response({"ok": False}, status=503)
@@ -799,7 +811,7 @@ def create_jev_app(
             return error_response(503, "Clef router is not configured", "server_error")
         try:
             response = await actual_clef_backend.evaluate(model, normalized)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, AdmissionError):
             raise
         except Exception:
             return error_response(502, "Clef backend failed", "upstream_error")
@@ -817,9 +829,9 @@ def create_jev_app(
             "questions": questions,
         }
         try:
-            upstream_response = await actual_clm_backend.evaluate(normalized)
+            upstream_response = await scheduler.run("clm", lambda: actual_clm_backend.evaluate(normalized))
             response = validate_clm_response(questions, upstream_response)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, AdmissionError):
             raise
         except Exception:
             return error_response(502, "CLM backend failed", "upstream_error")
@@ -857,12 +869,16 @@ def create_jev_app(
         state, questions = normalize_request(payload)
         started = time.perf_counter()
         try:
-            raw_results = await asyncio.gather(
-                *(
-                    actual_backend.decide(state, question)
-                    for question in questions.values()
+            async def decide_all():
+                results = await asyncio.gather(
+                    *(actual_backend.decide(state, question) for question in questions.values()),
+                    return_exceptions=True,
                 )
-            )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+                return results
+            raw_results = await scheduler.run("jevk5", decide_all, concurrency=settings.max_concurrency)
             results = [
                 validate_answer(question, answer)
                 for question, answer in zip(
@@ -871,7 +887,7 @@ def create_jev_app(
             ]
             answers = dict(zip(questions, results, strict=True))
             tokens = sum(answer.pop("input_tokens") for answer in answers.values())
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, AdmissionError):
             raise
         except Exception:
             return error_response(502, "JevK5 backend failed", "upstream_error")
@@ -944,12 +960,16 @@ def main() -> None:
     if not router_api_key:
         raise SystemExit("QWEN_API_KEY is required for Clef routes")
     clm_api_key = os.environ.get("CLM_API_KEY", "")
+    scheduler_socket = os.environ.get("REDQUEEN_SCHEDULER_SOCKET", "")
+    if not scheduler_socket:
+        raise SystemExit("REDQUEEN_SCHEDULER_SOCKET is required")
     web.run_app(
         create_jev_app(
             JevSettings(
                 api_key=api_key,
                 router_api_key=router_api_key,
                 clm_api_key=clm_api_key,
+                scheduler_socket=scheduler_socket,
             )
         ),
         host=args.host,

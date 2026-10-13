@@ -10,5 +10,8 @@ requires-python = ">=3.13"
 license = "Apache-2.0"
 dependencies = ["aiohttp==3.14.3", "Pillow==11.1.0"]
 
+[project.optional-dependencies]
+scheduler = ["PyYAML==6.0.3"]
+
 [tool.setuptools.packages.find]
 include = ["redqueen_adapters*"]

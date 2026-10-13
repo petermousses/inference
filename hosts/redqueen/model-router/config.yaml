@@ -1,7 +1,7 @@
-healthCheckTimeout: 900
+healthCheckTimeout: 120
 startPort: 5800
-globalTTL: 300
-unloadTimeout: 120
+globalTTL: 0
+unloadTimeout: 30
 apiKeys:
   - "${env.QWEN_API_KEY}"
 
@@ -26,7 +26,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
   gemma-4-e4b-it:
@@ -51,7 +51,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
   gemma-4-12b-it:
@@ -76,7 +76,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
   gemma-4-26b-a4b-it:
@@ -101,7 +101,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
   qwen3.6-35b-a3b:
@@ -126,12 +126,12 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
   glm-5.3-flash-abliterated:
     cmd: >-
-      /srv/ai/model-router/bin/glm-5.3-flash-abliterated-launcher.sh
+      /srv/ai/runtimes/llama.cpp-v0.6.0-d812350/bin/llama-server
       --model /srv/ai/models/huihui-glm-5.3-flash-abliterated-gguf/UD-IQ1_S/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf
       --alias glm-5.3-flash-abliterated
       --ctx-size 220000
@@ -153,7 +153,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 60
+    ttl: 0
     concurrencyLimit: 1
 
   embeddinggemma-2:
@@ -175,7 +175,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
   clef-flash-bf16:
@@ -200,7 +200,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
   clef-flash-q8:
@@ -225,7 +225,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
   clef-flash-q4:
@@ -250,7 +250,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
   clef-q4:
@@ -275,7 +275,7 @@ models:
       --api-key-file /srv/ai/secrets/qwen38-api-keys
       --host 127.0.0.1
       --port ${PORT}
-    ttl: 300
+    ttl: 0
     concurrencyLimit: 1
 
 routing:
@@ -284,8 +284,8 @@ routing:
     settings:
       groups:
         text-models:
-          swap: true
-          exclusive: true
+          swap: false
+          exclusive: false
           members:
             - qwen3.8-27b
             - gemma-4-e4b-it

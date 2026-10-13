@@ -152,6 +152,31 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
     def auth(token: str = TOKEN) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
 
+    async def test_jev_partial_failure_drains_other_questions_before_releasing_request(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        class PartialFailure(FakeJevBackend):
+            async def decide(self, state, question):
+                if question["instructions"] == "fail":
+                    raise RuntimeError("failed question")
+                started.set()
+                await release.wait()
+                return await super().decide(state, question)
+        client = await self.client(create_jev_app(JevSettings(api_key=TOKEN), PartialFailure()))
+        task = asyncio.create_task(client.post("/v1/systemone", headers=self.auth(), json={
+            "state": "hello", "questions": {
+                "failed": {"type": "noul", "instructions": "fail"},
+                "slow": {"type": "noul", "instructions": "wait"},
+            },
+        }))
+        await started.wait()
+        try:
+            done, _ = await asyncio.wait([task], timeout=0.05)
+            self.assertEqual(done, set())
+        finally:
+            release.set()
+        response = await task
+        self.assertEqual(response.status, 502)
+
     async def test_image_generation_requires_bearer_auth_and_returns_b64(self) -> None:
         backend = FakeImageBackend()
         client = await self.client(
