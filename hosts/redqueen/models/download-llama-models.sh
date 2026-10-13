@@ -400,6 +400,8 @@ download_clm() {
   local base="https://huggingface.co/Contrastive-LM/CLM-v0.1-8B/resolve/${revision}"
   local encoder_revision="2473489dc243ccaffb4ce569c55bf1df66b2088f"
   local encoder_base="https://huggingface.co/ggml-org/Qwen3-8B-GGUF/resolve/${encoder_revision}"
+  local encoder_source_revision="b968826d9c46dd6066d109eabc6255188de91218"
+  local encoder_source_base="https://huggingface.co/Qwen/Qwen3-8B/resolve/${encoder_source_revision}"
 
   mkdir -p -- "${model_root}"
   exec 4>"${model_root}/.download.lock"
@@ -412,12 +414,12 @@ download_clm() {
     CLM_v0.1-8B.pt \
     b2b4a8c9c2d39263eff78a351eb909a342ce9b3bf21a3f07c1d1bf15f1c4eda5
   download "${model_root}" "${base}/LICENSE" LICENSE \
-    bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a
+    cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
   download_large_model_file "${model_root}" ggml-org/Qwen3-8B-GGUF \
     "${encoder_revision}" Qwen3-8B-f16.gguf 16388043968 \
     dbc8b6ba7073bf9543abfa30f33103170aba5c9ccda3d64944c7484b4839e2fd
-  download "${model_root}" "${encoder_base}/LICENSE" ENCODER_LICENSE \
-    bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a
+  download "${model_root}" "${encoder_source_base}/LICENSE" ENCODER_LICENSE \
+    832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e
 
   install_metadata "${script_dir}/clm-v0.1-8b.sha256" \
     "${model_root}/SHA256SUMS"
@@ -428,6 +430,7 @@ download_clm() {
     "revision=${revision}" \
     'checkpoint=CLM_v0.1-8B.pt' \
     'checkpoint_sha256=b2b4a8c9c2d39263eff78a351eb909a342ce9b3bf21a3f07c1d1bf15f1c4eda5' \
+    'head_license_sha256=cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30' \
     'package=contrastive-lm==0.1.0' \
     'encoder_gguf_repository=ggml-org/Qwen3-8B-GGUF' \
     "encoder_gguf_revision=${encoder_revision}" \
@@ -435,7 +438,9 @@ download_clm() {
     'encoder_gguf_sha256=dbc8b6ba7073bf9543abfa30f33103170aba5c9ccda3d64944c7484b4839e2fd' \
     'encoder_gguf_size=16388043968' \
     'encoder_source_repository=Qwen/Qwen3-8B' \
-    'encoder_source_revision=b968826d9c46dd6066d109eabc6255188de91218' \
+    "encoder_source_revision=${encoder_source_revision}" \
+    'encoder_license_file=LICENSE' \
+    'encoder_license_sha256=832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e' \
     'encoder_model=qwen3-8b' \
     'encoder_pooling=last-token' \
     'encoder_max_tokens=2048'

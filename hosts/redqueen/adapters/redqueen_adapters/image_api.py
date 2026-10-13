@@ -22,6 +22,7 @@ from aiohttp.multipart import BodyPartReader
 from PIL import Image, UnidentifiedImageError
 
 from .common import auth_middleware, error_response, safe_errors
+from .scheduler_client import SchedulerClient
 
 
 MODEL = "qwen-image-2.1"
@@ -54,6 +55,7 @@ class ImageSettings:
     poll_interval_s: float = 1.0
     max_active: int = 1
     max_waiting: int = 4
+    scheduler_socket: str = ""
 
     def __post_init__(self) -> None:
         if not self.api_key:
@@ -560,6 +562,7 @@ def create_image_app(
     settings: ImageSettings, backend: ImageBackend | None = None
 ) -> web.Application:
     actual_backend = backend or ComfyBackend(settings)
+    scheduler = SchedulerClient(settings.scheduler_socket)
     gate = AdmissionGate(settings.max_active, settings.max_waiting)
     app = web.Application(
         client_max_size=(2 * MAX_IMAGE_BYTES) + (1024 * 1024),
@@ -570,6 +573,9 @@ def create_image_app(
         return web.json_response({"ok": True, "models": list(SUPPORTED_MODELS)})
 
     async def ready(_: web.Request) -> web.Response:
+        if settings.scheduler_socket:
+            ok = await scheduler.ready()
+            return web.json_response({"ok": ok}, status=200 if ok else 503)
         check = getattr(actual_backend, "ready", None)
         if check is not None and not await check():
             return web.json_response({"ok": False}, status=503)
@@ -590,7 +596,7 @@ def create_image_app(
     ) -> web.Response:
         try:
             async with gate.enter():
-                image = await operation()
+                image = await scheduler.run("comfyui", operation)
                 image = await asyncio.to_thread(_normalize_output, image, normalized)
         except RuntimeError as error:
             if str(error) == "image queue is full":
@@ -646,8 +652,11 @@ def main() -> None:
     api_key = os.environ.get("REDQUEEN_IMAGE_API_KEY", "")
     if not api_key:
         raise SystemExit("REDQUEEN_IMAGE_API_KEY is required")
+    scheduler_socket = os.environ.get("REDQUEEN_SCHEDULER_SOCKET", "")
+    if not scheduler_socket:
+        raise SystemExit("REDQUEEN_SCHEDULER_SOCKET is required")
     web.run_app(
-        create_image_app(ImageSettings(api_key=api_key)), host=args.host, port=args.port
+        create_image_app(ImageSettings(api_key=api_key, scheduler_socket=scheduler_socket, max_waiting=0)), host=args.host, port=args.port
     )
 
 

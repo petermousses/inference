@@ -1,9 +1,7 @@
 [Unit]
 Description=JevK5, Cloudflare Clef and CLM System One adapter
-Wants=network-online.target
-Wants=clm-api.service
-After=network-online.target jevk5.service
-Requires=jevk5.service
+Wants=network-online.target redqueen-scheduler.service
+After=network-online.target redqueen-scheduler.service
 ConditionPathIsDirectory=/srv/ai/adapters/source/redqueen_adapters
 ConditionPathIsDirectory=/srv/ai/adapters/venv
 ConditionPathExists=/srv/ai/secrets/redqueen-adapters.env
@@ -17,6 +15,7 @@ WorkingDirectory=/srv/ai/adapters/source
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=/srv/ai/adapters/source
+Environment=REDQUEEN_SCHEDULER_SOCKET=/srv/ai/model-router/run/scheduler.sock
 EnvironmentFile=/srv/ai/secrets/redqueen-adapters.env
 ExecStart=/srv/ai/adapters/venv/bin/python -m redqueen_adapters.jev_api --host 10.9.20.242 --port 8191
 Restart=on-failure
@@ -47,6 +46,7 @@ ProtectKernelTunables=true
 ProtectSystem=strict
 ReadOnlyPaths=/srv/ai/adapters
 ReadOnlyPaths=/srv/ai/secrets/redqueen-adapters.env
+ReadWritePaths=/srv/ai/model-router/run/leases
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true

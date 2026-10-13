@@ -17,7 +17,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/srv/ai/secrets/redqueen-adapters.env
 ExecStart=/srv/ai/clm/venv/bin/clm-serve --port 8700 --emb-url http://127.0.0.1:8090/v1/embeddings --emb-model qwen3-8b --max-tokens 2048 --ckpt /srv/ai/models/clm-v0.1-8b/CLM_v0.1-8B.pt --device cpu --action-cache 512MiB --no-ui
-Restart=on-failure
+Restart=no
 RestartSec=5
 TimeoutStartSec=60
 TimeoutStopSec=30

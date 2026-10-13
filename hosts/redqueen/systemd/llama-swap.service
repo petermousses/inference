@@ -2,8 +2,6 @@
 Description=OpenAI-compatible dynamic text model router for redqueen
 Wants=network-online.target
 After=network-online.target
-Requires=comfyui-control.service
-After=comfyui-control.service
 ConditionPathExists=/srv/ai/bin/llama-swap
 ConditionPathExists=/usr/bin/llama-server
 ConditionPathExists=/srv/ai/model-router/config.yaml
@@ -17,7 +15,7 @@ Type=simple
 Slice=ai-inference.slice
 WorkingDirectory=/srv/ai
 EnvironmentFile=/srv/ai/secrets/llama-swap.env
-ExecStart=/srv/ai/bin/llama-swap --config /srv/ai/model-router/config.yaml --listen 10.9.20.242:8081
+ExecStart=/srv/ai/bin/llama-swap --config /srv/ai/model-router/config.yaml --listen 127.0.0.1:8083
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=120

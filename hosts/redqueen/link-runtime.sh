@@ -90,6 +90,10 @@ link_path "$host_root/adapters/requirements.lock" \
 
 link_path "$host_root/model-router/config.yaml" \
   /srv/ai/model-router/config.yaml file no
+link_path "$host_root/model-router/scheduler.json" \
+  /srv/ai/model-router/scheduler.json file no
+link_path "$host_root/model-router/requirements.lock" \
+  /srv/ai/model-router/requirements.lock file no
 link_path "$host_root/model-router/comfyui-control.py" \
   /srv/ai/model-router/bin/comfyui-control.py file no
 link_path "$host_root/model-router/glm-5.3-flash-abliterated-launcher.sh" \
@@ -154,7 +158,8 @@ for unit in \
   qwen-image-adapter.service \
   qwen38.service \
   redqueen-archive.service \
-  redqueen-archive.timer; do
+  redqueen-archive.timer \
+  redqueen-scheduler.service; do
   replace=no
   [[ "$unit" != comfyui.service ]] || replace=yes
   link_path "$host_root/systemd/$unit" \
