@@ -134,6 +134,16 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             await self.scheduler.admit("large")
         self.assertEqual(self.runtime.stops, [])
 
+    async def test_unhealthy_resident_is_not_restarted_over_an_existing_request(self):
+        self.runtime.loaded = {"a": "ready"}
+        self.runtime.load_gate = asyncio.Event()
+        self.protect("a")
+        with patch.object(self.runtime, "ready", new=AsyncMock(return_value=False)):
+            with self.assertRaises(AdmissionError):
+                await self.scheduler.admit("a")
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.runtime.stops, [])
+
     async def test_file_lease_survives_scheduler_recreation(self):
         self.runtime.loaded = {"a": "ready"}
         self.protect("a")
@@ -213,6 +223,7 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.release = asyncio.Event()
         self.started = asyncio.Event()
         self.api_ready = False
+        self.custom_nodes = {}
         self.resources = {"a": resource(60), "b": resource(60), "comfyui": resource(60, "service")}
         self.runtime = FakeRuntime(self.resources)
         self.forwarded = []
@@ -237,8 +248,11 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             return web.json_response({"ok": True})
         async def ready(_):
             return web.json_response({"ok": self.api_ready}, status=200 if self.api_ready else 503)
+        async def nodes(_):
+            return web.json_response(self.custom_nodes)
         upstream.router.add_get("/health", health)
         upstream.router.add_get("/ready", ready)
+        upstream.router.add_get("/object_info", nodes)
         self.upstream = TestServer(upstream)
         await self.upstream.start_server()
         self.addAsyncCleanup(self.upstream.close)
@@ -335,6 +349,13 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             async with client.lease("a"):
                 self.fail("backend ran without admission")
         self.assertEqual(error.exception.status, 503)
+
+    async def test_backend_connection_failure_is_not_mislabeled_as_scheduler_failure(self):
+        async def fail():
+            raise aiohttp.ClientConnectionError("backend failure")
+        with self.assertRaises(aiohttp.ClientConnectionError):
+            await SchedulerClient(self.policy["socket_path"]).run("comfyui", fail)
+        self.assertEqual((await self.post("b")).status, 200)
 
     async def test_image_and_both_decision_adapters_preserve_capacity_errors(self):
         self.resources.update(jevk5=resource(60, "service"), clm=resource(60, "service"))
@@ -438,6 +459,13 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.api_ready = True
         self.assertTrue(await runtime.ready("comfyui"))
 
+    async def test_image_readiness_requires_installed_workflow_nodes(self):
+        self.resources["comfyui"].update(health_url=str(self.upstream.make_url("/health")), nodes_url=str(self.upstream.make_url("/object_info")), required_nodes=["UnetLoaderGGUF"])
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+        self.assertFalse(await runtime.ready("comfyui"))
+        self.custom_nodes["UnetLoaderGGUF"] = {}
+        self.assertTrue(await runtime.ready("comfyui"))
+
     async def test_deployment_waits_for_existing_leases_before_stopping_anything(self):
         self.runtime.loaded = {"a": "ready"}
         lock = ResourceLock(Path(self.policy["socket_path"]).parent / "leases", "a")
@@ -510,6 +538,7 @@ class DeploymentTest(unittest.TestCase):
         (source / "model-router/scheduler.json").write_text(json.dumps(self.policy))
         self.lease = Mock()
         self.commands = []
+        self.active_units = {"llama-swap.service"}
         self.user_units = self.repo / "user-units"
         self.user_units.mkdir()
         self.link_units()
@@ -528,7 +557,7 @@ class DeploymentTest(unittest.TestCase):
     def command(self, *arguments, **kwargs):
         self.commands.append(arguments)
         if arguments[0] in {"is-enabled", "is-active"}:
-            return subprocess.CompletedProcess(arguments, 0 if arguments[1] == "llama-swap.service" else 1, "", "")
+            return subprocess.CompletedProcess(arguments, 0 if arguments[1] in self.active_units else 1, "", "")
         if arguments[0] == "disable":
             # systemctl also removes manually linked unit definitions outside
             # the unit search path, not just default.target.wants symlinks.
@@ -549,12 +578,14 @@ class DeploymentTest(unittest.TestCase):
         self.assertTrue(all((self.user_units / unit).exists() for unit in deploy_scheduler.FRONTS + deploy_scheduler.MANAGED))
 
     def test_disabling_boot_starts_keeps_backend_definitions_available(self):
+        self.active_units.add("comfyui.service")
         async def healthy(policy):
             if not all((self.user_units / unit).exists() for unit in deploy_scheduler.MANAGED):
                 raise RuntimeError("backend unit definitions are missing")
         with patch.object(deploy_scheduler.os, "geteuid", return_value=1002), patch.dict("os.environ", {"QWEN_API_KEY": "test"}), patch.object(deploy_scheduler, "run", side_effect=self.run_command), patch.object(deploy_scheduler, "systemctl", side_effect=self.command), patch.object(deploy_scheduler, "build_profiles", return_value={"resources": {"a": resource(40)}}), patch.object(deploy_scheduler, "drain", new=AsyncMock(return_value=[self.lease])), patch.object(deploy_scheduler, "healthy", new=healthy):
             deploy_scheduler.deploy(self.repo, "previous")
         self.assertTrue(all((self.user_units / unit).exists() for unit in deploy_scheduler.MANAGED))
+        self.assertIn(("stop", "comfyui.service"), self.commands)
         self.lease.close.assert_called_once()
 
     def test_preflight_failure_does_not_touch_running_services(self):

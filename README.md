@@ -21,3 +21,5 @@ deploy as `ai` from `/srv/ai/inference`: save `previous=$(git rev-parse HEAD)`, 
 the scheduler, memory profiler and deployment tooling use the dedicated model-router venv. image/decision adapters use `/srv/ai/adapters/venv`; ComfyUI and CLM retain their own venvs. llama.cpp runtimes are compiled binaries isolated by their versioned directories and pinned ROCm library paths.
 
 deployment reuses an existing model-router venv only when its dependency pins match; changed pins require a separately built replacement so failed deployments cannot silently change live dependencies. the first migration from the old adapters needs a quiet maintenance window because those processes do not hold scheduler leases.
+
+install the uncensored image runtime once with `bash hosts/redqueen/comfyui/install-qwen-image-gguf.sh`; it installs the pinned custom node and GGUF dependency in ComfyUI's venv. deployment drains and stops resident backends so updated unit settings and plugins take effect on the next lazy start. image admission verifies the required workflow nodes are registered.

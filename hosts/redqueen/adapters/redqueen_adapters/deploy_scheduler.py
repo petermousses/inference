@@ -134,6 +134,9 @@ def deploy(repo: Path, previous: str, *, check_only: bool = False) -> None:
         running_fronts = [unit for unit in active if unit in FRONTS]
         if running_fronts:
             systemctl("stop", *running_fronts)
+        running_backends = [unit for unit in active if unit in MANAGED and unit not in FRONTS]
+        if running_backends:
+            systemctl("stop", *running_backends)
         run("bash", str(source / "link-runtime.sh"))
         temporary = profile_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(profiles, indent=2))

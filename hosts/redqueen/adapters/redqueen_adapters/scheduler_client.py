@@ -84,18 +84,19 @@ class SchedulerClient:
             return
         lock = ResourceLock(Path(self.socket_path).parent / "leases", resource)
         try:
-            if not lock.acquire():
-                raise AdmissionError(503, "model is changing state; retry shortly", "model_transition")
-            connector = aiohttp.UnixConnector(path=self.socket_path)
-            async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
-                async with session.post("http://scheduler/admit", json={"resource": resource}) as response:
-                    body = await response.json()
-                    if response.status != 200:
-                        error = body.get("error", {})
-                        raise AdmissionError(response.status, error.get("message", "model capacity unavailable"), error.get("code", "capacity_unavailable"))
+            try:
+                if not lock.acquire():
+                    raise AdmissionError(503, "model is changing state; retry shortly", "model_transition")
+                connector = aiohttp.UnixConnector(path=self.socket_path)
+                async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
+                    async with session.post("http://scheduler/admit", json={"resource": resource}) as response:
+                        body = await response.json()
+                        if response.status != 200:
+                            error = body.get("error", {})
+                            raise AdmissionError(response.status, error.get("message", "model capacity unavailable"), error.get("code", "capacity_unavailable"))
+            except (aiohttp.ClientError, TimeoutError, OSError) as error:
+                raise AdmissionError(503, "model scheduler is unavailable", "scheduler_unavailable") from error
             yield
-        except (aiohttp.ClientError, TimeoutError, OSError) as error:
-            raise AdmissionError(503, "model scheduler is unavailable", "scheduler_unavailable") from error
         finally:
             lock.close()
 

@@ -34,6 +34,8 @@
       "units": ["comfyui.service"],
       "health_url": "http://127.0.0.1:8189/system_stats",
       "queue_url": "http://127.0.0.1:8189/queue",
+      "nodes_url": "http://127.0.0.1:8189/object_info",
+      "required_nodes": ["UnetLoaderGGUF", "TextEncodeQwenImage21", "QwenImage21Cache"],
       "workspace_mib": 16384,
       "weights": [
         "/srv/ai/models/qwen-image-2.1/diffusion_models/qwen_image_2.1_bf16.safetensors",

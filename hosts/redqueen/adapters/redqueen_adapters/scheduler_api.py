@@ -121,8 +121,12 @@ class Runtime:
                 async with self.session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=2)) as response:
                     if response.status != 200:
                         return False
+            if spec.get("nodes_url"):
+                nodes = await self.json(spec["nodes_url"])
+                if not isinstance(nodes, dict) or not set(spec["required_nodes"]).issubset(nodes):
+                    return False
             return True
-        except (aiohttp.ClientError, TimeoutError):
+        except (aiohttp.ClientError, TimeoutError, ValueError, TypeError):
             return False
 
     async def busy(self, name: str) -> bool:
@@ -207,6 +211,10 @@ class Scheduler:
                 await self.refresh()
                 if name in self.states and self.states[name] != "ready":
                     raise AdmissionError(503, "model is changing state; retry shortly", "model_transition")
+                if name in self.states and not await self.runtime.ready(name):
+                    # An existing lease may still own backend work. Recovery
+                    # must use the idle reaper's exclusive lease and busy probe.
+                    raise AdmissionError(503, "resident backend is not ready; retry later", "backend_unready")
                 capacity, usage = self.runtime.capacity()
                 required = footprint(self.resources[name])
                 if not required.fits(capacity):
@@ -239,7 +247,7 @@ class Scheduler:
                 unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
                 if not (reserved + unknown + (Memory(0, 0) if name in self.states else required)).fits(capacity):
                     raise AdmissionError(503, "memory is not yet available after eviction", "capacity_unavailable")
-                if name not in self.states or not await self.runtime.ready(name):
+                if name not in self.states:
                     loading = True
                     self.states[name] = "starting"
                     LOG.info("load model=%s gpu_mib=%.0f host_mib=%.0f context=%s", name, required.gpu / MIB, required.host / MIB, self.resources[name].get("context_tokens", 0))
