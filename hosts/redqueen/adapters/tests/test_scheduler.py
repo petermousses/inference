@@ -295,9 +295,12 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await SchedulerClient(self.policy["socket_path"]).ready())
 
     async def test_runtime_readiness_probes_service_bus_and_memory_counters(self):
+        self.resources["comfyui"]["units"] = ["comfyui.service"]
         runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
-        with patch.object(runtime, "capacity", return_value=(Memory(100, 100), Memory(0, 0))), patch.object(runtime, "command", new=AsyncMock(return_value="active\n")):
+        with patch.object(runtime, "capacity", return_value=(Memory(100, 100), Memory(0, 0))), patch.object(runtime, "command", new=AsyncMock(side_effect=["loaded\n\nloaded\n", "active\n"])):
             self.assertTrue(await runtime.healthy())
+        with patch.object(runtime, "capacity", return_value=(Memory(100, 100), Memory(0, 0))), patch.object(runtime, "command", new=AsyncMock(return_value="not-found\nloaded\n")):
+            self.assertFalse(await runtime.healthy())
         with patch.object(runtime, "capacity", return_value=(Memory(100, 100), Memory(0, 0))), patch.object(runtime, "command", new=AsyncMock(side_effect=RuntimeError("bus hidden"))):
             self.assertFalse(await runtime.healthy())
         with patch.object(runtime, "capacity", side_effect=RuntimeError("GPU counters hidden")):
@@ -507,15 +510,34 @@ class DeploymentTest(unittest.TestCase):
         (source / "model-router/scheduler.json").write_text(json.dumps(self.policy))
         self.lease = Mock()
         self.commands = []
+        self.user_units = self.repo / "user-units"
+        self.user_units.mkdir()
+        self.link_units()
+
+    def link_units(self):
+        for source in (self.repo / "hosts/redqueen/systemd").iterdir():
+            target = self.user_units / source.name
+            if not target.is_symlink():
+                target.symlink_to(source)
+
+    def run_command(self, *arguments, **kwargs):
+        if arguments[0] == "bash" and arguments[1].endswith("link-runtime.sh"):
+            self.link_units()
+        return subprocess.CompletedProcess(arguments, 0, "", "")
 
     def command(self, *arguments, **kwargs):
         self.commands.append(arguments)
         if arguments[0] in {"is-enabled", "is-active"}:
             return subprocess.CompletedProcess(arguments, 0 if arguments[1] == "llama-swap.service" else 1, "", "")
+        if arguments[0] == "disable":
+            # systemctl also removes manually linked unit definitions outside
+            # the unit search path, not just default.target.wants symlinks.
+            for unit in arguments[1:]:
+                (self.user_units / unit).unlink(missing_ok=True)
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
     def test_failed_activation_restores_profiles_services_and_releases_drain_lock(self):
-        with patch.object(deploy_scheduler.os, "geteuid", return_value=1002), patch.dict("os.environ", {"QWEN_API_KEY": "test"}), patch.object(deploy_scheduler, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as commands, patch.object(deploy_scheduler, "systemctl", side_effect=self.command), patch.object(deploy_scheduler, "build_profiles", return_value={"resources": {"a": resource(40)}}), patch.object(deploy_scheduler, "drain", new=AsyncMock(return_value=[self.lease])), patch.object(deploy_scheduler, "healthy", new=AsyncMock(side_effect=RuntimeError("unhealthy"))):
+        with patch.object(deploy_scheduler.os, "geteuid", return_value=1002), patch.dict("os.environ", {"QWEN_API_KEY": "test"}), patch.object(deploy_scheduler, "run", side_effect=self.run_command) as commands, patch.object(deploy_scheduler, "systemctl", side_effect=self.command), patch.object(deploy_scheduler, "build_profiles", return_value={"resources": {"a": resource(40)}}), patch.object(deploy_scheduler, "drain", new=AsyncMock(return_value=[self.lease])), patch.object(deploy_scheduler, "healthy", new=AsyncMock(side_effect=RuntimeError("unhealthy"))):
             with self.assertRaisesRegex(RuntimeError, "unhealthy"):
                 deploy_scheduler.deploy(self.repo, "previous")
         self.assertEqual(self.profile_path.read_text(), "old profiles")
@@ -523,6 +545,16 @@ class DeploymentTest(unittest.TestCase):
         self.assertIn(("enable", "llama-swap.service"), self.commands)
         self.assertIn(("disable", "comfyui.service"), self.commands)
         commands.assert_any_call("git", "-C", str(self.repo), "switch", "--detach", "previous")
+        self.lease.close.assert_called_once()
+        self.assertTrue(all((self.user_units / unit).exists() for unit in deploy_scheduler.FRONTS + deploy_scheduler.MANAGED))
+
+    def test_disabling_boot_starts_keeps_backend_definitions_available(self):
+        async def healthy(policy):
+            if not all((self.user_units / unit).exists() for unit in deploy_scheduler.MANAGED):
+                raise RuntimeError("backend unit definitions are missing")
+        with patch.object(deploy_scheduler.os, "geteuid", return_value=1002), patch.dict("os.environ", {"QWEN_API_KEY": "test"}), patch.object(deploy_scheduler, "run", side_effect=self.run_command), patch.object(deploy_scheduler, "systemctl", side_effect=self.command), patch.object(deploy_scheduler, "build_profiles", return_value={"resources": {"a": resource(40)}}), patch.object(deploy_scheduler, "drain", new=AsyncMock(return_value=[self.lease])), patch.object(deploy_scheduler, "healthy", new=healthy):
+            deploy_scheduler.deploy(self.repo, "previous")
+        self.assertTrue(all((self.user_units / unit).exists() for unit in deploy_scheduler.MANAGED))
         self.lease.close.assert_called_once()
 
     def test_preflight_failure_does_not_touch_running_services(self):

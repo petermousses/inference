@@ -95,7 +95,9 @@ def restore(repo: Path, previous: str, enabled: dict, active: list[str], profile
     for unit, was_enabled in enabled.items():
         if (repo / "hosts/redqueen/systemd" / unit).exists():
             systemctl("enable" if was_enabled else "disable", unit)
-    systemctl("daemon-reload")
+    # disable also removes the manually linked definitions; restore those
+    # without recreating boot-target wants links.
+    run("bash", str(repo / "hosts/redqueen/link-runtime.sh"))
     if active:
         systemctl("start", *active)
 
@@ -138,6 +140,7 @@ def deploy(repo: Path, previous: str, *, check_only: bool = False) -> None:
         temporary.chmod(0o600)
         temporary.replace(profile_path)
         systemctl("disable", *MANAGED)
+        run("bash", str(source / "link-runtime.sh"))
         systemctl("enable", "llama-swap.service", "redqueen-scheduler.service", "qwen-image-adapter.service", "jevk5-adapter.service")
         systemctl("start", "llama-swap.service", "redqueen-scheduler.service", "qwen-image-adapter.service", "jevk5-adapter.service")
         asyncio.run(healthy(policy))

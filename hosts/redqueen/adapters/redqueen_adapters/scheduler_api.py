@@ -69,6 +69,10 @@ class Runtime:
     async def healthy(self) -> bool:
         try:
             self.capacity()
+            units = sorted({"llama-swap.service", *(unit for spec in self.resources.values() for unit in spec.get("units", []))})
+            loaded = (await self.command("show", *units, "-p", "LoadState", "--value")).split()
+            if len(loaded) != len(units) or any(value != "loaded" for value in loaded):
+                return False
             state = await self.command("show", "llama-swap.service", "-p", "ActiveState", "--value")
             if state.strip() != "active":
                 return False
