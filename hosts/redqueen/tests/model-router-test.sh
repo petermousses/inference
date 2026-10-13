@@ -81,6 +81,12 @@ done
 grep -Fq 'Requires=comfyui-control.service' "${host_root}/systemd/llama-swap.service"
 grep -Fq 'ProtectHome=read-only' "${host_root}/systemd/comfyui-control.service"
 grep -Fq 'Type=notify' "${host_root}/systemd/comfyui-control.service"
+grep -Fq 'Wants=network-online.target qwen-image-adapter.service' \
+  "${host_root}/systemd/comfyui.service"
+grep -Fq 'PartOf=comfyui.service' "${host_root}/systemd/qwen-image-adapter.service"
+grep -Fq 'Wants=network-online.target jevk5-adapter.service' \
+  "${host_root}/systemd/jevk5.service"
+grep -Fq 'PartOf=jevk5.service' "${host_root}/systemd/jevk5-adapter.service"
 grep -Fq -- '--unix-socket' "${host_root}/model-router/glm-5.3-flash-abliterated-launcher.sh"
 
 printf 'static model-router and image-pipeline checks passed\n'

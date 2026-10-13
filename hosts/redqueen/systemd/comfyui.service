@@ -1,6 +1,6 @@
 [Unit]
 Description=ComfyUI Qwen Image 2.1 backend
-Wants=network-online.target
+Wants=network-online.target qwen-image-adapter.service
 After=network-online.target
 ConditionPathIsDirectory=/srv/ai/comfyui/source
 ConditionPathIsDirectory=/srv/ai/comfyui/venv

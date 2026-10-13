@@ -3,6 +3,7 @@ Description=Qwen Image 2.1 OpenAI-compatible adapter
 Wants=network-online.target
 After=network-online.target comfyui.service
 Requires=comfyui.service
+PartOf=comfyui.service
 ConditionPathIsDirectory=/srv/ai/adapters/source/redqueen_adapters
 ConditionPathIsDirectory=/srv/ai/adapters/venv
 ConditionPathExists=/srv/ai/secrets/redqueen-adapters.env

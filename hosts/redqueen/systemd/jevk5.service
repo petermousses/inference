@@ -1,6 +1,6 @@
 [Unit]
 Description=JevK5 4B v0.3 llama.cpp backend
-Wants=network-online.target
+Wants=network-online.target jevk5-adapter.service
 After=network-online.target
 ConditionPathExists=/srv/ai/models/jevk5-4b-v0.3/jevk5-4b-v0.3-Q8_0.gguf
 StartLimitIntervalSec=300
