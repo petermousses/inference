@@ -39,6 +39,10 @@ class FakeRuntime:
         self.load_gate: asyncio.Event | None = None
         self.stop_failure = False
         self.load_failure = False
+        self.available = True
+
+    async def healthy(self):
+        return self.available
 
     async def snapshot(self):
         return dict(self.loaded)
@@ -280,6 +284,24 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/api/models/unload/a", headers={"Authorization": "Bearer secret"})
         self.assertEqual(response.status, 404)
         self.assertEqual(self.runtime.starts, [])
+
+    async def test_readiness_fails_when_model_management_is_unavailable(self):
+        self.runtime.available = False
+        self.assertEqual((await self.client.get("/healthz")).status, 200)
+        self.assertEqual((await self.client.get("/readyz")).status, 503)
+        self.assertFalse(await SchedulerClient(self.policy["socket_path"]).ready())
+        self.runtime.available = True
+        self.assertEqual((await self.client.get("/readyz")).status, 200)
+        self.assertTrue(await SchedulerClient(self.policy["socket_path"]).ready())
+
+    async def test_runtime_readiness_probes_service_bus_and_memory_counters(self):
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+        with patch.object(runtime, "capacity", return_value=(Memory(100, 100), Memory(0, 0))), patch.object(runtime, "command", new=AsyncMock(return_value="active\n")):
+            self.assertTrue(await runtime.healthy())
+        with patch.object(runtime, "capacity", return_value=(Memory(100, 100), Memory(0, 0))), patch.object(runtime, "command", new=AsyncMock(side_effect=RuntimeError("bus hidden"))):
+            self.assertFalse(await runtime.healthy())
+        with patch.object(runtime, "capacity", side_effect=RuntimeError("GPU counters hidden")):
+            self.assertFalse(await runtime.healthy())
 
     async def test_duplicate_model_keys_cannot_route_a_different_unreserved_model(self):
         response = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer secret", "Content-Type": "application/json"}, data='{"model":"b","model":"a"}')

@@ -55,15 +55,27 @@ class Runtime:
     async def command(self, *arguments: str, timeout: float = 5) -> str:
         process = await asyncio.create_subprocess_exec("/usr/bin/systemctl", "--user", *arguments, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
         except BaseException:
             if process.returncode is None:
                 process.kill()
             await process.wait()
             raise
         if process.returncode:
+            LOG.error("systemctl failed exit=%s detail=%s", process.returncode, stderr.decode(errors="replace")[-512:].strip())
             raise RuntimeError("user service manager operation failed")
         return stdout.decode()
+
+    async def healthy(self) -> bool:
+        try:
+            self.capacity()
+            state = await self.command("show", "llama-swap.service", "-p", "ActiveState", "--value")
+            if state.strip() != "active":
+                return False
+            async with self.session.get(f"{self.url}/health", timeout=aiohttp.ClientTimeout(total=2)) as response:
+                return response.status == 200
+        except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError):
+            return False
 
     async def json(self, url: str) -> object:
         async with self.session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=5)) as response:
@@ -314,6 +326,10 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
     async def health(_: web.Request):
         return web.json_response({"ok": True})
 
+    async def ready(_: web.Request):
+        ok = await state["runtime"].healthy()
+        return web.json_response({"ok": ok}, status=200 if ok else 503)
+
     async def status(_: web.Request):
         scheduler = state["scheduler"]
         return web.json_response({"models": {name: {"state": value, "active_requests": scheduler.active.get(name, 0), "last_request_age_s": scheduler.clock() - scheduler.last_used.get(name, scheduler.clock()), **{key: resources[name][key] for key in ("gpu_bytes", "host_bytes", "context_tokens")}} for name, value in scheduler.states.items()}})
@@ -416,11 +432,12 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
             return await forward()
 
     public.router.add_get("/healthz", health)
-    public.router.add_get("/readyz", health)
+    public.router.add_get("/readyz", ready)
     public.router.add_get("/scheduler", status)
     public.router.add_route("*", "/{path:.*}", proxy)
     local.router.add_post("/admit", admit)
     local.router.add_get("/healthz", health)
+    local.router.add_get("/readyz", ready)
     return public, local
 
 

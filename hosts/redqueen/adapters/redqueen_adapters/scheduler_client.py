@@ -72,7 +72,7 @@ class SchedulerClient:
             return True
         try:
             async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=self.socket_path), timeout=aiohttp.ClientTimeout(total=3)) as session:
-                async with session.get("http://scheduler/healthz") as response:
+                async with session.get("http://scheduler/readyz") as response:
                     return response.status == 200
         except (aiohttp.ClientError, TimeoutError, OSError):
             return False

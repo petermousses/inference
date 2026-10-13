@@ -37,7 +37,8 @@ LockPersonality=true
 PrivateTmp=true
 ProtectClock=true
 ProtectControlGroups=true
-ProtectHome=true
+# systemctl --user needs the bus under /run/user; true hides that directory.
+ProtectHome=read-only
 ProtectHostname=true
 ProtectKernelLogs=true
 ProtectKernelModules=true

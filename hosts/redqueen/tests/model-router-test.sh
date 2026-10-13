@@ -70,5 +70,6 @@ PY
 done
 
 grep -Fq -- '--listen 127.0.0.1:8083' "${host_root}/systemd/llama-swap.service"
+grep -Fq 'ProtectHome=read-only' "${host_root}/systemd/redqueen-scheduler.service"
 
 printf 'static model-router and image-pipeline checks passed\n'

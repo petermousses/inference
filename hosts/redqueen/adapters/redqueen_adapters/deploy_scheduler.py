@@ -68,7 +68,7 @@ async def healthy(policy: dict) -> None:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as session:
         for _ in range(40):
             try:
-                for url in (f"{policy['upstream_url']}/health", "http://10.9.20.242:8081/healthz", "http://10.9.20.242:8190/readyz", "http://10.9.20.242:8191/readyz"):
+                for url in (f"{policy['upstream_url']}/health", "http://10.9.20.242:8081/readyz", "http://10.9.20.242:8190/readyz", "http://10.9.20.242:8191/readyz"):
                     async with session.get(url) as response:
                         response.raise_for_status()
                 return
