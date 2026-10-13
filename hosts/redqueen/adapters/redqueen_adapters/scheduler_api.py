@@ -357,12 +357,22 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
         if model is not None:
             aliases = {alias: name for name, spec in resources.items() for alias in spec.get("aliases", [])}
             model = aliases.get(model, model)
-        data = await request.read()
+        content_type = request.headers.get("Content-Type", "application/json")
+        if body is not None:
+            # Python and llama-swap's JSON parser disagree on duplicate keys;
+            # non-JSON content types also let upstream query parameters route.
+            # Forward exactly the canonical model whose memory we admitted.
+            body["model"] = model
+            data = json.dumps(body, allow_nan=False, ensure_ascii=False).encode()
+            content_type = "application/json"
+        else:
+            data = await request.read()
         async def forward():
             response = None
-            try:
+            async def transfer():
+                nonlocal response
                 async with asyncio.timeout(policy["response_timeout_s"]):
-                    upstream = await state["session"].request(request.method, f"{policy['upstream_url']}{request.rel_url}", data=data, headers={"Authorization": f"Bearer {api_key}", "Content-Type": request.headers.get("Content-Type", "application/json")}, allow_redirects=False)
+                    upstream = await state["session"].request(request.method, f"{policy['upstream_url']}{request.rel_url}", data=data, headers={"Authorization": f"Bearer {api_key}", "Content-Type": content_type}, allow_redirects=False)
                     try:
                         first = await upstream.content.readany()
                     except BaseException:
@@ -382,11 +392,22 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                         await response.write(chunk)
                     await response.write_eof()
                     return response
+            try:
+                # Include writes to slow clients: an upstream session timeout
+                # ends at EOF and cannot bound a blocked downstream write.
+                async with asyncio.timeout(policy["request_timeout_s"]):
+                    return await transfer()
             except (TimeoutError, aiohttp.ClientError) as error:
                 if response is not None and response.prepared:
-                    if "text/event-stream" in response.headers.get("Content-Type", ""):
-                        await response.write(b'data: {"error":{"message":"upstream response timed out","type":"server_error","code":"upstream_timeout"}}\n\n')
-                    await response.write_eof()
+                    try:
+                        async with asyncio.timeout(min(1, policy["response_timeout_s"])):
+                            if "text/event-stream" in response.headers.get("Content-Type", ""):
+                                await response.write(b'data: {"error":{"message":"response deadline exceeded","type":"server_error","code":"upstream_timeout"}}\n\n')
+                            await response.write_eof()
+                    except (TimeoutError, ConnectionError, RuntimeError):
+                        response.force_close()
+                        if request.transport is not None:
+                            request.transport.close()
                     return response
                 raise AdmissionError(504 if isinstance(error, TimeoutError) else 503, "upstream did not respond within its deadline", "upstream_timeout") from error
         if model is None:

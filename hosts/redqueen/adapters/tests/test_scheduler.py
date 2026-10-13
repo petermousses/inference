@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -210,9 +211,11 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.api_ready = False
         self.resources = {"a": resource(60), "b": resource(60), "comfyui": resource(60, "service")}
         self.runtime = FakeRuntime(self.resources)
+        self.forwarded = []
 
         async def handle(request):
             payload = await request.json()
+            self.forwarded.append((await request.text(), request.headers.get("Content-Type")))
             if payload.get("hang"):
                 await self.release.wait()
             if payload.get("stream"):
@@ -237,6 +240,7 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.upstream.close)
         self.policy = {"socket_path": str(Path(self.directory.name) / "scheduler.sock"), "upstream_url": str(self.upstream.make_url("")).rstrip("/"), "load_timeout_s": 1, "stop_timeout_s": 1, "response_timeout_s": 1, "request_timeout_s": 5, "idle_timeout_s": 300}
         public, local = create_apps(self.policy, self.resources, "secret", runtime_factory=lambda *args: self.runtime)
+        self.public = public
         self.client = TestClient(TestServer(public, handler_cancellation=True))
         await self.client.start_server()
         self.addAsyncCleanup(self.client.close)
@@ -276,6 +280,19 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/api/models/unload/a", headers={"Authorization": "Bearer secret"})
         self.assertEqual(response.status, 404)
         self.assertEqual(self.runtime.starts, [])
+
+    async def test_duplicate_model_keys_cannot_route_a_different_unreserved_model(self):
+        response = await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer secret", "Content-Type": "application/json"}, data='{"model":"b","model":"a"}')
+        self.assertEqual(response.status, 200)
+        pairs = json.loads(self.forwarded[-1][0], object_pairs_hook=list)
+        self.assertEqual([value for key, value in pairs if key == "model"], ["a"])
+        self.assertEqual(self.runtime.starts, ["a"])
+
+    async def test_non_json_content_type_cannot_route_an_unreserved_query_model(self):
+        response = await self.client.post("/v1/chat/completions?model=b", headers={"Authorization": "Bearer secret", "Content-Type": "text/plain"}, data='{"model":"a"}')
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.forwarded[-1][1], "application/json")
+        self.assertEqual(self.runtime.starts, ["a"])
 
     async def test_adapter_lease_protects_model_across_http_calls_and_releases_afterwards(self):
         adapter = SchedulerClient(self.policy["socket_path"])
@@ -364,6 +381,26 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.wait_for(response.read(), 0.5)
             self.assertIn(b"upstream_timeout", result)
             self.assertNotIn(b"[DONE]", result)
+            admitted = await self.post("b")
+            self.assertEqual(admitted.status, 200)
+        finally:
+            self.release.set()
+
+    async def test_client_not_reading_cannot_keep_a_lease_past_total_deadline(self):
+        self.policy.update(request_timeout_s=0.03, response_timeout_s=0.03)
+        original = web.StreamResponse.write
+        write_started = asyncio.Event()
+        async def blocked(response, data):
+            if response._req is not None and response._req.app is self.public:
+                write_started.set()
+                await asyncio.Event().wait()
+            return await original(response, data)
+        try:
+            with patch.object(web.StreamResponse, "write", new=blocked):
+                response = await self.post("a", stream=True)
+                await asyncio.wait_for(write_started.wait(), 0.5)
+                with self.assertRaises(aiohttp.ClientPayloadError):
+                    await asyncio.wait_for(response.read(), 0.5)
             admitted = await self.post("b")
             self.assertEqual(admitted.status, 200)
         finally:
