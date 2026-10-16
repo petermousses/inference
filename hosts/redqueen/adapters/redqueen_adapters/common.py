@@ -9,6 +9,7 @@ import traceback
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from email.utils import parsedate_to_datetime
 
 from aiohttp import web
 
@@ -18,7 +19,7 @@ JSON_MARKERS = re.compile(rb'["\\\[\]{},:]')
 
 
 class AdmissionError(Exception):
-    def __init__(self, status: int, message: str, code: str, retry_after: int | None = 1):
+    def __init__(self, status: int, message: str, code: str, retry_after: int | str | None = 1):
         super().__init__(message)
         self.status, self.code, self.retry_after = status, code, retry_after
 
@@ -95,6 +96,8 @@ async def safe_errors(
     try:
         response = await handler(request)
     except AdmissionError as error:
+        if error.status >= 500:
+            LOG.warning("request_unavailable id=%s status=%s code=%s reason=%s", request_id, error.status, error.code, type(error.__cause__).__name__ if error.__cause__ else type(error).__name__)
         response = admission_response(error)
     except web.HTTPRequestEntityTooLarge:
         response = error_response(413, "request body is too large")
@@ -186,6 +189,18 @@ class IngressGate:
             self.active -= 1
 
 
+def retry_after_value(value: str | None, default: int | None = 1) -> int | str | None:
+    if not value or len(value) > 80 or not value.isascii():
+        return default
+    if value.isdecimal() and len(value) <= 10:
+        return value
+    try:
+        date = parsedate_to_datetime(value)
+        return value if date.tzinfo is not None else default
+    except (ValueError, TypeError, OverflowError):
+        return default
+
+
 async def read_limited(response, limit: int = 8 * 1024 * 1024, *, description: str = "upstream", check_status: bool = True) -> bytes:
     data = bytearray()
     async for chunk in response.content.iter_chunked(64 * 1024):
@@ -201,8 +216,7 @@ async def read_limited(response, limit: int = 8 * 1024 * 1024, *, description: s
                 code = candidate
         except (ValueError, AttributeError, TypeError):
             pass
-        retry = response.headers.get("Retry-After", "1")
-        retry_after = min(3600, int(retry)) if retry.isdecimal() and len(retry) <= 5 else 1
+        retry_after = None if code in {"configuration_unready", "model_exceeds_budget"} else retry_after_value(response.headers.get("Retry-After"))
         if status in {429, 503}:
             raise UpstreamError(status, "upstream is temporarily unavailable", code if code != "upstream_error" else "model_busy" if status == 429 else "backend_unavailable", retry_after=retry_after)
         if status in {400, 422}:

@@ -13,7 +13,7 @@ from typing import TypeVar
 
 import aiohttp
 
-from .common import AdmissionError, read_limited
+from .common import AdmissionError, read_limited, retry_after_value
 from .ownership import OwnedRequest
 
 T = TypeVar("T")
@@ -113,7 +113,7 @@ class SchedulerClient:
                             if not isinstance(error, dict):
                                 raise AdmissionError(503, "invalid scheduler admission response", "scheduler_unavailable")
                             retry = response.headers.get("Retry-After")
-                            raise AdmissionError(response.status, error.get("message", "model capacity unavailable"), error.get("code", "capacity_unavailable"), retry_after=int(retry) if retry and retry.isdecimal() else None)
+                            raise AdmissionError(response.status, error.get("message", "model capacity unavailable"), error.get("code", "capacity_unavailable"), retry_after=retry_after_value(retry, default=None))
                         if not isinstance(body, dict) or body.get("ok") is not True:
                             raise AdmissionError(503, "invalid scheduler admission response", "scheduler_unavailable")
                         self.generations[resource] = body.get("generation")

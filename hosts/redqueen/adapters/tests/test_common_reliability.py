@@ -67,6 +67,21 @@ class CommonReliabilityTest(unittest.IsolatedAsyncioTestCase):
             await read_limited(Response(), 5)
         self.assertEqual(error.exception.status, 502)
 
+    async def test_upstream_retry_after_is_preserved_except_permanent_configuration(self):
+        class Content:
+            async def iter_chunked(self, size):
+                yield json.dumps({"error": {"code": response_code}}).encode()
+        class Response:
+            content, status, headers = Content(), 503, {"Retry-After": "Fri, 16 Oct 2026 22:00:00 GMT"}
+        response_code = "capacity_unavailable"
+        with self.assertRaises(UpstreamError) as error:
+            await read_limited(Response())
+        self.assertEqual(error.exception.retry_after, Response.headers["Retry-After"])
+        response_code = "configuration_unready"
+        with self.assertRaises(UpstreamError) as error:
+            await read_limited(Response())
+        self.assertIsNone(error.exception.retry_after)
+
     async def test_http_405_preserves_allow(self):
         app = web.Application(middlewares=[safe_errors])
         app.router.add_get("/route", lambda request: web.json_response({}))
