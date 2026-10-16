@@ -252,6 +252,18 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         finally:
             lock.close()
 
+    async def test_pending_systemd_work_blocks_admission_and_eviction(self):
+        directory = Path(self.directory.name)
+        self.scheduler = Scheduler(self.resources, self.runtime, directory / "leases", self.policy, clock=lambda: 1000)
+        (directory / "maintenance.json").write_text('{"reason":"pending-service-job"}')
+        self.runtime.loaded = {"a": "ready"}
+        self.scheduler.last_used["a"] = 1
+        with self.assertRaises(AdmissionError) as error:
+            await self.scheduler.admit("b")
+        self.assertEqual(error.exception.code, "maintenance")
+        await self.scheduler.reap()
+        self.assertEqual(self.runtime.stops, [])
+
     async def test_reaper_preserves_active_work_and_stops_idle_models(self):
         self.runtime.loaded = {"a": "ready", "b": "ready"}
         self.scheduler.last_used = {"a": 10, "b": 20}
@@ -313,6 +325,13 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
 
     async def post(self, model, **parameters):
         return await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer secret"}, json={"model": model, **parameters})
+
+    async def test_known_routes_return_405_with_allow(self):
+        for method, path, allowed in (("GET", "/v1/chat/completions", "POST"), ("POST", "/v1/models", "GET"), ("DELETE", "/upstream/a/health", "GET")):
+            response = await self.client.request(method, path, headers={"Authorization": "Bearer secret"})
+            self.assertEqual(response.status, 405)
+            self.assertIn(allowed, response.headers["Allow"])
+            self.assertEqual((await response.json())["error"]["code"], "method_not_allowed")
 
     async def test_active_stream_survives_new_model_rejection_then_idle_model_is_evicted(self):
         stream = await self.post("a", stream=True)

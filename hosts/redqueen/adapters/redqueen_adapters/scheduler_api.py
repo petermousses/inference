@@ -129,9 +129,13 @@ class Runtime:
 
     async def snapshot(self) -> dict[str, str]:
         body = await self.json(f"{self.url}/running")
+        if not isinstance(body, dict) or not isinstance(body.get("running"), list):
+            raise UpstreamError(502, "invalid model router response", "upstream_invalid_response")
         states = {}
         self.proxies = {}
         for model in body["running"]:
+            if not isinstance(model, dict) or any(not isinstance(model.get(key), str) for key in ("model", "state", "proxy")):
+                raise UpstreamError(502, "invalid model router response", "upstream_invalid_response")
             name = model["model"]
             if name not in self.resources:
                 raise RuntimeError("unprofiled model is running")
@@ -247,6 +251,9 @@ class Scheduler:
         if not operation.acquire():
             raise AdmissionError(503, "deployment or host recovery is in progress", "maintenance")
         try:
+            marker = self.lock_dir.parent / "maintenance.json"
+            if marker.exists() or marker.is_symlink():
+                raise AdmissionError(503, "host recovery has pending service work", "maintenance")
             if hasattr(self.runtime, "verify_configuration"):
                 try:
                     self.runtime.verify_configuration()
@@ -391,6 +398,9 @@ class Scheduler:
         if not operation.acquire():
             return
         try:
+            marker = self.lock_dir.parent / "maintenance.json"
+            if marker.exists() or marker.is_symlink():
+                return
             async with self.transition:
                 await self._reap()
         finally:
@@ -484,7 +494,18 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
             if process is not None and process.returncode is None:
                 process.kill()
                 await process.wait()
-        return web.json_response({"models": {name: {"state": value, "active_requests": scheduler.active.get(name, 0), "last_request_age_s": scheduler.clock() - scheduler.last_used.get(name, scheduler.clock()), **{key: resources[name][key] for key in ("gpu_bytes", "host_bytes", "context_tokens")}} for name, value in scheduler.states.items()}, "recovery": scheduler.recovery, "ownership": [{key: record.get(key) for key in ("id", "resource", "pid", "phase", "boot_id")} for record in records(scheduler.lock_dir.parent / "requests")], "source": revision})
+        diagnostics = {}
+        for filename in ("boot-status.json", "supervisor.json", "recovery.json", "last-good.json"):
+            path = scheduler.lock_dir.parent / filename
+            try:
+                if path.stat().st_size > 64 * 1024:
+                    raise ValueError("oversized diagnostics")
+                diagnostics[filename.removesuffix(".json")] = json.loads(path.read_text())
+            except FileNotFoundError:
+                diagnostics[filename.removesuffix(".json")] = {"state": "uninitialized"}
+            except (OSError, ValueError):
+                diagnostics[filename.removesuffix(".json")] = {"state": "invalid", "ready": False}
+        return web.json_response({"models": {name: {"state": value, "active_requests": scheduler.active.get(name, 0), "last_request_age_s": scheduler.clock() - scheduler.last_used.get(name, scheduler.clock()), **{key: resources[name][key] for key in ("gpu_bytes", "host_bytes", "context_tokens")}} for name, value in scheduler.states.items()}, "recovery": {name: {**value, "retry_in_s": max(0, value.get("next_retry", 0) - scheduler.clock())} for name, value in scheduler.recovery.items()}, "ownership": [{key: record.get(key) for key in ("id", "resource", "pid", "phase", "boot_id")} for record in records(scheduler.lock_dir.parent / "requests")], "source": revision, "host": diagnostics})
 
     async def admit(request: web.Request):
         body = await read_json(request)
@@ -520,8 +541,10 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 raise AdmissionError(404, "unknown inference route", "not_found")
             model = parts[2]
             if request.method not in {"GET", "POST"}:
-                raise AdmissionError(405, "method is not allowed", "method_not_allowed")
-        elif path in MODEL_ENDPOINTS and request.method == "POST":
+                raise web.HTTPMethodNotAllowed(request.method, {"GET", "POST"})
+        elif path in MODEL_ENDPOINTS:
+            if request.method != "POST":
+                raise web.HTTPMethodNotAllowed(request.method, {"POST"})
             try:
                 body = await read_json(request)
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -529,7 +552,10 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
             if not isinstance(body, dict) or not isinstance(body.get("model"), str):
                 raise ValueError("model must be a string")
             model = body["model"]
-        elif request.method != "GET" or path not in {"/v1/models", "/models", "/health", "/running", "/metrics", "/logs"}:
+        elif path in {"/v1/models", "/models", "/health", "/running", "/metrics", "/logs"}:
+            if request.method != "GET":
+                raise web.HTTPMethodNotAllowed(request.method, {"GET"})
+        else:
             raise AdmissionError(404, "unknown inference route", "not_found")
         if model is not None:
             aliases = {alias: name for name, spec in resources.items() for alias in spec.get("aliases", [])}
@@ -599,14 +625,19 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                         await response.write(chunk)
                     await response.write_eof()
                     return response
-            except (TimeoutError, aiohttp.ClientError, AdmissionError, ConnectionError) as error:
-                failure = error if isinstance(error, AdmissionError) else AdmissionError(504 if isinstance(error, TimeoutError) else 502, "upstream transport failed", "transport_timeout" if isinstance(error, TimeoutError) else "upstream_error", retry_after=None)
+            except Exception as error:
+                expected = isinstance(error, (TimeoutError, aiohttp.ClientError, AdmissionError, ConnectionError))
+                failure = error if isinstance(error, AdmissionError) else AdmissionError(504 if isinstance(error, TimeoutError) else 502 if expected else 500, "upstream transport failed" if expected else "internal server error", "transport_timeout" if isinstance(error, TimeoutError) else "upstream_error" if expected else "internal_error", retry_after=None)
                 if response is None or not response.prepared:
+                    if not expected:
+                        raise
                     raise failure from error
+                if not expected:
+                    LOG.error("stream_failed id=%s reason=%s", request.get("request_id", ""), type(error).__name__)
                 try:
                     async with asyncio.timeout(1):
                         if "text/event-stream" in response.headers.get("Content-Type", ""):
-                            frame = {"error": {"message": str(failure), "type": "server_error", "code": failure.code}}
+                            frame = {"error": {"message": str(failure), "type": "server_error", "param": None, "code": failure.code}}
                             await response.write(b"data: " + json.dumps(frame).encode() + b"\n\n")
                         await response.write_eof()
                 except (TimeoutError, ConnectionError, RuntimeError):

@@ -8,7 +8,7 @@ from unittest.mock import patch
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from redqueen_adapters.common import IngressGate, UpstreamError, auth_middleware, read_limited, safe_errors
+from redqueen_adapters.common import IngressGate, UpstreamError, auth_middleware, read_json, read_limited, safe_errors
 from redqueen_adapters.ownership import OwnedRequest, abandoned, records
 
 
@@ -75,6 +75,34 @@ class CommonReliabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 405)
         self.assertIn("GET", response.headers["Allow"])
         self.assertEqual((await response.json())["error"]["code"], "method_not_allowed")
+
+    async def test_json_shape_is_bounded_before_decode(self):
+        app = web.Application(client_max_size=32 * 1024 * 1024, middlewares=[safe_errors])
+        async def handler(request):
+            await read_json(request)
+            return web.json_response({"ok": True})
+        app.router.add_post("/json", handler)
+        client = await self.client(app)
+        for raw in (b"[" * 65 + b"0" + b"]" * 65, b"[" + b'"",' * 125_001 + b'""]'):
+            with patch("redqueen_adapters.common.json.loads", side_effect=AssertionError("must reject before decode")):
+                response = await client.post("/json", data=raw)
+            self.assertEqual(response.status, 400)
+            self.assertEqual((await response.json())["error"]["code"], "invalid_request")
+        for raw in (b"[" * 64 + b"0" + b"]" * 64, json.dumps({"escaped": '\\\"[]{}:,' * 100}).encode()):
+            response = await client.post("/json", data=raw)
+            self.assertEqual(response.status, 200)
+
+    async def test_request_id_is_bounded_and_preserved_before_transmission(self):
+        app = web.Application(middlewares=[safe_errors, IngressGate(1).middleware])
+        async def handler(request):
+            return web.json_response({"ok": True})
+        app.router.add_post("/work", handler)
+        client = await self.client(app)
+        response = await client.post("/work", headers={"X-Request-ID": "client-123"})
+        self.assertEqual(response.headers["X-Request-ID"], "client-123")
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        response = await client.post("/work", headers={"X-Request-ID": "x" * 81})
+        self.assertEqual(len(response.headers["X-Request-ID"]), 32)
 
 
 class OwnershipTest(unittest.TestCase):

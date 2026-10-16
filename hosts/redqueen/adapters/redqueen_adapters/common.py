@@ -14,6 +14,7 @@ from aiohttp import web
 
 
 LOG = logging.getLogger("redqueen.http")
+JSON_MARKERS = re.compile(rb'["\\\[\]{},:]')
 
 
 class AdmissionError(Exception):
@@ -88,7 +89,8 @@ async def safe_errors(
     request: web.Request,
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
 ) -> web.StreamResponse:
-    request_id = uuid.uuid4().hex
+    supplied_id = request.headers.get("X-Request-ID", "")
+    request_id = supplied_id if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", supplied_id) else uuid.uuid4().hex
     request["request_id"] = request_id
     try:
         response = await handler(request)
@@ -125,9 +127,36 @@ async def body_timeout(seconds: float = 60):
 
 async def read_json(request: web.Request) -> object:
     async with body_timeout():
+        raw = await request.read()
+        # Bound object allocation before decoding. A byte cap alone still lets
+        # millions of tiny JSON nodes exhaust the front service's memory.
+        depth = markers = escaped_until = 0
+        in_string = False
+        for match in JSON_MARKERS.finditer(raw):
+            position = match.start()
+            if position < escaped_until:
+                continue
+            marker = raw[position]
+            if in_string:
+                if marker == 92:
+                    escaped_until = position + 2
+                elif marker == 34:
+                    in_string = False
+                continue
+            if marker == 34:
+                in_string = True
+            elif marker in (91, 123):
+                depth += 1
+                if depth > 64:
+                    raise ValueError("request JSON exceeds its nesting limit")
+            elif marker in (93, 125):
+                depth -= 1
+            markers += 1
+            if markers > 250_000:
+                raise ValueError("request JSON exceeds its structure limit")
         try:
-            return await request.json()
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            return json.loads(raw)
+        except (UnicodeDecodeError, ValueError, RecursionError):
             raise ValueError("request body must be valid JSON") from None
 
 
@@ -144,7 +173,15 @@ class IngressGate:
             raise AdmissionError(429, "request admission limit reached", "frontend_busy")
         self.active += 1
         try:
-            return await handler(request)
+            response = await handler(request)
+            if isinstance(response, web.Response) and not response.prepared:
+                response.headers.setdefault("X-Request-ID", request.get("request_id", uuid.uuid4().hex))
+                response.headers.setdefault("Cache-Control", "no-store")
+                await response.prepare(request)
+                # aiohttp normally transmits Response after middleware returns.
+                # Keep the buffer's admission slot until the client drains it.
+                await response.write_eof()
+            return response
         finally:
             self.active -= 1
 

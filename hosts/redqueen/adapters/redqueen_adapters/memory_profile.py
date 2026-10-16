@@ -60,7 +60,7 @@ def memory_rows(output: str) -> dict[str, tuple[int, int, int]]:
 def build_profiles(router_path: Path, policy_path: Path) -> dict:
     policy = json.loads(policy_path.read_text())
     router = yaml.safe_load(router_path.read_text())
-    sources = {str(path): file_signature(path, content=True) for path in (router_path, policy_path)}
+    sources = {str(path): file_signature(path, content=True) for path in (router_path, policy_path, Path(__file__).resolve())}
     resources = {}
 
     def add_source(path: Path, *, content: bool = False) -> None:
