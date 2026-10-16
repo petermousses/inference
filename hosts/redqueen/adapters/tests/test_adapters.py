@@ -116,7 +116,11 @@ class FakeClefBackend:
 class RecordingComfyBackend(ComfyBackend):
     def __init__(self) -> None:
         workflow_dir = Path(__file__).resolve().parents[2] / "comfyui"
-        super().__init__(ImageSettings(api_key=TOKEN, workflow_dir=workflow_dir))
+        self._fixture = tempfile.TemporaryDirectory()
+        root = Path(self._fixture.name)
+        for area in ("input", "output"):
+            (root / "state" / area).mkdir(parents=True)
+        super().__init__(ImageSettings(api_key=TOKEN, workflow_dir=workflow_dir, comfy_state_dir=root / "state", ownership_directory=root / "requests", minimum_free_bytes=0))
         self.workflows: list[dict] = []
         self.removed: list[tuple[str, str, str]] = []
 
@@ -152,15 +156,21 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
     def auth(token: str = TOKEN) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
 
-    async def test_jev_partial_failure_drains_other_questions_before_releasing_request(self):
-        started, release = asyncio.Event(), asyncio.Event()
+    async def test_jev_partial_failure_cancels_and_drains_owned_questions(self):
+        started, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
         class PartialFailure(FakeJevBackend):
             async def decide(self, state, question):
                 if question["instructions"] == "fail":
+                    await started.wait()
                     raise RuntimeError("failed question")
                 started.set()
-                await release.wait()
-                return await super().decide(state, question)
+                try:
+                    await release.wait()
+                    return await super().decide(state, question)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    await release.wait()
+                    raise
         client = await self.client(create_jev_app(JevSettings(api_key=TOKEN), PartialFailure()))
         task = asyncio.create_task(client.post("/v1/systemone", headers=self.auth(), json={
             "state": "hello", "questions": {
@@ -170,10 +180,14 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
         }))
         await started.wait()
         try:
+            waiter = asyncio.create_task(cancelled.wait())
+            done, _ = await asyncio.wait([waiter], timeout=0.05)
+            self.assertTrue(done, "a failed batch must cancel its remaining questions")
             done, _ = await asyncio.wait([task], timeout=0.05)
             self.assertEqual(done, set())
         finally:
             release.set()
+            waiter.cancel()
         response = await task
         self.assertEqual(response.status, 502)
 
@@ -422,6 +436,7 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_comfy_workflow_mapping_is_fixed_and_request_scoped(self) -> None:
         backend = RecordingComfyBackend()
+        self.addCleanup(backend._fixture.cleanup)
         generation = {
             "model": "qwen-image-2.1",
             "prompt": "glass sphere",
@@ -463,6 +478,7 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_uncensored_alias_uses_only_fixed_gguf_loader_mapping(self) -> None:
         backend = RecordingComfyBackend()
+        self.addCleanup(backend._fixture.cleanup)
         request = {
             "model": "qwen-image-2.1-uncensored",
             "prompt": "a red cube",
@@ -521,6 +537,7 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_uncensored_workflow_fails_closed_on_unexpected_loader_graph(self) -> None:
         backend = RecordingComfyBackend()
+        self.addCleanup(backend._fixture.cleanup)
         backend._workflows["generate"]["1"]["class_type"] = "UnexpectedLoader"
         request = {
             "model": "qwen-image-2.1-uncensored",

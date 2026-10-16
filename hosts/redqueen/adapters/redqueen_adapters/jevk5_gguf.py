@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import json
 import math
-import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
+
+import aiohttp
+
+from .common import UpstreamError, read_limited
 
 
 LETTERS = "ABCDEFGHIJKLMNOP"
@@ -57,7 +60,7 @@ def decision_options(question: dict) -> list[tuple[str, str]]:
     return [(key, f"{key}: {description}") for key, description in pairs]
 
 
-Reader = Callable[[list[str]], Sequence[float]]
+Reader = Callable[[list[str]], Awaitable[Sequence[float]]]
 
 
 def _groups(count: int, groups: int) -> list[range]:
@@ -70,11 +73,11 @@ def _groups(count: int, groups: int) -> list[range]:
     return runs
 
 
-def _combine(read: Reader, texts: list[str]) -> list[float]:
+async def _combine(read: Reader, texts: list[str]) -> list[float]:
     if len(texts) <= len(LETTERS):
-        return list(read(texts))
+        return list(await read(texts))
     runs = _groups(len(texts), -(-len(texts) // len(LETTERS)))
-    inner = [list(read([texts[index] for index in run])) for run in runs]
+    inner = [list(await read([texts[index] for index in run])) for run in runs]
     inner = [
         [value / sum(probabilities) for value in probabilities]
         for probabilities in inner
@@ -100,7 +103,7 @@ def _combine(read: Reader, texts: list[str]) -> list[float]:
         sorted(option for group_index, option in chosen if group_index == group)
         for group in range(len(runs))
     ]
-    final = _combine(
+    final = await _combine(
         read, [texts[run[option]] for run, top in zip(runs, tops) for option in top]
     )
     shares, at = [], 0
@@ -122,10 +125,10 @@ def _combine(read: Reader, texts: list[str]) -> list[float]:
     return [value / total for value in weights]
 
 
-def spread(read: Reader, texts: list[str], temperature: float) -> list[float]:
+async def spread(read: Reader, texts: list[str], temperature: float) -> list[float]:
     if len(texts) <= len(LETTERS):
-        return list(read(texts))
-    probabilities = _combine(read, texts)
+        return list(await read(texts))
+    probabilities = await _combine(read, texts)
     if temperature != 1.0:
         probabilities = [value ** (1 / temperature) for value in probabilities]
         total = sum(probabilities)
@@ -162,29 +165,42 @@ class JevK5GGUF:
         temperature: float = 1.22,
         knockout_temperature: float = 0.93,
         top_k: int = 40,
-        timeout_s: float = 180.0,
+        timeout_s: float | None = None,
+        connect_timeout_s: float = 10.0,
     ) -> None:
         self.url = url.rstrip("/")
         self.temperature = temperature
         self.knockout_temperature = knockout_temperature
         self.top_k = top_k
-        self.timeout_s = timeout_s
+        # timeout_s is retained for callers; healthy inference has no age limit.
+        self.timeout = aiohttp.ClientTimeout(total=None, connect=connect_timeout_s, sock_connect=connect_timeout_s, sock_read=None)
 
-    def _post(self, path: str, payload: dict) -> dict:
-        request = urllib.request.Request(
-            self.url + path,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
-            return json.loads(response.read())
+    async def _post(self, session: aiohttp.ClientSession, path: str, payload: dict) -> dict:
+        try:
+            async with session.post(self.url + path, json=payload) as response:
+                body = await read_limited(response, description="JevK5")
+            result = json.loads(body)
+            if not isinstance(result, dict):
+                raise ValueError("response must be an object")
+            return result
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError, RecursionError) as error:
+            raise UpstreamError(502, "JevK5 returned an invalid response", "upstream_invalid_response") from error
+        except TimeoutError as error:
+            raise UpstreamError(504, "JevK5 transport timed out", "transport_timeout", retry_after=None) from error
+        except aiohttp.ClientError as error:
+            raise UpstreamError(503, "JevK5 connection failed", "upstream_connection_failed", retry_after=1) from error
 
-    def _logprobs(self, prompt: str) -> tuple[dict[str, float], int]:
-        tokens = self._post(
+    async def _logprobs(self, session: aiohttp.ClientSession, prompt: str) -> tuple[dict[str, float], int]:
+        tokenized = await self._post(
+            session,
             "/tokenize",
             {"content": prompt, "add_special": False, "parse_special": True},
-        )["tokens"]
-        output = self._post(
+        )
+        tokens = tokenized.get("tokens")
+        if not isinstance(tokens, list) or any(isinstance(token, bool) or not isinstance(token, int) for token in tokens):
+            raise UpstreamError(502, "JevK5 returned invalid tokens", "upstream_invalid_response")
+        output = await self._post(
+            session,
             "/completion",
             {
                 "prompt": tokens,
@@ -194,18 +210,29 @@ class JevK5GGUF:
                 "cache_prompt": False,
             },
         )
-        top = output["completion_probabilities"][0]["top_logprobs"]
-        return {entry["token"]: entry["logprob"] for entry in top}, output.get(
-            "tokens_evaluated", 0
-        )
+        try:
+            top = output["completion_probabilities"][0]["top_logprobs"]
+            count = output.get("tokens_evaluated", 0)
+            if not isinstance(top, list) or not top or isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError("invalid probability metadata")
+            probabilities = {}
+            for entry in top:
+                token, value = entry["token"], entry["logprob"]
+                if not isinstance(token, str) or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError("invalid token probability")
+                probabilities[token] = value
+            return probabilities, count
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            raise UpstreamError(502, "JevK5 returned invalid probabilities", "upstream_invalid_response") from error
 
-    def decide(self, state: object, question: dict) -> dict:
+    async def decide(self, state: object, question: dict) -> dict:
         options = decision_options(question)
         tokens = 0
 
-        def read(texts: list[str]) -> list[float]:
+        async def read(texts: list[str]) -> list[float]:
             nonlocal tokens
-            seen, count = self._logprobs(
+            seen, count = await self._logprobs(
+                session,
                 prompt_text(state, question["instructions"], texts)
             )
             tokens += count
@@ -216,5 +243,6 @@ class JevK5GGUF:
             total = sum(weights)
             return [value / total for value in weights]
 
-        values = spread(read, [text for _, text in options], self.knockout_temperature)
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            values = await spread(read, [text for _, text in options], self.knockout_temperature)
         return answer(question, dict(zip((key for key, _ in options), values)), tokens)
