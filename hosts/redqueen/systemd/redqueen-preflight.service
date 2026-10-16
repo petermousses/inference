@@ -1,0 +1,19 @@
+[Unit]
+Description=Recover interrupted Redqueen deployments and validate unattended startup
+After=network-online.target
+Wants=network-online.target
+Before=llama-swap.service redqueen-scheduler.service qwen-image-adapter.service jevk5-adapter.service default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart=/usr/bin/python3 /srv/ai/model-router/libexec/host_reliability.py boot
+TimeoutStartSec=240
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

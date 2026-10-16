@@ -1,12 +1,11 @@
 [Unit]
 Description=JevK5, Cloudflare Clef and CLM System One adapter
-Wants=network-online.target redqueen-scheduler.service
-After=network-online.target redqueen-scheduler.service
+Wants=redqueen-preflight.service network-online.target redqueen-scheduler.service
+After=redqueen-preflight.service network-online.target redqueen-scheduler.service
 ConditionPathIsDirectory=/srv/ai/adapters/source/redqueen_adapters
 ConditionPathIsDirectory=/srv/ai/adapters/venv
 ConditionPathExists=/srv/ai/secrets/redqueen-adapters.env
-StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -18,8 +17,10 @@ Environment=PYTHONPATH=/srv/ai/adapters/source
 Environment=REDQUEEN_SCHEDULER_SOCKET=/srv/ai/model-router/run/scheduler.sock
 EnvironmentFile=/srv/ai/secrets/redqueen-adapters.env
 ExecStart=/srv/ai/adapters/venv/bin/python -m redqueen_adapters.jev_api --host 10.9.20.242 --port 8191
-Restart=on-failure
+Restart=always
 RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
 TimeoutStartSec=30
 TimeoutStopSec=30
 KillSignal=SIGINT
@@ -47,6 +48,7 @@ ProtectSystem=strict
 ReadOnlyPaths=/srv/ai/adapters
 ReadOnlyPaths=/srv/ai/secrets/redqueen-adapters.env
 ReadWritePaths=/srv/ai/model-router/run/leases
+ReadWritePaths=/srv/ai/model-router/run/requests
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true

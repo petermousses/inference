@@ -1,12 +1,11 @@
 [Unit]
 Description=Memory admission and idle-only LRU scheduling for Redqueen inference
-Wants=network-online.target llama-swap.service
-After=network-online.target llama-swap.service
+Wants=redqueen-preflight.service network-online.target llama-swap.service
+After=redqueen-preflight.service network-online.target llama-swap.service
 ConditionPathExists=/srv/ai/model-router/run/memory-profiles.json
 ConditionPathExists=/srv/ai/model-router/scheduler.json
 ConditionPathIsDirectory=/srv/ai/model-router/venv
-StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -19,14 +18,16 @@ Environment=XDG_RUNTIME_DIR=%t
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 EnvironmentFile=/srv/ai/secrets/llama-swap.env
 ExecStart=/srv/ai/model-router/venv/bin/python -m redqueen_adapters.scheduler_api
-Restart=on-failure
-RestartSec=3
+Restart=always
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
 TimeoutStopSec=45
 KillSignal=SIGINT
 KillMode=mixed
 CPUQuota=200%
-MemoryHigh=256M
-MemoryMax=512M
+MemoryHigh=512M
+MemoryMax=1G
 TasksMax=128
 LimitNOFILE=8192
 UMask=0077

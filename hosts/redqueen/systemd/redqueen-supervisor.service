@@ -1,0 +1,28 @@
+[Unit]
+Description=Independent Redqueen HTTP liveness and interrupted-deployment recovery
+After=redqueen-preflight.service network-online.target
+Wants=redqueen-preflight.service network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Slice=ai-inference.slice
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=XDG_RUNTIME_DIR=%t
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart=/usr/bin/python3 /srv/ai/model-router/libexec/host_reliability.py supervise
+Restart=always
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
+TimeoutStopSec=10
+KillMode=mixed
+CPUQuota=25%
+MemoryMax=128M
+TasksMax=32
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
