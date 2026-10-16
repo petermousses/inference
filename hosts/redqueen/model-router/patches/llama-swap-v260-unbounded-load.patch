@@ -1,0 +1,142 @@
+diff --git a/internal/config/load.go b/internal/config/load.go
+index b9a0681..8a7297d 100644
+--- a/internal/config/load.go
++++ b/internal/config/load.go
+@@ -60,7 +60,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
+ 		config.Models[modelID] = modelConfig
+ 	}
+ 
+-	if config.HealthCheckTimeout < 15 {
++	if config.HealthCheckTimeout != 0 && config.HealthCheckTimeout < 15 {
+ 		config.HealthCheckTimeout = 15
+ 	}
+ 
+diff --git a/internal/process/process_command.go b/internal/process/process_command.go
+index 18390f0..76aea69 100644
+--- a/internal/process/process_command.go
++++ b/internal/process/process_command.go
+@@ -593,18 +593,21 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
+ 		default:
+ 		}
+ 
+-		if time.Now().After(deadline) {
++		if healthCheckTimeout > 0 && time.Now().After(deadline) {
+ 			return abort(fmt.Errorf("health check timed out after %v", healthCheckTimeout))
+ 		}
+ 
+ 		// Tagged so the proxy ErrorHandler logs a not-yet-listening upstream
+ 		// at debug rather than as a proxy error once per poll.
+-		checkCtx := context.WithValue(startCtx, healthCheckKey{}, true)
++		// Individual probes remain bounded even when loading has no deadline.
++		probeCtx, probeCancel := context.WithTimeout(startCtx, 2*time.Second)
++		checkCtx := context.WithValue(probeCtx, healthCheckKey{}, true)
+ 		req, _ := http.NewRequestWithContext(checkCtx, "GET", p.config.CheckEndpoint, nil)
+ 		rr := httptest.NewRecorder()
+ 		reverseProxy.ServeHTTP(rr, req)
+ 		resp := rr.Result()
+ 		resp.Body.Close()
++		probeCancel()
+ 		if resp.StatusCode == http.StatusOK {
+ 			p.proxyLogger.Infof("<%s> Health check passed on %s%s", p.id, p.config.Proxy, p.config.CheckEndpoint)
+ 			break
+diff --git a/internal/router/base.go b/internal/router/base.go
+index f49badf..e2c885a 100644
+--- a/internal/router/base.go
++++ b/internal/router/base.go
+@@ -262,7 +262,10 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
+ 	// process nobody was ever going to start (issue #946). EnsureReady makes
+ 	// the same decision inside the process, where the state is owned.
+ 	target := b.processes[modelID]
+-	err := target.EnsureReady(b.shutdownCtx, timeout)
++	// Redqueen: zero explicitly disables only model-loading deadlines.
++	// Stops retain healthCheckTimeout()'s bounded fallback.
++	loadTimeout := time.Duration(b.config.HealthCheckTimeout) * time.Second
++	err := target.EnsureReady(b.shutdownCtx, loadTimeout)
+ 	if err != nil && b.shutdownCtx.Err() == nil {
+ 		// Quiet during shutdown: every in-flight swap fails at once there, and
+ 		// that is expected rather than worth a warning per model.
+diff --git a/internal/config/redqueen_unbounded_test.go b/internal/config/redqueen_unbounded_test.go
+new file mode 100644
+index 0000000..3e87604
+--- /dev/null
++++ b/internal/config/redqueen_unbounded_test.go
+@@ -0,0 +1,16 @@
++package config
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestRedqueenZeroHealthTimeoutSurvivesParsing(t *testing.T) {
++	cfg, err := LoadConfigFromReader(strings.NewReader("healthCheckTimeout: 0\nmodels:\n  a:\n    cmd: server --port ${PORT}\n"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cfg.HealthCheckTimeout != 0 {
++		t.Fatalf("zero loading deadline became %d seconds", cfg.HealthCheckTimeout)
++	}
++}
+diff --git a/internal/process/redqueen_unbounded_test.go b/internal/process/redqueen_unbounded_test.go
+new file mode 100644
+index 0000000..0299f72
+--- /dev/null
++++ b/internal/process/redqueen_unbounded_test.go
+@@ -0,0 +1,57 @@
++package process
++
++import (
++	"context"
++	"fmt"
++	"github.com/mostlygeek/llama-swap/internal/config"
++	"net/http"
++	"net/http/httptest"
++	"runtime"
++	"testing"
++	"time"
++)
++
++// Zero explicitly disables the loading deadline; each health HTTP probe is
++// still bounded and Stop/shutdown must still cancel an unready process.
++func TestRedqueenZeroLoadTimeoutWaitsForHealth(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("fixture uses POSIX sleep")
++	}
++	firstProbe := make(chan struct{}, 1)
++	ready := make(chan struct{})
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		select {
++		case firstProbe <- struct{}{}:
++		default:
++		}
++		select {
++		case <-ready:
++			w.WriteHeader(http.StatusOK)
++		default:
++			w.WriteHeader(http.StatusServiceUnavailable)
++		}
++	}))
++	defer server.Close()
++	p := newProcessCommand(t, config.ModelConfig{Cmd: "sleep 30", Proxy: server.URL, CheckEndpoint: "/health"})
++	defer p.Stop(time.Second)
++	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
++	defer cancel()
++	done := make(chan error, 1)
++	go func() { done <- p.EnsureReady(ctx, 0) }()
++	select {
++	case err := <-done:
++		t.Fatalf("zero load timeout aborted before first health probe: %v", err)
++	case <-firstProbe:
++	case <-ctx.Done():
++		t.Fatal("health probe was never attempted")
++	}
++	close(ready)
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatal(fmt.Errorf("healthy loading failed: %w", err))
++		}
++	case <-ctx.Done():
++		t.Fatal("loading did not become ready")
++	}
++}

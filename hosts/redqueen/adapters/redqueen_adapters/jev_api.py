@@ -8,7 +8,6 @@ import math
 import os
 import re
 import time
-import urllib.request
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Protocol
@@ -17,9 +16,9 @@ import aiohttp
 from aiohttp import web
 from PIL import Image
 
-from .common import AdmissionError, auth_middleware, error_response, safe_errors
+from .common import AdmissionError, IngressGate, UpstreamError, auth_middleware, decode_json, error_response, read_json, read_limited, safe_errors
 from .jevk5_gguf import JevK5GGUF
-from .scheduler_client import SchedulerClient
+from .scheduler_client import SchedulerClient, finish_shielded
 
 
 MODEL = "jevk5-4b-v0.3"
@@ -88,19 +87,26 @@ class LocalJevBackend:
 
     async def decide(self, state: object, question: dict) -> dict:
         async with self._slots:
-            return await asyncio.to_thread(self._model.decide, state, question)
+            return await self._model.decide(state, question)
 
     async def ready(self) -> bool:
-        def check() -> bool:
-            try:
-                with urllib.request.urlopen(
-                    f"{self._model.url}/health", timeout=5
-                ) as response:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                async with session.get(f"{self._model.url}/health") as response:
                     return response.status == 200
-            except Exception:
-                return False
+        except (aiohttp.ClientError, TimeoutError):
+            return False
 
-        return await asyncio.to_thread(check)
+
+async def _upstream_json(response: aiohttp.ClientResponse, description: str) -> dict:
+    body = await read_limited(response, description=description)
+    try:
+        result = decode_json(body)
+        if not isinstance(result, dict):
+            raise ValueError("response must be an object")
+        return result
+    except (UnicodeDecodeError, ValueError, TypeError, RecursionError) as error:
+        raise UpstreamError(502, f"{description} returned an invalid response", "upstream_invalid_response") from error
 
 
 class ClefBackend(Protocol):
@@ -113,33 +119,29 @@ class RouterClefBackend:
             raise ValueError("router api key must not be empty")
         self.url = settings.router_url.rstrip("/")
         self.api_key = settings.router_api_key
-        self.timeout = aiohttp.ClientTimeout(total=900, connect=10)
+        self.timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=None)
         self._slot = asyncio.Semaphore(1)
 
     async def evaluate(self, model: str, payload: dict) -> dict:
         if self._slot.locked():
             raise AdmissionError(429, "decision model is busy", "model_busy")
-        async with self._slot:
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                async with session.post(
-                    f"{self.url}/upstream/{model}/v1/systemone",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                ) as response:
-                    body = await response.content.read(8 * 1024 * 1024 + 1)
-                    if len(body) > 8 * 1024 * 1024:
-                        raise ValueError("Clef upstream response exceeded 8 MiB")
-                    if response.status in {429, 503, 504}:
-                        raise AdmissionError(response.status, "decision model capacity is unavailable", "model_busy" if response.status == 429 else "capacity_unavailable")
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Clef upstream returned HTTP {response.status}"
-                        )
-                    try:
-                        result = json.loads(body)
-                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                        raise ValueError("Clef upstream returned invalid JSON") from error
-        return validate_clef_response(model, payload["questions"], result)
+        try:
+            async with self._slot:
+                async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                    async with session.post(
+                        f"{self.url}/upstream/{model}/v1/systemone",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                    ) as response:
+                        result = await _upstream_json(response, "Clef")
+        except TimeoutError as error:
+            raise UpstreamError(504, "Clef transport timed out", "transport_timeout", retry_after=None) from error
+        except aiohttp.ClientError as error:
+            raise UpstreamError(503, "Clef connection failed", "upstream_connection_failed") from error
+        try:
+            return validate_clef_response(model, payload["questions"], result)
+        except (KeyError, TypeError, ValueError) as error:
+            raise UpstreamError(502, "Clef returned an invalid response", "upstream_invalid_response") from error
 
 
 class CLMBackend(Protocol):
@@ -150,30 +152,25 @@ class LocalCLMBackend:
     def __init__(self, settings: JevSettings) -> None:
         self.url = settings.clm_url.rstrip("/")
         self.api_key = settings.clm_api_key
-        self.timeout = aiohttp.ClientTimeout(total=900, connect=10)
+        self.timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=None)
         self._slot = asyncio.Semaphore(1)
 
     async def evaluate(self, payload: dict) -> dict:
         if self._slot.locked():
             raise AdmissionError(429, "decision model is busy", "model_busy")
-        async with self._slot:
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                async with session.post(
-                    f"{self.url}/v1/systemone",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                ) as response:
-                    body = await response.content.read(8 * 1024 * 1024 + 1)
-                    if len(body) > 8 * 1024 * 1024:
-                        raise ValueError("CLM response exceeded 8 MiB")
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"CLM upstream returned HTTP {response.status}"
-                        )
-                    try:
-                        return json.loads(body)
-                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                        raise ValueError("CLM upstream returned invalid JSON") from error
+        try:
+            async with self._slot:
+                async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                    async with session.post(
+                        f"{self.url}/v1/systemone",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                    ) as response:
+                        return await _upstream_json(response, "CLM")
+        except TimeoutError as error:
+            raise UpstreamError(504, "CLM transport timed out", "transport_timeout", retry_after=None) from error
+        except aiohttp.ClientError as error:
+            raise UpstreamError(503, "CLM connection failed", "upstream_connection_failed") from error
 
 
 def _instructions(value: object) -> str:
@@ -191,7 +188,7 @@ def normalize_question(question: object) -> dict:
     if unknown:
         raise ValueError(f"unsupported question fields: {', '.join(unknown)}")
     kind = question.get("type")
-    if kind not in {"noul", "choice", "score"}:
+    if not isinstance(kind, str) or kind not in {"noul", "choice", "score"}:
         raise ValueError(f"unknown question type {kind!r}")
     normalized = {
         "type": kind,
@@ -250,7 +247,7 @@ def normalize_request(
     unknown = sorted(set(payload) - {"model", "state", "questions"})
     if unknown:
         raise ValueError(f"unsupported fields: {', '.join(unknown)}")
-    if payload.get("model", MODEL) not in model_aliases:
+    if not isinstance(payload.get("model", MODEL), str) or payload.get("model", MODEL) not in model_aliases:
         raise ValueError(f"model must be one of {', '.join(sorted(model_aliases))}")
     if "state" not in payload:
         raise ValueError("state is required")
@@ -287,7 +284,7 @@ def normalize_clef_request(payload: object, model: str) -> dict:
     if "state" not in payload:
         raise ValueError("state is required")
     family = CLEF_MODEL_FAMILIES[model]
-    if payload.get("model", model) not in {model, family}:
+    if not isinstance(payload.get("model", model), str) or payload.get("model", model) not in {model, family}:
         raise ValueError(f"model must be {model!r} or {family!r} for this route")
     state, questions = normalize_request(
         {
@@ -790,7 +787,7 @@ def create_jev_app(
     )
     app = web.Application(
         client_max_size=13 * 1024 * 1024,
-        middlewares=[safe_errors, auth_middleware(settings.api_key)],
+        middlewares=[safe_errors, auth_middleware(settings.api_key), IngressGate(limit=settings.max_concurrency).middleware],
     )
 
     async def health(_: web.Request) -> web.Response:
@@ -811,10 +808,10 @@ def create_jev_app(
             return error_response(503, "Clef router is not configured", "server_error")
         try:
             response = await actual_clef_backend.evaluate(model, normalized)
-        except (asyncio.CancelledError, AdmissionError):
+        except (asyncio.CancelledError, AdmissionError, UpstreamError):
             raise
-        except Exception:
-            return error_response(502, "Clef backend failed", "upstream_error")
+        except Exception as error:
+            raise UpstreamError(502, "Clef backend failed", "upstream_error") from error
         return web.json_response(response, headers={"Cache-Control": "no-store"})
 
     async def evaluate_clm(payload: object) -> web.Response:
@@ -831,10 +828,12 @@ def create_jev_app(
         try:
             upstream_response = await scheduler.run("clm", lambda: actual_clm_backend.evaluate(normalized))
             response = validate_clm_response(questions, upstream_response)
-        except (asyncio.CancelledError, AdmissionError):
+        except (asyncio.CancelledError, AdmissionError, UpstreamError):
             raise
-        except Exception:
-            return error_response(502, "CLM backend failed", "upstream_error")
+        except (KeyError, TypeError, ValueError) as error:
+            raise UpstreamError(502, "CLM returned an invalid response", "upstream_invalid_response") from error
+        except Exception as error:
+            raise UpstreamError(502, "CLM backend failed", "upstream_error") from error
         return web.json_response(response, headers={"Cache-Control": "no-store"})
 
     async def models(_: web.Request) -> web.Response:
@@ -870,14 +869,16 @@ def create_jev_app(
         started = time.perf_counter()
         try:
             async def decide_all():
-                results = await asyncio.gather(
-                    *(actual_backend.decide(state, question) for question in questions.values()),
-                    return_exceptions=True,
-                )
-                for result in results:
-                    if isinstance(result, BaseException):
-                        raise result
-                return results
+                tasks = [asyncio.create_task(actual_backend.decide(state, question)) for question in questions.values()]
+                try:
+                    return await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        if not task.done() and not task.cancelling():
+                            task.cancel()
+                    async def drain():
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    await finish_shielded(asyncio.create_task(drain()))
             raw_results = await scheduler.run("jevk5", decide_all, concurrency=settings.max_concurrency)
             results = [
                 validate_answer(question, answer)
@@ -887,10 +888,12 @@ def create_jev_app(
             ]
             answers = dict(zip(questions, results, strict=True))
             tokens = sum(answer.pop("input_tokens") for answer in answers.values())
-        except (asyncio.CancelledError, AdmissionError):
+        except (asyncio.CancelledError, AdmissionError, UpstreamError):
             raise
-        except Exception:
-            return error_response(502, "JevK5 backend failed", "upstream_error")
+        except (KeyError, TypeError, ValueError) as error:
+            raise UpstreamError(502, "JevK5 returned an invalid response", "upstream_invalid_response") from error
+        except Exception as error:
+            raise UpstreamError(502, "JevK5 backend failed", "upstream_error") from error
         return web.json_response(
             {
                 "model": MODEL,
@@ -903,14 +906,14 @@ def create_jev_app(
 
     async def systemone(request: web.Request) -> web.Response:
         try:
-            payload = await request.json()
+            payload = await read_json(request)
         except (json.JSONDecodeError, aiohttp.ContentTypeError):
             raise ValueError("request body must be valid JSON")
         return await dispatch_systemone(payload)
 
     async def decisions(request: web.Request) -> web.Response:
         try:
-            payload = await request.json()
+            payload = await read_json(request)
         except (json.JSONDecodeError, aiohttp.ContentTypeError):
             raise ValueError("request body must be valid JSON")
         systemone_payload, output_specs, _ = normalize_openai_decision_request(payload)
@@ -918,12 +921,10 @@ def create_jev_app(
         if response.status != 200:
             return response
         try:
-            body = json.loads(response.body)
+            body = decode_json(response.body)
             openai_body = serialize_openai_decision_response(body, output_specs)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return error_response(
-                502, "decision backend returned an invalid response", "upstream_error"
-            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise UpstreamError(502, "decision backend returned an invalid response", "upstream_invalid_response") from error
         return web.json_response(
             openai_body, headers={"Cache-Control": "no-store"}
         )
@@ -931,7 +932,7 @@ def create_jev_app(
     def clef_handler(model: str):
         async def handle(request: web.Request) -> web.Response:
             try:
-                payload = await request.json()
+                payload = await read_json(request)
             except (json.JSONDecodeError, aiohttp.ContentTypeError):
                 raise ValueError("request body must be valid JSON")
             return await evaluate_clef(payload, model)
@@ -974,6 +975,7 @@ def main() -> None:
         ),
         host=args.host,
         port=args.port,
+        handler_cancellation=True,
     )
 
 

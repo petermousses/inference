@@ -60,7 +60,7 @@ def memory_rows(output: str) -> dict[str, tuple[int, int, int]]:
 def build_profiles(router_path: Path, policy_path: Path) -> dict:
     policy = json.loads(policy_path.read_text())
     router = yaml.safe_load(router_path.read_text())
-    sources = {str(path): file_signature(path, content=True) for path in (router_path, policy_path)}
+    sources = {str(path): file_signature(path, content=True) for path in (router_path, policy_path, Path(__file__).resolve())}
     resources = {}
 
     def add_source(path: Path, *, content: bool = False) -> None:
@@ -103,6 +103,7 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
         margin, overhead = policy["estimate_margin"], policy["model_overhead_mib"] * MIB
         return {
             **metadata, "weights_bytes": weight_bytes + extra_bytes + host_bytes,
+            "model_paths": [str(path) for path in weights],
             "context_tokens": int(flags["--ctx-size"]), "planner": str(estimator),
             "gpu_bytes": math.ceil((gpu + extra_bytes) * margin) + overhead,
             "host_bytes": math.ceil(total * margin) + overhead,

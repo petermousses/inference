@@ -1,23 +1,24 @@
 [Unit]
 Description=OpenAI-compatible dynamic text model router for redqueen
-Wants=network-online.target
-After=network-online.target
-ConditionPathExists=/srv/ai/bin/llama-swap
+Wants=redqueen-preflight.service network-online.target
+After=redqueen-preflight.service network-online.target
+ConditionPathExists=/srv/ai/runtimes/llama-swap-v260-unbounded/bin/llama-swap
 ConditionPathExists=/usr/bin/llama-server
 ConditionPathExists=/srv/ai/model-router/config.yaml
 ConditionPathExists=/srv/ai/secrets/llama-swap.env
 ConditionPathExists=/srv/ai/secrets/qwen38-api-keys
-StartLimitIntervalSec=600
-StartLimitBurst=3
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 Slice=ai-inference.slice
 WorkingDirectory=/srv/ai
 EnvironmentFile=/srv/ai/secrets/llama-swap.env
-ExecStart=/srv/ai/bin/llama-swap --config /srv/ai/model-router/config.yaml --listen 127.0.0.1:8083
-Restart=on-failure
-RestartSec=10
+ExecStart=/srv/ai/runtimes/llama-swap-v260-unbounded/bin/llama-swap --config /srv/ai/model-router/config.yaml --listen 127.0.0.1:8083
+Restart=always
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=60
 TimeoutStartSec=120
 TimeoutStopSec=120
 KillSignal=SIGINT
@@ -44,6 +45,7 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
 ReadOnlyPaths=/srv/ai/bin/llama-swap
+ReadOnlyPaths=/srv/ai/runtimes/llama-swap-v260-unbounded
 ReadOnlyPaths=/usr/bin/llama-server
 ReadOnlyPaths=/srv/ai/runtimes/llama.cpp-v0.6.0-d812350
 ReadOnlyPaths=/srv/ai/runtimes/llama.cpp-b11457-5ad1c5d

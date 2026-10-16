@@ -101,6 +101,15 @@ link_path "$host_root/model-router/glm-5.3-flash-abliterated-launcher.sh" \
 link_path "$host_root/model-router/THIRD-PARTY-LICENSE.md" \
   /srv/ai/model-router/THIRD-PARTY-LICENSE.md file no
 
+# This MUST be a regular copy. A candidate checkout must not replace the
+# helper that rolls back that candidate after SIGKILL, power loss or reboot.
+# Successful deployment promotes the new helper; the linker only bootstraps.
+/usr/bin/python3 "$host_root/adapters/redqueen_adapters/host_reliability.py" \
+  install --source "$host_root/adapters/redqueen_adapters/host_reliability.py" \
+  --bootstrap-only
+/usr/bin/python3 "$host_root/adapters/redqueen_adapters/host_reliability.py" \
+  unit --source "$host_root/systemd/redqueen-preflight.service" --bootstrap-only
+
 link_path "$host_root/comfyui/download-qwen-image-2.1.sh" \
   /srv/ai/comfyui/download-qwen-image-2.1.sh file yes
 link_path "$host_root/comfyui/extra-model-paths.yaml" \
@@ -159,6 +168,7 @@ for unit in \
   qwen38.service \
   redqueen-archive.service \
   redqueen-archive.timer \
+  redqueen-supervisor.service \
   redqueen-scheduler.service; do
   replace=no
   [[ "$unit" != comfyui.service ]] || replace=yes

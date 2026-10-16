@@ -1,1 +1,3 @@
 hosts/redqueen/models/metadata/** -text
+# Patch context contains upstream tabs and blank context lines by design.
+hosts/redqueen/model-router/patches/*.patch -whitespace

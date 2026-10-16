@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -12,7 +13,8 @@ from typing import TypeVar
 
 import aiohttp
 
-from .common import AdmissionError
+from .common import AdmissionError, decode_json, read_limited, retry_after_value
+from .ownership import OwnedRequest
 
 T = TypeVar("T")
 
@@ -46,12 +48,17 @@ class ResourceLock:
         self.fd: int | None = None
 
     def acquire(self) -> bool:
+        if self.fd is not None:
+            raise RuntimeError("resource lease is already acquired")
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, (fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
             return False
+        except BaseException:
+            os.close(fd)
+            raise
         self.fd = fd
         return True
 
@@ -62,10 +69,13 @@ class ResourceLock:
 
 
 class SchedulerClient:
-    def __init__(self, socket_path: str = "", *, timeout: float = 135):
+    def __init__(self, socket_path: str = "", *, timeout: float | None = None):
         self.socket_path = socket_path
-        self.timeout = timeout
+        # Retained argument for API compatibility. Admission may include an
+        # arbitrarily long healthy model load; it has no response deadline.
+        self.timeout = None
         self.slots: dict[str, asyncio.Semaphore] = {}
+        self.generations: dict[str, str | None] = {}
 
     async def ready(self) -> bool:
         if not self.socket_path:
@@ -78,25 +88,48 @@ class SchedulerClient:
             return False
 
     @asynccontextmanager
-    async def lease(self, resource: str):
+    async def lease(self, resource: str, *, exclusive: bool = False):
         if not self.socket_path:
-            yield
+            yield {}
             return
-        lock = ResourceLock(Path(self.socket_path).parent / "leases", resource)
+        directory = Path(self.socket_path).parent
+        (directory / "leases").mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = ResourceLock(directory / "leases", resource, exclusive=exclusive)
+        owned = None
+        admitted = False
         try:
             try:
                 if not lock.acquire():
                     raise AdmissionError(503, "model is changing state; retry shortly", "model_transition")
+                owned = OwnedRequest(directory / "requests", resource).begin()
                 connector = aiohttp.UnixConnector(path=self.socket_path)
-                async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
+                async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None, sock_read=None, connect=10)) as session:
                     async with session.post("http://scheduler/admit", json={"resource": resource}) as response:
-                        body = await response.json()
+                        body = decode_json(await read_limited(response, 64 * 1024, check_status=False))
+                        if not isinstance(body, dict):
+                            raise AdmissionError(503, "invalid scheduler admission response", "scheduler_unavailable")
                         if response.status != 200:
                             error = body.get("error", {})
-                            raise AdmissionError(response.status, error.get("message", "model capacity unavailable"), error.get("code", "capacity_unavailable"))
-            except (aiohttp.ClientError, TimeoutError, OSError) as error:
+                            if not isinstance(error, dict):
+                                raise AdmissionError(503, "invalid scheduler admission response", "scheduler_unavailable")
+                            retry = response.headers.get("Retry-After")
+                            raise AdmissionError(response.status, error.get("message", "model capacity unavailable"), error.get("code", "capacity_unavailable"), retry_after=retry_after_value(retry, default=None))
+                        if not isinstance(body, dict) or body.get("ok") is not True:
+                            raise AdmissionError(503, "invalid scheduler admission response", "scheduler_unavailable")
+                        self.generations[resource] = body.get("generation")
+            except (aiohttp.ClientError, TimeoutError, OSError, UnicodeDecodeError, ValueError) as error:
                 raise AdmissionError(503, "model scheduler is unavailable", "scheduler_unavailable") from error
-            yield
+            admitted = True
+            yield body
+        except BaseException:
+            if owned is not None and admitted:
+                owned.detach()
+            elif owned is not None:
+                owned.close()
+            raise
+        else:
+            if owned is not None:
+                owned.close()
         finally:
             lock.close()
 
@@ -105,7 +138,15 @@ class SchedulerClient:
         if slot.locked():
             raise AdmissionError(429, "model is serving its maximum concurrent requests", "model_busy")
         async with slot, self.lease(resource):
-            # A cancelled urllib/to_thread call can keep issuing GPU work. Keep
-            # its lease until the entire operation, including worker threads, ends.
             task = asyncio.create_task(operation())
-            return await finish_shielded(task)
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Operations now use cancellable async HTTP. Drain their owned
+                # cleanup before releasing the flock; record uncertain work.
+                task.cancel()
+                try:
+                    await finish_shielded(task)
+                except asyncio.CancelledError:
+                    pass
+                raise
