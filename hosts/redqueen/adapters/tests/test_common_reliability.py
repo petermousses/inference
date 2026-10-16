@@ -1,0 +1,93 @@
+import asyncio
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from redqueen_adapters.common import IngressGate, UpstreamError, auth_middleware, read_limited, safe_errors
+from redqueen_adapters.ownership import OwnedRequest, abandoned, records
+
+
+class CommonReliabilityTest(unittest.IsolatedAsyncioTestCase):
+    async def client(self, app):
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def test_non_ascii_bearer_is_json_401_and_unknown_exception_is_redacted(self):
+        app = web.Application(middlewares=[safe_errors, auth_middleware("test")])
+        async def broken(request):
+            raise TypeError("secret-body")
+        app.router.add_get("/broken", broken)
+        client = await self.client(app)
+        response = await client.get("/broken", headers={"Authorization": "Bearer é"})
+        self.assertEqual(response.status, 401)
+        response = await client.get("/broken", headers={"Authorization": "Bearer test"})
+        self.assertEqual(response.status, 500)
+        body = await response.json()
+        self.assertEqual(body["error"]["code"], "internal_error")
+        self.assertNotIn("secret-body", json.dumps(body))
+        self.assertIn("X-Request-ID", response.headers)
+
+    async def test_admission_precedes_body_handler(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        count = 0
+        app = web.Application(middlewares=[safe_errors, IngressGate(1).middleware])
+        async def handler(request):
+            nonlocal count
+            count += 1
+            entered.set()
+            await release.wait()
+            return web.json_response({"ok": True})
+        app.router.add_post("/work", handler)
+        client = await self.client(app)
+        first = asyncio.create_task(client.post("/work"))
+        await entered.wait()
+        response = await client.post("/work")
+        self.assertEqual(response.status, 429)
+        self.assertEqual(count, 1)
+        release.set()
+        self.assertEqual((await first).status, 200)
+
+    async def test_bounded_read_waits_for_fragmented_eof(self):
+        class Content:
+            async def iter_chunked(self, size):
+                yield b'{"ok":'
+                await asyncio.sleep(0)
+                yield b'true}'
+        class Response:
+            content, status, headers = Content(), 200, {}
+        self.assertEqual(json.loads(await read_limited(Response())), {"ok": True})
+        with self.assertRaises(UpstreamError) as error:
+            await read_limited(Response(), 5)
+        self.assertEqual(error.exception.status, 502)
+
+    async def test_http_405_preserves_allow(self):
+        app = web.Application(middlewares=[safe_errors])
+        app.router.add_get("/route", lambda request: web.json_response({}))
+        client = await self.client(app)
+        response = await client.post("/route")
+        self.assertEqual(response.status, 405)
+        self.assertIn("GET", response.headers["Allow"])
+        self.assertEqual((await response.json())["error"]["code"], "method_not_allowed")
+
+
+class OwnershipTest(unittest.TestCase):
+    def test_live_ownership_never_expires_and_pid_reuse_is_abandoned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with patch("redqueen_adapters.ownership.boot_id", return_value="boot"), patch("redqueen_adapters.ownership.process_start", return_value="start"):
+                request = OwnedRequest(directory, "clm").begin()
+                self.assertEqual(abandoned(directory, "clm"), [])
+                self.assertNotIn("deadline", records(directory)[0])
+                with patch("redqueen_adapters.ownership.process_start", return_value="new-process"):
+                    self.assertEqual(abandoned(directory, "clm")[0]["id"], request.id)
+                request.detach()
+                self.assertEqual(abandoned(directory, "clm")[0]["phase"], "abandoned")
+                request.close()
+                self.assertEqual(records(directory), [])

@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
+import logging
+import re
+import traceback
+import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 
 from aiohttp import web
 
 
+LOG = logging.getLogger("redqueen.http")
+
+
 class AdmissionError(Exception):
-    def __init__(self, status: int, message: str, code: str):
+    def __init__(self, status: int, message: str, code: str, retry_after: int | None = 1):
         super().__init__(message)
-        self.status, self.code = status, code
+        self.status, self.code, self.retry_after = status, code, retry_after
+
+
+class UpstreamError(AdmissionError):
+    """An upstream fault, distinct from client input validation."""
 
 
 def admission_response(error: AdmissionError) -> web.Response:
@@ -18,13 +31,13 @@ def admission_response(error: AdmissionError) -> web.Response:
     body = json.loads(response.body)
     body["error"]["code"] = error.code
     response = web.json_response(body, status=error.status, headers={"Cache-Control": "no-store"})
-    if error.status in {429, 503}:
-        response.headers["Retry-After"] = "1"
+    if error.status in {429, 503} and error.retry_after is not None:
+        response.headers["Retry-After"] = str(error.retry_after)
     return response
 
 
 def error_response(
-    status: int, message: str, error_type: str = "invalid_request_error"
+    status: int, message: str, error_type: str = "invalid_request_error", *, code: str | None = None
 ) -> web.Response:
     return web.json_response(
         {
@@ -32,7 +45,7 @@ def error_response(
                 "message": message,
                 "type": error_type,
                 "param": None,
-                "code": None,
+                "code": code or {400: "invalid_request", 401: "authentication_failed", 403: "access_denied", 404: "not_found", 405: "method_not_allowed", 408: "upload_timeout", 413: "body_too_large", 429: "model_busy", 500: "internal_error", 502: "upstream_error", 503: "backend_unavailable", 504: "transport_timeout"}.get(status, "http_error"),
             }
         },
         status=status,
@@ -47,7 +60,7 @@ def bearer_is_valid(request: web.Request, expected: str) -> bool:
     return (
         separator == " "
         and scheme.lower() == "bearer"
-        and hmac.compare_digest(supplied, expected)
+        and hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
     )
 
 
@@ -75,11 +88,87 @@ async def safe_errors(
     request: web.Request,
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
 ) -> web.StreamResponse:
+    request_id = uuid.uuid4().hex
+    request["request_id"] = request_id
     try:
-        return await handler(request)
+        response = await handler(request)
     except AdmissionError as error:
-        return admission_response(error)
+        response = admission_response(error)
     except web.HTTPRequestEntityTooLarge:
-        return error_response(413, "request body is too large")
+        response = error_response(413, "request body is too large")
+    except web.HTTPException as error:
+        response = error_response(error.status, error.reason)
+        for header in ("Allow", "WWW-Authenticate", "Retry-After"):
+            if header in error.headers:
+                response.headers[header] = error.headers[header]
     except ValueError as error:
-        return error_response(400, str(error))
+        response = error_response(400, str(error))
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        frames = [(frame.filename, frame.lineno, frame.name) for frame in traceback.extract_tb(error.__traceback__)]
+        LOG.error("request_failed id=%s reason=%s frames=%s", request_id, type(error).__name__, frames)
+        response = error_response(500, "internal server error", "server_error")
+    if not response.prepared:
+        response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@asynccontextmanager
+async def body_timeout(seconds: float = 60):
+    try:
+        async with asyncio.timeout(seconds):
+            yield
+    except TimeoutError as error:
+        raise AdmissionError(408, "request body could not be read", "upload_timeout", retry_after=None) from error
+
+
+async def read_json(request: web.Request) -> object:
+    async with body_timeout():
+        try:
+            return await request.json()
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError("request body must be valid JSON") from None
+
+
+class IngressGate:
+    """Reject excess handlers before they buffer or decode a request."""
+    def __init__(self, limit: int = 2):
+        self.limit, self.active = limit, 0
+
+    @web.middleware
+    async def middleware(self, request: web.Request, handler):
+        if request.path in {"/healthz", "/readyz", "/scheduler", "/v1/models", "/models", "/health", "/running", "/metrics"}:
+            return await handler(request)
+        if self.active >= self.limit:
+            raise AdmissionError(429, "request admission limit reached", "frontend_busy")
+        self.active += 1
+        try:
+            return await handler(request)
+        finally:
+            self.active -= 1
+
+
+async def read_limited(response, limit: int = 8 * 1024 * 1024, *, description: str = "upstream", check_status: bool = True) -> bytes:
+    data = bytearray()
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        data.extend(chunk)
+        if len(data) > limit:
+            raise UpstreamError(502, f"{description} response exceeded its byte limit", "upstream_invalid_response")
+    if check_status and response.status >= 400:
+        status = response.status
+        code = "upstream_error"
+        try:
+            candidate = json.loads(data).get("error", {}).get("code")
+            if isinstance(candidate, str) and re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", candidate):
+                code = candidate
+        except (ValueError, AttributeError, TypeError):
+            pass
+        retry = response.headers.get("Retry-After", "1")
+        retry_after = min(3600, int(retry)) if retry.isdecimal() and len(retry) <= 5 else 1
+        if status in {429, 503}:
+            raise UpstreamError(status, "upstream is temporarily unavailable", code if code != "upstream_error" else "model_busy" if status == 429 else "backend_unavailable", retry_after=retry_after)
+        if status in {400, 422}:
+            raise UpstreamError(400, "upstream rejected model input", code)
+        raise UpstreamError(504 if status == 504 else 502, "upstream request failed", code)
+    return bytes(data)
