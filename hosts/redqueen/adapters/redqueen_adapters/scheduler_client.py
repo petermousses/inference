@@ -13,7 +13,7 @@ from typing import TypeVar
 
 import aiohttp
 
-from .common import AdmissionError, read_limited, retry_after_value
+from .common import AdmissionError, decode_json, read_limited, retry_after_value
 from .ownership import OwnedRequest
 
 T = TypeVar("T")
@@ -105,7 +105,7 @@ class SchedulerClient:
                 connector = aiohttp.UnixConnector(path=self.socket_path)
                 async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None, sock_read=None, connect=10)) as session:
                     async with session.post("http://scheduler/admit", json={"resource": resource}) as response:
-                        body = json.loads(await read_limited(response, 64 * 1024, check_status=False))
+                        body = decode_json(await read_limited(response, 64 * 1024, check_status=False))
                         if not isinstance(body, dict):
                             raise AdmissionError(503, "invalid scheduler admission response", "scheduler_unavailable")
                         if response.status != 200:
@@ -117,7 +117,7 @@ class SchedulerClient:
                         if not isinstance(body, dict) or body.get("ok") is not True:
                             raise AdmissionError(503, "invalid scheduler admission response", "scheduler_unavailable")
                         self.generations[resource] = body.get("generation")
-            except (aiohttp.ClientError, TimeoutError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            except (aiohttp.ClientError, TimeoutError, OSError, UnicodeDecodeError, ValueError) as error:
                 raise AdmissionError(503, "model scheduler is unavailable", "scheduler_unavailable") from error
             admitted = True
             yield body

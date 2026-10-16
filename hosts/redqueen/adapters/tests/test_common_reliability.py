@@ -98,7 +98,13 @@ class CommonReliabilityTest(unittest.IsolatedAsyncioTestCase):
             return web.json_response({"ok": True})
         app.router.add_post("/json", handler)
         client = await self.client(app)
-        for raw in (b"[" * 65 + b"0" + b"]" * 65, b"[" + b'"",' * 125_001 + b'""]'):
+        malformed_encodings = [
+            '{"model":"x"}'.encode("utf-16-le"),
+            '{"model":"x"}'.encode("utf-16-be"),
+            '{"model":"x"}'.encode("utf-32-le"),
+            '{"model":"x"}'.encode("utf-32-be"),
+        ]
+        for raw in (b"[" * 65 + b"0" + b"]" * 65, b"[" + b'"",' * 125_001 + b'""]', *malformed_encodings):
             with patch("redqueen_adapters.common.json.loads", side_effect=AssertionError("must reject before decode")):
                 response = await client.post("/json", data=raw)
             self.assertEqual(response.status, 400)
@@ -106,6 +112,17 @@ class CommonReliabilityTest(unittest.IsolatedAsyncioTestCase):
         for raw in (b"[" * 64 + b"0" + b"]" * 64, json.dumps({"escaped": '\\\"[]{}:,' * 100}).encode()):
             response = await client.post("/json", data=raw)
             self.assertEqual(response.status, 200)
+
+    async def test_json_requires_strict_utf8_and_rejects_nonfinite_or_surrogate_values(self):
+        app = web.Application(client_max_size=32 * 1024 * 1024, middlewares=[safe_errors])
+        async def handler(request):
+            await read_json(request)
+            return web.json_response({"ok": True})
+        app.router.add_post("/json", handler)
+        client = await self.client(app)
+        for raw in (b'{"x":"\\ud800"}', b'{"x":NaN}', b'{"x":Infinity}', b'{"x":"a\x00b"}'):
+            response = await client.post("/json", data=raw)
+            self.assertEqual(response.status, 400, raw)
 
     async def test_request_id_is_bounded_and_preserved_before_transmission(self):
         app = web.Application(middlewares=[safe_errors, IngressGate(1).middleware])

@@ -26,7 +26,7 @@ from aiohttp import web
 from aiohttp.multipart import BodyPartReader
 from PIL import Image, UnidentifiedImageError
 
-from .common import AdmissionError, IngressGate, UpstreamError, auth_middleware, body_timeout, error_response, read_json, read_limited, safe_errors
+from .common import AdmissionError, IngressGate, UpstreamError, auth_middleware, body_timeout, decode_json, error_response, read_json, read_limited, safe_errors
 from .ownership import OwnedRequest, abandoned, remove_record
 from .scheduler_client import SchedulerClient, finish_shielded
 
@@ -393,7 +393,7 @@ class ComfyBackend:
     @staticmethod
     def _decode_json(data: bytes) -> dict:
         try:
-            result = json.loads(data)
+            result = decode_json(data)
             if not isinstance(result, dict):
                 raise ValueError("response must be an object")
             return result

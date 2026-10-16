@@ -16,6 +16,7 @@ from aiohttp import web
 
 LOG = logging.getLogger("redqueen.http")
 JSON_MARKERS = re.compile(rb'["\\\[\]{},:]')
+JSON_SURROGATES = re.compile(r"[\ud800-\udfff]")
 
 
 class AdmissionError(Exception):
@@ -128,39 +129,71 @@ async def body_timeout(seconds: float = 60):
         raise AdmissionError(408, "request body could not be read", "upload_timeout", retry_after=None) from error
 
 
+def decode_json(raw: bytes | str) -> object:
+    """Decode bounded UTF-8 JSON only after bounding its raw-byte structure."""
+    if isinstance(raw, str):
+        try:
+            raw = raw.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("JSON text must be valid Unicode") from None
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise ValueError("JSON must use UTF-8 encoding")
+    raw = bytes(raw)
+    if b"\0" in raw:
+        raise ValueError("JSON must use UTF-8 encoding")
+
+    # Bound object allocation before decoding. A byte cap alone still lets
+    # millions of tiny JSON nodes exhaust a front service's memory. Scanning
+    # bytes also avoids json.loads' UTF-16/32 auto-detection bypassing limits.
+    depth = markers = escaped_until = 0
+    in_string = False
+    for match in JSON_MARKERS.finditer(raw):
+        position = match.start()
+        if position < escaped_until:
+            continue
+        marker = raw[position]
+        if in_string:
+            if marker == 92:
+                escaped_until = position + 2
+            elif marker == 34:
+                in_string = False
+            continue
+        if marker == 34:
+            in_string = True
+        elif marker in (91, 123):
+            depth += 1
+            if depth > 64:
+                raise ValueError("JSON exceeds its nesting limit")
+        elif marker in (93, 125):
+            depth -= 1
+        markers += 1
+        if markers > 250_000:
+            raise ValueError("JSON exceeds its structure limit")
+
+    try:
+        text = raw.decode("utf-8-sig")
+        value = json.loads(text, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid JSON number")))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise ValueError("JSON must be valid UTF-8 JSON") from None
+
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if JSON_SURROGATES.search(item):
+                raise ValueError("JSON contains an invalid Unicode surrogate")
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return value
+
+
 async def read_json(request: web.Request) -> object:
     async with body_timeout():
         raw = await request.read()
-        # Bound object allocation before decoding. A byte cap alone still lets
-        # millions of tiny JSON nodes exhaust the front service's memory.
-        depth = markers = escaped_until = 0
-        in_string = False
-        for match in JSON_MARKERS.finditer(raw):
-            position = match.start()
-            if position < escaped_until:
-                continue
-            marker = raw[position]
-            if in_string:
-                if marker == 92:
-                    escaped_until = position + 2
-                elif marker == 34:
-                    in_string = False
-                continue
-            if marker == 34:
-                in_string = True
-            elif marker in (91, 123):
-                depth += 1
-                if depth > 64:
-                    raise ValueError("request JSON exceeds its nesting limit")
-            elif marker in (93, 125):
-                depth -= 1
-            markers += 1
-            if markers > 250_000:
-                raise ValueError("request JSON exceeds its structure limit")
-        try:
-            return json.loads(raw)
-        except (UnicodeDecodeError, ValueError, RecursionError):
-            raise ValueError("request body must be valid JSON") from None
+    return decode_json(raw)
 
 
 class IngressGate:
@@ -211,7 +244,8 @@ async def read_limited(response, limit: int = 8 * 1024 * 1024, *, description: s
         status = response.status
         code = "upstream_error"
         try:
-            candidate = json.loads(data).get("error", {}).get("code")
+            body = decode_json(data)
+            candidate = body.get("error", {}).get("code") if isinstance(body, dict) else None
             if isinstance(candidate, str) and re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", candidate):
                 code = candidate
         except (ValueError, AttributeError, TypeError):

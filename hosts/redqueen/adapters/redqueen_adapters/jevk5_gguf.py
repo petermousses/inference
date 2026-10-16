@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable, Sequence
 
 import aiohttp
 
-from .common import UpstreamError, read_limited
+from .common import UpstreamError, decode_json, read_limited
 
 
 LETTERS = "ABCDEFGHIJKLMNOP"
@@ -179,7 +179,7 @@ class JevK5GGUF:
         try:
             async with session.post(self.url + path, json=payload) as response:
                 body = await read_limited(response, description="JevK5")
-            result = json.loads(body)
+            result = decode_json(body)
             if not isinstance(result, dict):
                 raise ValueError("response must be an object")
             return result

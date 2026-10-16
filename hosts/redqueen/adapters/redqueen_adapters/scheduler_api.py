@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -17,7 +18,7 @@ from urllib.parse import quote
 import aiohttp
 from aiohttp import web
 
-from .common import AdmissionError, IngressGate, UpstreamError, admission_response, auth_middleware, body_timeout, read_json, read_limited, safe_errors
+from .common import AdmissionError, IngressGate, UpstreamError, admission_response, auth_middleware, body_timeout, decode_json, read_json, read_limited, safe_errors
 from .memory_profile import MIB, verify_profiles
 from .scheduler_client import ResourceLock, finish_shielded
 from .ownership import OwnedRequest, abandoned, boot_id, records, remove_record
@@ -25,6 +26,8 @@ from .ownership import OwnedRequest, abandoned, boot_id, records, remove_record
 LOG = logging.getLogger("redqueen.scheduler")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
 MODEL_ENDPOINTS = {"/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/embeddings", "/completion", "/tokenize", "/detokenize"}
+SSE_BOUNDARY = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+MAX_SSE_FRAME = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -90,7 +93,7 @@ class Runtime:
     async def json(self, url: str) -> object:
         async with self.session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=5)) as response:
             try:
-                return json.loads(await read_limited(response))
+                return decode_json(await read_limited(response))
             except (ValueError, UnicodeDecodeError) as error:
                 raise RuntimeError("invalid runtime control response") from error
 
@@ -271,6 +274,10 @@ class Scheduler:
             # Existing warm work can proceed while another model loads. Probe
             # directly so a crashed warm model cannot autoload around the budget.
             if self.states.get(name) == "ready" and await self.runtime.ready(name):
+                if self.resources[name]["kind"] == "text":
+                    busy = await self.runtime.busy(name)
+                    if busy is not False:
+                        raise AdmissionError(429 if busy is True else 503, "backend work is still active" if busy is True else "backend activity is unknown", "model_busy" if busy is True else "backend_health_uncertain")
                 self.last_used[name] = self.clock()
                 return
             raise AdmissionError(503, "another model is changing state; retry shortly", "model_transition")
@@ -285,8 +292,10 @@ class Scheduler:
                     # An existing lease may still own backend work. Recovery
                     # must use the idle reaper's exclusive lease and busy probe.
                     raise AdmissionError(503, "resident backend is not ready; retry later", "backend_unready")
-                if name in self.states and self.resources[name]["kind"] == "text" and await self.runtime.busy(name) is True:
-                    raise AdmissionError(429, "model still has backend work in progress", "model_busy")
+                if name in self.states and self.resources[name]["kind"] == "text":
+                    busy = await self.runtime.busy(name)
+                    if busy is not False:
+                        raise AdmissionError(429 if busy is True else 503, "backend work is still active" if busy is True else "backend activity is unknown", "model_busy" if busy is True else "backend_health_uncertain")
                 capacity, usage = self.runtime.capacity()
                 required = footprint(self.resources[name])
                 if not required.fits(capacity):
@@ -365,6 +374,7 @@ class Scheduler:
             raise AdmissionError(503, "model is being evicted; retry shortly", "model_transition")
         self.active[name] = self.active.get(name, 0) + 1
         owned = None
+        admitted = False
         try:
             owned = OwnedRequest(self.lock_dir.parent / "requests", name).begin()
             # Finish admission cleanup even if its client disappears during a
@@ -379,10 +389,17 @@ class Scheduler:
                 except asyncio.CancelledError:
                     pass
                 raise
+            admitted = True
             yield
         except BaseException:
             if owned is not None:
-                owned.detach()
+                if admitted:
+                    owned.detach()
+                else:
+                    # Rejected admission never transferred work to this
+                    # request. Keeping its record would grow diagnostics and
+                    # disk use during ordinary capacity pressure.
+                    owned.close()
             raise
         else:
             if owned is not None:
@@ -408,6 +425,14 @@ class Scheduler:
 
     async def _reap(self) -> None:
             await self.refresh()
+            # No resident backend means an abandoned request cannot still own
+            # model work. Keep Comfy job manifests so image reconciliation can
+            # clean their files after its next generation starts.
+            for name in self.resources:
+                if name not in self.states:
+                    for record in abandoned(self.lock_dir.parent / "requests", name):
+                        if not record.get("job_id") and not record.get("client_id"):
+                            remove_record(self.lock_dir.parent / "requests", record["id"])
             for name in list(self.states):
                 lock = ResourceLock(self.lock_dir, name, exclusive=True)
                 try:
@@ -415,13 +440,19 @@ class Scheduler:
                         continue
                     busy = await self.runtime.busy(name)
                     ready = self.states[name] == "ready" and await self.runtime.ready(name)
+                    abandoned_work = abandoned(self.lock_dir.parent / "requests", name)
+                    ambiguous_comfy_job = name == "comfyui" and any(
+                        record.get("kind") == "comfyui_job"
+                        and (record.get("upload_pending") is True or (record.get("submitted") is True and record.get("acknowledged") is False))
+                        for record in abandoned_work
+                    )
                     if ready:
                         self.recovery.pop(name, None)
                         if busy is False:
-                            for record in abandoned(self.lock_dir.parent / "requests", name):
+                            for record in abandoned_work:
                                 if not record.get("job_id") and not record.get("client_id"):
                                     remove_record(self.lock_dir.parent / "requests", record["id"])
-                        if busy is not False or self.clock() - self.last_used[name] < self.policy["idle_timeout_s"]:
+                        if busy is not False or (not ambiguous_comfy_job and self.clock() - self.last_used[name] < self.policy["idle_timeout_s"]):
                             continue
                     else:
                         failure = self.recovery.setdefault(name, {"attempts": 0})
@@ -606,7 +637,7 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                         payload = await read_limited(upstream, 32 * MIB, check_status=False)
                         if request.method == "POST":
                             try:
-                                result = json.loads(payload)
+                                result = decode_json(payload)
                                 if not isinstance(result, (dict, list)):
                                     raise ValueError("invalid response shape")
                             except (ValueError, UnicodeDecodeError) as error:
@@ -616,13 +647,29 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                         return web.Response(body=payload, status=upstream.status, headers=headers)
                     if response is None:
                         await open_stream(headers, upstream.status)
+                    fragment = b""
                     while True:
                         pending = asyncio.create_task(upstream.content.readany())
                         chunk = await wait_with_heartbeat(pending)
                         pending = None
                         if not chunk:
                             break
-                        await response.write(chunk)
+                        # Heartbeats must never split an upstream SSE event.
+                        # Assemble bounded frames before sending any of their
+                        # bytes so even a quiet mid-frame gap remains safe.
+                        framed = fragment + chunk
+                        offset = 0
+                        for boundary in SSE_BOUNDARY.finditer(framed):
+                            end = boundary.end()
+                            if end - offset > MAX_SSE_FRAME:
+                                raise UpstreamError(502, "upstream stream frame exceeds its byte limit", "upstream_invalid_response")
+                            await response.write(framed[offset:end])
+                            offset = end
+                        fragment = framed[offset:]
+                        if len(fragment) > MAX_SSE_FRAME:
+                            raise UpstreamError(502, "upstream stream frame exceeds its byte limit", "upstream_invalid_response")
+                    if fragment.strip():
+                        raise UpstreamError(502, "upstream stream ended with an incomplete event", "upstream_invalid_response")
                     await response.write_eof()
                     return response
             except Exception as error:

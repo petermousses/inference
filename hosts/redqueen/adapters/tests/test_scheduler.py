@@ -18,6 +18,7 @@ from redqueen_adapters import deploy_scheduler
 from redqueen_adapters.image_api import ImageSettings, create_image_app
 from redqueen_adapters.jev_api import JevSettings, create_jev_app
 from redqueen_adapters.memory_profile import MIB, build_profiles, file_signature, memory_rows, verify_profiles, weight_paths
+from redqueen_adapters.ownership import OwnedRequest, records
 from redqueen_adapters.scheduler_api import Memory, Runtime, Scheduler, create_apps
 from redqueen_adapters.scheduler_client import ResourceLock, SchedulerClient
 
@@ -81,7 +82,7 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.resources = {"a": resource(40), "b": resource(40), "large": resource(75)}
         self.runtime = FakeRuntime(self.resources)
         self.policy = {"load_timeout_s": 0.1, "stop_timeout_s": 0.1, "idle_timeout_s": 300}
-        self.scheduler = Scheduler(self.resources, self.runtime, Path(self.directory.name), self.policy, clock=lambda: 1000)
+        self.scheduler = Scheduler(self.resources, self.runtime, Path(self.directory.name) / "leases", self.policy, clock=lambda: 1000)
 
     def protect(self, name):
         lock = ResourceLock(self.scheduler.lock_dir, name)
@@ -200,6 +201,39 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             await self.scheduler.admit("a")
         self.assertNotIn("a", self.runtime.starts)
 
+    async def test_rejected_admission_does_not_leave_an_abandoned_owner_record(self):
+        self.resources["large"] = resource(75)
+        self.runtime.loaded = {"a": "ready"}
+        self.protect("a")
+        with self.assertRaises(AdmissionError):
+            async with self.scheduler.request("large"):
+                self.fail("capacity rejection reached application work")
+        self.assertEqual(records(Path(self.directory.name) / "requests", "large"), [])
+
+    async def test_idle_comfy_backend_resets_only_for_abandoned_ambiguous_jobs(self):
+        self.resources["comfyui"] = resource(40, "service")
+        self.runtime.loaded = {"comfyui": "ready"}
+        self.scheduler.last_used["comfyui"] = self.scheduler.clock()
+        requests = Path(self.directory.name) / "requests"
+        upload = OwnedRequest(requests, "comfyui", job={"kind": "comfyui_job", "job_id": "upload", "upload_pending": True}).begin()
+        upload.detach()
+        lost_ack = OwnedRequest(requests, "comfyui", job={"kind": "comfyui_job", "job_id": "ack", "submitted": True, "acknowledged": False}).begin()
+        lost_ack.detach()
+        await self.scheduler.reap()
+        self.assertEqual(self.runtime.stops, ["comfyui"])
+        self.assertEqual(self.runtime.loaded, {})
+        self.assertEqual({item["job_id"] for item in records(requests, "comfyui")}, {"upload", "ack"})
+
+    async def test_comfy_reaper_preserves_foreign_or_active_work(self):
+        self.resources["comfyui"] = resource(40, "service")
+        self.runtime.loaded = {"comfyui": "ready"}
+        self.scheduler.last_used["comfyui"] = self.scheduler.clock() - 10000
+        active = OwnedRequest(Path(self.directory.name) / "requests", "comfyui", job={"kind": "comfyui_job", "job_id": "active", "upload_pending": True}).begin()
+        lease = self.protect("comfyui")
+        await self.scheduler.reap()
+        self.assertEqual(self.runtime.stops, [])
+        self.assertTrue(active.path.exists())
+
     async def test_healthy_load_survives_former_deadline(self):
         self.policy["load_timeout_s"] = 0.01
         self.runtime.load_gate = asyncio.Event()
@@ -264,6 +298,17 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         await self.scheduler.reap()
         self.assertEqual(self.runtime.stops, [])
 
+    async def test_warm_admission_preserves_busy_and_unknown_activity_during_other_load(self):
+        self.runtime.loaded = {"a": "ready"}
+        await self.scheduler.refresh()
+        async with self.scheduler.transition:
+            for busy, status in ((True, 429), (None, 503)):
+                self.runtime.busy = AsyncMock(return_value=busy)
+                with self.assertRaises(AdmissionError) as error:
+                    await self.scheduler.admit("a")
+                self.assertEqual(error.exception.status, status)
+        self.assertEqual(self.runtime.starts, [])
+
     async def test_reaper_preserves_active_work_and_stops_idle_models(self):
         self.runtime.loaded = {"a": "ready", "b": "ready"}
         self.scheduler.last_used = {"a": 10, "b": 20}
@@ -292,6 +337,14 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             if payload.get("stream"):
                 response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
                 await response.prepare(request)
+                if payload.get("fragmented"):
+                    await response.write(b'data: {"content":"hel')
+                    self.started.set()
+                    await self.release.wait()
+                    await response.write(b'lo"}\r\n\r')
+                    await asyncio.sleep(0)
+                    await response.write(b'\n')
+                    return response
                 await response.write(b'data: {"content":"hello"}\n\n')
                 self.started.set()
                 await self.release.wait()
@@ -332,6 +385,17 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 405)
             self.assertIn(allowed, response.headers["Allow"])
             self.assertEqual((await response.json())["error"]["code"], "method_not_allowed")
+
+    async def test_heartbeat_never_splits_fragmented_upstream_sse_event(self):
+        self.policy["heartbeat_s"] = 0.01
+        stream = await self.post("a", stream=True, fragmented=True)
+        await self.started.wait()
+        await asyncio.sleep(0.04)
+        self.release.set()
+        raw = await stream.read()
+        self.assertIn(b": ping\n\n", raw)
+        frames = [line[6:] for line in raw.splitlines() if line.startswith(b"data: ")]
+        self.assertEqual([json.loads(frame) for frame in frames], [{"content": "hello"}])
 
     async def test_active_stream_survives_new_model_rejection_then_idle_model_is_evicted(self):
         stream = await self.post("a", stream=True)

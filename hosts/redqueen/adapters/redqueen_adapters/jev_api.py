@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 from PIL import Image
 
-from .common import AdmissionError, IngressGate, UpstreamError, auth_middleware, error_response, read_json, read_limited, safe_errors
+from .common import AdmissionError, IngressGate, UpstreamError, auth_middleware, decode_json, error_response, read_json, read_limited, safe_errors
 from .jevk5_gguf import JevK5GGUF
 from .scheduler_client import SchedulerClient, finish_shielded
 
@@ -101,7 +101,7 @@ class LocalJevBackend:
 async def _upstream_json(response: aiohttp.ClientResponse, description: str) -> dict:
     body = await read_limited(response, description=description)
     try:
-        result = json.loads(body)
+        result = decode_json(body)
         if not isinstance(result, dict):
             raise ValueError("response must be an object")
         return result
@@ -921,7 +921,7 @@ def create_jev_app(
         if response.status != 200:
             return response
         try:
-            body = json.loads(response.body)
+            body = decode_json(response.body)
             openai_body = serialize_openai_decision_response(body, output_specs)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise UpstreamError(502, "decision backend returned an invalid response", "upstream_invalid_response") from error
