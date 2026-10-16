@@ -90,10 +90,10 @@ class Runtime:
         if self.policy.get("profile_path"):
             verify_profiles(json.loads(Path(self.policy["profile_path"]).read_text()))
 
-    async def json(self, url: str) -> object:
+    async def json(self, url: str, *, limit: int = 8 * 1024 * 1024) -> object:
         async with self.session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=5)) as response:
             try:
-                return decode_json(await read_limited(response))
+                return decode_json(await read_limited(response, limit))
             except (ValueError, UnicodeDecodeError) as error:
                 raise RuntimeError("invalid runtime control response") from error
 
@@ -170,9 +170,17 @@ class Runtime:
                     if response.status != 200:
                         return False
             if spec.get("nodes_url"):
-                nodes = await self.json(spec["nodes_url"])
-                if not isinstance(nodes, dict) or not set(spec["required_nodes"]).issubset(nodes):
-                    return False
+                nodes_url = spec["nodes_url"].rstrip("/")
+                for node in spec["required_nodes"]:
+                    # ComfyUI's unfiltered /object_info endpoint walks every
+                    # installed node class. Probe the per-node route so a
+                    # large extension catalog cannot exceed our bounded JSON
+                    # decoder while the backend is starting.
+                    node_info = await self.json(
+                        f"{nodes_url}/{quote(node, safe='')}", limit=512 * 1024
+                    )
+                    if not isinstance(node_info, dict) or not isinstance(node_info.get(node), dict):
+                        return False
             return True
         except (aiohttp.ClientError, TimeoutError, ValueError, TypeError):
             return False
@@ -341,6 +349,12 @@ class Scheduler:
                     cleanup = asyncio.create_task(self._stop_failed_load(name))
                     await finish_shielded(cleanup)
                 raise
+            except UpstreamError as error:
+                if not loading:
+                    raise
+                await self._stop_failed_load(name)
+                LOG.error("admission failed model=%s reason=%s", name, type(error).__name__)
+                raise AdmissionError(503, "model process could not become ready", "model_load_failed") from error
             except AdmissionError:
                 raise
             except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError) as error:

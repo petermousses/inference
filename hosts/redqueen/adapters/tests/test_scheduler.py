@@ -13,7 +13,7 @@ import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from redqueen_adapters.common import AdmissionError
+from redqueen_adapters.common import AdmissionError, UpstreamError
 from redqueen_adapters import deploy_scheduler
 from redqueen_adapters.image_api import ImageSettings, create_image_app
 from redqueen_adapters.jev_api import JevSettings, create_jev_app
@@ -201,6 +201,21 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             await self.scheduler.admit("a")
         self.assertNotIn("a", self.runtime.starts)
 
+    async def test_invalid_control_response_during_load_is_cleaned_up(self):
+        async def start(name):
+            self.runtime.starts.append(name)
+            self.runtime.loaded[name] = "starting"
+            raise UpstreamError(502, "invalid control response", "upstream_invalid_response")
+
+        self.runtime.start = start
+        with self.assertRaises(AdmissionError) as caught:
+            await self.scheduler.admit("large")
+
+        self.assertEqual((caught.exception.status, caught.exception.code), (503, "model_load_failed"))
+        self.assertEqual(self.runtime.stops, ["large"])
+        self.assertNotIn("large", self.runtime.loaded)
+        self.assertNotIn("large", self.scheduler.states)
+
     async def test_rejected_admission_does_not_leave_an_abandoned_owner_record(self):
         self.resources["large"] = resource(75)
         self.runtime.loaded = {"a": "ready"}
@@ -325,6 +340,7 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.started = asyncio.Event()
         self.api_ready = False
         self.custom_nodes = {}
+        self.full_catalog_requests = 0
         self.resources = {"a": resource(60), "b": resource(60), "comfyui": resource(60, "service")}
         self.runtime = FakeRuntime(self.resources)
         self.forwarded = []
@@ -358,10 +374,15 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         async def ready(_):
             return web.json_response({"ok": self.api_ready}, status=200 if self.api_ready else 503)
         async def nodes(_):
+            self.full_catalog_requests += 1
             return web.json_response(self.custom_nodes)
+        async def node(request):
+            name = request.match_info["node_class"]
+            return web.json_response({name: self.custom_nodes[name]} if name in self.custom_nodes else {})
         upstream.router.add_get("/health", health)
         upstream.router.add_get("/ready", ready)
         upstream.router.add_get("/object_info", nodes)
+        upstream.router.add_get("/object_info/{node_class}", node)
         self.upstream = TestServer(upstream)
         await self.upstream.start_server()
         self.addAsyncCleanup(self.upstream.close)
@@ -606,6 +627,20 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await runtime.ready("comfyui"))
         self.custom_nodes["UnetLoaderGGUF"] = {}
         self.assertTrue(await runtime.ready("comfyui"))
+        self.assertEqual(self.full_catalog_requests, 0)
+
+    async def test_image_readiness_probes_only_required_node_metadata(self):
+        required = ["UnetLoaderGGUF", "TextEncodeQwenImage21", "QwenImage21Cache"]
+        self.resources["comfyui"].update(health_url=str(self.upstream.make_url("/health")), nodes_url=str(self.upstream.make_url("/object_info")), required_nodes=required)
+        self.custom_nodes.update({name: {} for name in required})
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        self.assertTrue(await runtime.ready("comfyui"))
+        self.assertEqual(self.full_catalog_requests, 0)
+
+        del self.custom_nodes["QwenImage21Cache"]
+        self.assertFalse(await runtime.ready("comfyui"))
+        self.assertEqual(self.full_catalog_requests, 0)
 
     async def test_deployment_waits_for_existing_leases_before_stopping_anything(self):
         self.runtime.loaded = {"a": "ready"}
