@@ -27,7 +27,7 @@ class UpstreamError(AdmissionError):
 
 
 def admission_response(error: AdmissionError) -> web.Response:
-    response = error_response(error.status, str(error), "rate_limit_error" if error.status == 429 else "server_error")
+    response = error_response(error.status, str(error), "rate_limit_error" if error.status == 429 else "invalid_request_error" if 400 <= error.status < 500 else "server_error")
     body = json.loads(response.body)
     body["error"]["code"] = error.code
     response = web.json_response(body, status=error.status, headers={"Cache-Control": "no-store"})
@@ -60,7 +60,7 @@ def bearer_is_valid(request: web.Request, expected: str) -> bool:
     return (
         separator == " "
         and scheme.lower() == "bearer"
-        and hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+        and hmac.compare_digest(supplied.encode("utf-8", "surrogatepass"), expected.encode("utf-8", "surrogatepass"))
     )
 
 

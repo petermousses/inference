@@ -103,6 +103,7 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
         margin, overhead = policy["estimate_margin"], policy["model_overhead_mib"] * MIB
         return {
             **metadata, "weights_bytes": weight_bytes + extra_bytes + host_bytes,
+            "model_paths": [str(path) for path in weights],
             "context_tokens": int(flags["--ctx-size"]), "planner": str(estimator),
             "gpu_bytes": math.ceil((gpu + extra_bytes) * margin) + overhead,
             "host_bytes": math.ceil(total * margin) + overhead,

@@ -53,6 +53,8 @@ class OwnedRequest:
         self.id = request_id or uuid.uuid4().hex
         if not self.id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for c in self.id) or self.id in {".", ".."}:
             raise ValueError("invalid ownership id")
+        if job and job.keys() & {"version", "id", "request_id", "resource", "boot_id", "pid", "process_start"}:
+            raise ValueError("cannot override request ownership")
         self.path = self.directory / f"{self.id}.json"
         self.record = {"version": 1, "id": self.id, "request_id": self.id, "resource": resource, "boot_id": boot_id(), "pid": os.getpid(), "process_start": process_start(os.getpid()), "phase": "active", **(job or {})}
 

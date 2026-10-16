@@ -48,12 +48,17 @@ class ResourceLock:
         self.fd: int | None = None
 
     def acquire(self) -> bool:
+        if self.fd is not None:
+            raise RuntimeError("resource lease is already acquired")
         fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         try:
             fcntl.flock(fd, (fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         except BlockingIOError:
             os.close(fd)
             return False
+        except BaseException:
+            os.close(fd)
+            raise
         self.fd = fd
         return True
 

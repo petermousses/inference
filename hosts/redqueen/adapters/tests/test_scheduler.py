@@ -167,24 +167,29 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_load_keeps_reservation_until_cleanup_completes(self):
         self.runtime.load_gate = asyncio.Event()
-        entered = asyncio.Event()
+        cleanup_started, cleanup_release = asyncio.Event(), asyncio.Event()
+        original = self.runtime.stop
+        async def stop(name):
+            cleanup_started.set()
+            await cleanup_release.wait()
+            await original(name)
+        self.runtime.stop = stop
         async def request():
             async with self.scheduler.request("large"):
-                entered.set()
+                self.fail("cancelled load was admitted")
         task = asyncio.create_task(request())
         await self.runtime.starting.wait()
         task.cancel()
-        await asyncio.sleep(0)
+        await cleanup_started.wait()
         task.cancel()
         await asyncio.sleep(0)
         self.assertFalse(task.done())
         self.assertEqual(self.scheduler.states["large"], "starting")
-        self.runtime.load_gate.set()
+        cleanup_release.set()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        self.assertFalse(entered.is_set())
         self.assertEqual(self.scheduler.active["large"], 0)
-        self.assertEqual(self.runtime.loaded["large"], "ready")
+        self.assertEqual(self.runtime.loaded, {})
 
     async def test_failed_load_cleans_up_and_failed_cleanup_does_not_release_memory(self):
         self.runtime.load_failure = self.runtime.stop_failure = True
@@ -195,18 +200,57 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             await self.scheduler.admit("a")
         self.assertNotIn("a", self.runtime.starts)
 
-    async def test_load_deadline_stops_partial_model(self):
+    async def test_healthy_load_survives_former_deadline(self):
+        self.policy["load_timeout_s"] = 0.01
         self.runtime.load_gate = asyncio.Event()
-        with self.assertRaises(AdmissionError):
-            await self.scheduler.admit("large")
-        self.assertEqual(self.runtime.stops, ["large"])
-        self.assertEqual(self.runtime.loaded, {})
+        task = asyncio.create_task(self.scheduler.admit("large"))
+        await self.runtime.starting.wait()
+        await asyncio.sleep(0.03)
+        self.assertFalse(task.done())
+        self.assertEqual(self.runtime.stops, [])
+        self.runtime.load_gate.set()
+        await asyncio.wait_for(task, 1)
+        self.assertEqual(self.runtime.loaded, {"large": "ready"})
 
     async def test_external_gpu_memory_is_reserved(self):
         self.runtime.external = Memory(30, 0)
         with self.assertRaises(AdmissionError):
             await self.scheduler.admit("large")
         self.assertEqual(self.runtime.starts, [])
+
+    async def test_partial_failed_backend_recovers_without_waiting_for_idle_age(self):
+        self.runtime.loaded = {"a": "starting"}
+        self.runtime.ready = AsyncMock(return_value=False)
+        self.runtime.busy = AsyncMock(return_value=None)
+        self.runtime.failed = AsyncMock(return_value=True)
+        for _ in range(3):
+            await self.scheduler.reap()
+        self.assertEqual(self.runtime.stops, ["a"])
+        self.assertEqual(self.runtime.loaded, {})
+        self.assertEqual(self.scheduler.recovery["a"]["state"], "cooling-down")
+
+    async def test_uncertain_live_backend_is_not_killed_based_on_age(self):
+        self.runtime.loaded = {"a": "starting"}
+        self.runtime.ready = AsyncMock(return_value=False)
+        self.runtime.busy = AsyncMock(return_value=None)
+        self.runtime.failed = AsyncMock(return_value=False)
+        self.scheduler.last_used["a"] = -1000000000
+        for _ in range(5):
+            await self.scheduler.reap()
+        self.assertEqual(self.runtime.stops, [])
+        self.assertEqual(self.scheduler.recovery["a"]["state"], "quarantined")
+
+    async def test_deployment_lock_rejects_admission_without_stopping_work(self):
+        lock = ResourceLock(self.scheduler.lock_dir.parent, "operations.lock", exclusive=True)
+        self.assertTrue(lock.acquire())
+        try:
+            with self.assertRaises(AdmissionError) as error:
+                await self.scheduler.admit("a")
+            self.assertEqual(error.exception.code, "maintenance")
+            await self.scheduler.reap()
+            self.assertEqual(self.runtime.stops, [])
+        finally:
+            lock.close()
 
     async def test_reaper_preserves_active_work_and_stops_idle_models(self):
         self.runtime.loaded = {"a": "ready", "b": "ready"}
@@ -391,15 +435,20 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             for client in reversed(clients):
                 await client.close()
 
-    async def test_adapter_cancel_keeps_lease_until_background_work_ends(self):
+    async def test_adapter_cancel_keeps_lease_until_owned_cleanup_ends(self):
         client = SchedulerClient(self.policy["socket_path"])
+        cleanup_started = asyncio.Event()
         async def operation():
             self.started.set()
-            await self.release.wait()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                await self.release.wait()
         task = asyncio.create_task(client.run("comfyui", operation))
         await self.started.wait()
         task.cancel()
-        await asyncio.sleep(0)
+        await cleanup_started.wait()
         task.cancel()
         await asyncio.sleep(0)
         self.assertFalse(task.done())
@@ -411,45 +460,54 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         response = await self.post("b")
         self.assertEqual(response.status, 200)
 
-    async def test_unresponsive_upstream_returns_bounded_504(self):
-        self.policy["response_timeout_s"] = 0.03
+    async def test_quiet_prefill_survives_former_response_deadline(self):
+        self.policy.update(response_timeout_s=0.01, request_timeout_s=0.01)
+        task = asyncio.create_task(self.post("a", hang=True))
         try:
-            response = await asyncio.wait_for(self.post("a", hang=True), 0.5)
-            self.assertEqual(response.status, 504)
-            self.assertEqual((await response.json())["error"]["code"], "upstream_timeout")
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done())
+            self.release.set()
+            response = await asyncio.wait_for(task, 1)
+            self.assertEqual(response.status, 200)
+            self.assertTrue((await response.json())["ok"])
         finally:
             self.release.set()
 
-    async def test_stalled_stream_returns_an_error_and_releases_the_lease(self):
-        self.policy["response_timeout_s"] = 0.03
+    async def test_quiet_stream_survives_former_deadlines_and_emits_heartbeats(self):
+        self.policy.update(response_timeout_s=0.01, request_timeout_s=0.01, heartbeat_s=0.01)
+        response = await self.post("a", stream=True)
+        first = await response.content.readany()
+        self.assertIn(b"hello", first)
         try:
-            response = await self.post("a", stream=True)
-            result = await asyncio.wait_for(response.read(), 0.5)
-            self.assertIn(b"upstream_timeout", result)
-            self.assertNotIn(b"[DONE]", result)
-            admitted = await self.post("b")
-            self.assertEqual(admitted.status, 200)
+            heartbeat = await asyncio.wait_for(response.content.readany(), 1)
+            self.assertIn(b": ping", heartbeat)
+            self.assertEqual((await self.post("b")).status, 503)
         finally:
             self.release.set()
+        rest = await asyncio.wait_for(response.read(), 1)
+        self.assertIn(b"[DONE]", rest)
+        self.assertNotIn(b"upstream_timeout", first + heartbeat + rest)
 
-    async def test_client_not_reading_cannot_keep_a_lease_past_total_deadline(self):
-        self.policy.update(request_timeout_s=0.03, response_timeout_s=0.03)
+    async def test_backpressure_does_not_expire_a_live_request(self):
+        self.policy.update(request_timeout_s=0.01, response_timeout_s=0.01)
         original = web.StreamResponse.write
-        write_started = asyncio.Event()
+        write_started, write_release = asyncio.Event(), asyncio.Event()
         async def blocked(response, data):
             if response._req is not None and response._req.app is self.public:
                 write_started.set()
-                await asyncio.Event().wait()
+                await write_release.wait()
             return await original(response, data)
         try:
             with patch.object(web.StreamResponse, "write", new=blocked):
                 response = await self.post("a", stream=True)
-                await asyncio.wait_for(write_started.wait(), 0.5)
-                with self.assertRaises(aiohttp.ClientPayloadError):
-                    await asyncio.wait_for(response.read(), 0.5)
-            admitted = await self.post("b")
-            self.assertEqual(admitted.status, 200)
+                await asyncio.wait_for(write_started.wait(), 1)
+                await asyncio.sleep(0.03)
+                self.assertEqual((await self.post("b")).status, 503)
+                write_release.set()
+                self.release.set()
+                self.assertIn(b"[DONE]", await asyncio.wait_for(response.read(), 1))
         finally:
+            write_release.set()
             self.release.set()
 
     async def test_service_requires_all_health_endpoints_before_admission(self):
