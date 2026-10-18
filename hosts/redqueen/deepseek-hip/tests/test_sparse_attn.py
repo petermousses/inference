@@ -148,6 +148,18 @@ class NativeSparseAttnTest(unittest.TestCase):
         expected = torch.tensor([[[[2.0, 4.0, 6.0], [2.0, 4.0, 6.0]]]], dtype=torch.bfloat16)
         self.assertTrue(torch.equal(actual, expected))
 
+    def test_value_accumulation_uses_bf16_rounded_probabilities(self):
+        q = torch.tensor([[[[1.0, 0.0]]]], dtype=torch.bfloat16)
+        kv = torch.tensor([[[0.0, 0.0], [-1.0, 0.5078125]]], dtype=torch.bfloat16)
+        sink = torch.tensor([0.0], dtype=torch.float32)
+        indices = torch.tensor([[[0, 1]]], dtype=torch.int32)
+        actual = self.call_sparse_attn(q, kv, sink, indices, 1.0)
+
+        # exp(-1) rounds to 0.3671875 in BF16 before the value product; the
+        # denominator keeps the unrounded FP32 exponential plus the sink.
+        self.assertEqual(float(actual[0, 0, 0, 1]), 0.07861328125)
+        self.assertNotEqual(float(actual[0, 0, 0, 1]), 0.0791015625)
+
     def test_all_missing_and_out_of_range_indices_return_zero(self):
         q = torch.ones((1, 2, 3, 5), dtype=torch.bfloat16)
         kv = torch.randn((1, 4, 5), dtype=torch.bfloat16, generator=torch.Generator().manual_seed(1001))
@@ -201,6 +213,16 @@ class NativeSparseAttnTest(unittest.TestCase):
         actual = self.call_sparse_attn(q, kv, sink, indices, 0.11)
         expected = reference_sparse_attn(q, kv, sink, indices, 0.11)
         self.assert_matches_reference(actual, expected, max_ulp=2)
+
+    def test_output_feature_slices_cross_256_thread_boundaries(self):
+        q = torch.zeros((1, 1, 3, 513), dtype=torch.bfloat16)
+        kv = torch.empty((1, 2, 513), dtype=torch.bfloat16)
+        kv[:, 0, :] = 1.0
+        kv[:, 1, :] = 2.0
+        sink = torch.zeros((3,), dtype=torch.float32)
+        indices = torch.tensor([[[0, 1]]], dtype=torch.int32)
+        actual = self.call_sparse_attn(q, kv, sink, indices, 1.0)
+        self.assertTrue(torch.equal(actual, torch.ones_like(actual)))
 
     def test_rejects_invalid_arguments_without_launching(self):
         q = torch.ones((1, 1, 2, 3), dtype=torch.bfloat16, device="cuda")
