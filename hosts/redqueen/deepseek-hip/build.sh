@@ -12,6 +12,7 @@ sources=(
   "${root}/src/rmsnorm.hip"
   "${root}/src/sparse_attn.hip"
   "${root}/src/rope.hip"
+  "${root}/src/hc_sinkhorn.hip"
 )
 
 if [[ "${DS4_HIP_TEST_SUPPORT:-0}" == "1" ]]; then
