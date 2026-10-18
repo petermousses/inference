@@ -8,6 +8,7 @@ sources=(
   "${root}/src/quantization.hip"
   "${root}/src/fp8_gemm.hip"
   "${root}/src/rmsnorm.hip"
+  "${root}/src/sparse_attn.hip"
 )
 
 if [[ "${DS4_HIP_TEST_SUPPORT:-0}" == "1" ]]; then
