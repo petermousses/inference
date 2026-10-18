@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from cached_model import install_cached_moe, run_reserved_sync
+from cached_model import install_cached_moe
 
 
 class _Cache:
@@ -49,6 +49,15 @@ def _moe(layer_id, expert_count=4, swiglu_limit=10.0):
         gate=lambda activations, image_mask=None: (activations, image_mask),
         shared_experts=shared_expert,
         forward=original,
+    )
+
+
+def _installation(cache, fence):
+    return install_cached_moe(
+        SimpleNamespace(layers=[], mtp=[]),
+        cache,
+        lambda values, weight: values,
+        fence=fence,
     )
 
 
@@ -141,12 +150,8 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(reservation.active)
             events.append("fence")
 
-        result = await run_reserved_sync(
-            operation,
-            reservation,
-            cache=cache,
-            fence=fence,
-        )
+        with _installation(cache, fence) as installation:
+            result = await installation.run_reserved_sync(operation, reservation)
         self.assertEqual(result, "result")
         self.assertEqual(events, ["enter", "operation", "fence", "exit"])
         self.assertFalse(reservation.active)
@@ -164,10 +169,9 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(reservation.active)
             events.append("fence")
 
-        with self.assertRaisesRegex(LookupError, "model failure"):
-            await run_reserved_sync(
-                operation, reservation, cache=cache, fence=fence
-            )
+        with _installation(cache, fence) as installation:
+            with self.assertRaisesRegex(LookupError, "model failure"):
+                await installation.run_reserved_sync(operation, reservation)
         self.assertEqual(events, ["enter", "operation", "fence", "exit"])
 
     async def test_worker_context_wraps_operation_and_restores_before_fence(self):
@@ -182,13 +186,12 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             def __exit__(self, exc_type, exc, traceback):
                 events.append("worker-exit")
 
-        await run_reserved_sync(
-            lambda: events.append("operation"),
-            reservation,
-            cache=cache,
-            fence=lambda: events.append("fence"),
-            worker_context=WorkerContext,
-        )
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            await installation.run_reserved_sync(
+                lambda: events.append("operation"),
+                reservation,
+                worker_context=WorkerContext,
+            )
         self.assertEqual(
             events,
             ["enter", "worker-enter", "operation", "worker-exit", "fence", "exit"],
@@ -204,21 +207,21 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             events.append("fence")
             raise RuntimeError("GPU fence failed")
 
-        with self.assertRaisesRegex(RuntimeError, "GPU fence failed"):
-            await run_reserved_sync(
-                lambda: events.append("operation"),
-                reservation,
-                cache=cache,
-                fence=fence,
-            )
+        with _installation(cache, fence) as installation:
+            with self.assertRaisesRegex(RuntimeError, "GPU fence failed"):
+                await installation.run_reserved_sync(
+                    lambda: events.append("operation"), reservation
+                )
         self.assertTrue(cache.quarantined)
         self.assertEqual(events, ["enter", "operation", "fence", "exit"])
 
     async def test_cancelled_waiter_keeps_reservation_until_worker_finishes(self):
         events = []
         reservation = _Reservation(events)
+        second_reservation = _Reservation(events)
         cache = _Cache()
         started = threading.Event()
+        second_started = threading.Event()
         release = threading.Event()
 
         def operation():
@@ -228,28 +231,106 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             events.append("operation-finished")
 
         def fence():
-            self.assertTrue(reservation.active)
+            self.assertTrue(reservation.active or second_reservation.active)
             events.append("fence")
 
-        task = asyncio.create_task(
-            run_reserved_sync(
-                operation, reservation, cache=cache, fence=fence
+        with _installation(cache, fence) as installation:
+            task = asyncio.create_task(
+                installation.run_reserved_sync(operation, reservation)
             )
-        )
-        try:
-            started_in_time = await asyncio.to_thread(started.wait, 2)
-            self.assertTrue(started_in_time)
-            task.cancel()
-            with self.assertRaises(asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
-            self.assertTrue(reservation.active)
-            self.assertNotIn("exit", events)
-        finally:
-            release.set()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
+            second_task = None
+            try:
+                started_in_time = await asyncio.to_thread(started.wait, 2)
+                self.assertTrue(started_in_time)
+                task.cancel()
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+                self.assertTrue(reservation.active)
+                self.assertNotIn("exit", events)
+                second_task = asyncio.create_task(
+                    installation.run_reserved_sync(
+                        lambda: (second_started.set(), events.append("second-finished")),
+                        second_reservation,
+                    )
+                )
+                await asyncio.sleep(0.05)
+                self.assertFalse(second_started.is_set())
+                self.assertFalse(second_reservation.active)
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            if second_task is not None:
+                await second_task
         self.assertFalse(reservation.active)
-        self.assertEqual(events, ["enter", "operation-finished", "fence", "exit"])
+        self.assertFalse(second_reservation.active)
+        self.assertEqual(
+            events,
+            [
+                "enter",
+                "operation-finished",
+                "fence",
+                "exit",
+                "enter",
+                "second-finished",
+                "fence",
+                "exit",
+            ],
+        )
+
+    async def test_model_execution_is_serialized_before_memory_admission(self):
+        cache = _Cache()
+        events = []
+        first_reservation = _Reservation(events)
+        second_reservation = _Reservation(events)
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+        active_guard = threading.Lock()
+        active = 0
+        peak_active = 0
+
+        def operation(started, release=None):
+            def run():
+                nonlocal active, peak_active
+                with active_guard:
+                    active += 1
+                    peak_active = max(peak_active, active)
+                started.set()
+                if release is not None and not release.wait(2):
+                    raise TimeoutError("first operation was not released")
+                with active_guard:
+                    active -= 1
+            return run
+
+        def fence():
+            self.assertTrue(first_reservation.active or second_reservation.active)
+
+        with _installation(cache, fence) as installation:
+            first = asyncio.create_task(
+                installation.run_reserved_sync(
+                    operation(first_started, release_first), first_reservation
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(first_started.wait, 2))
+            second = asyncio.create_task(
+                installation.run_reserved_sync(
+                    operation(second_started), second_reservation
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(second_started.is_set())
+            self.assertFalse(second_reservation.active)
+            with self.assertRaisesRegex(RuntimeError, "during model execution"):
+                installation.close()
+
+            release_first.set()
+            await asyncio.gather(first, second)
+            self.assertTrue(second_started.is_set())
+            self.assertEqual(peak_active, 1)
+
+        with self.assertRaisesRegex(RuntimeError, "already closed"):
+            await installation.run_reserved_sync(lambda: None, _Reservation([]))
 
 
 if __name__ == "__main__":

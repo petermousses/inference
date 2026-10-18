@@ -24,8 +24,16 @@ class _ForwardPatch:
 class CachedMoEInstallation:
     """Reversible per-instance MoE.forward patches for one transformer."""
 
-    def __init__(self, patches: list[_ForwardPatch]) -> None:
+    def __init__(
+        self,
+        patches: list[_ForwardPatch],
+        cache: object,
+        fence: Callable[[], None] | None,
+    ) -> None:
         self._patches = patches
+        self._cache = cache
+        self._fence = fence
+        self._execution_lock = asyncio.Lock()
         self._closed = False
 
     def __enter__(self) -> CachedMoEInstallation:
@@ -39,12 +47,79 @@ class CachedMoEInstallation:
     def close(self) -> None:
         if self._closed:
             return
+        if self._execution_lock.locked():
+            raise RuntimeError("cannot close cached MoE installation during model execution")
         for patch in self._patches:
             if patch.moe.forward is not patch.installed:
                 raise RuntimeError("MoE.forward changed while the cache was installed")
         for patch in self._patches:
             patch.moe.forward = patch.original
         self._closed = True
+
+    async def run_reserved_sync(
+        self,
+        operation: Callable[[], _T],
+        reservation,
+        *,
+        worker_context: Callable[[], object] | None = None,
+    ) -> _T:
+        """Serialize model execution and hold its broker lease through the GPU fence.
+
+        The execution lock is acquired before memory admission, so a queued
+        request does not reserve memory while another request uses the graph.
+        The operation must consume or copy GPU results before returning, so
+        the reservation covers all live request state. ``worker_context`` can
+        install thread-local device/runtime state and must restore it on exit.
+        """
+        if self._closed:
+            raise RuntimeError("cached MoE installation is already closed")
+        if not callable(operation):
+            raise TypeError("operation must be callable")
+        if not callable(self._fence):
+            raise ValueError("cached MoE installation requires a final GPU fence")
+        if worker_context is not None and not callable(worker_context):
+            raise TypeError("worker_context must be callable")
+        if not callable(getattr(self._cache, "quarantine", None)):
+            raise TypeError("cache must support quarantine")
+        if not callable(getattr(reservation, "__aenter__", None)) or not callable(
+            getattr(reservation, "__aexit__", None)
+        ):
+            raise TypeError("reservation must be an async context manager")
+
+        async with self._execution_lock:
+            if self._closed:
+                raise RuntimeError("cached MoE installation is already closed")
+            async with reservation:
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        _run_and_fence,
+                        operation,
+                        self._cache,
+                        self._fence,
+                        worker_context,
+                    )
+                )
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError as cancellation:
+                    # Do not cancel the worker: it must finish and fence while
+                    # both the reservation and execution lock remain held.
+                    while not task.done():
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            continue
+                        except BaseException:
+                            break
+                    try:
+                        task.result()
+                    except BaseException as worker_error:
+                        if hasattr(cancellation, "add_note"):
+                            cancellation.add_note(
+                                "GPU worker finished with "
+                                f"{worker_error!r} while cancellation drained"
+                            )
+                    raise cancellation
 
 
 def _blocks(value: object, name: str) -> list[object]:
@@ -158,7 +233,7 @@ def install_cached_moe(
 
     for patch in patches:
         patch.moe.forward = patch.installed
-    return CachedMoEInstallation(patches)
+    return CachedMoEInstallation(patches, cache, fence)
 
 
 def _run_and_fence(
@@ -193,62 +268,3 @@ def _run_and_fence(
     if operation_error is not None:
         raise operation_error
     return result  # type: ignore[return-value]
-
-
-async def run_reserved_sync(
-    operation: Callable[[], _T],
-    reservation,
-    *,
-    cache: object,
-    fence: Callable[[], None],
-    worker_context: Callable[[], object] | None = None,
-) -> _T:
-    """Run synchronous GPU work under an async broker lease without early release.
-
-    The blocking operation runs in a worker thread. If its coroutine waiter is
-    cancelled, the thread is allowed to finish and fence while the async memory
-    reservation remains held; ``asyncio.to_thread`` cancellation alone does
-    not stop native or PyTorch work. The operation must consume or copy any GPU
-    result before returning, so the reservation covers all live request state.
-    ``worker_context`` can install thread-local device/runtime state that the
-    event loop does not propagate, and must restore that state when it exits.
-    """
-    if not callable(operation):
-        raise TypeError("operation must be callable")
-    if not callable(fence):
-        raise TypeError("fence must be callable")
-    if worker_context is not None and not callable(worker_context):
-        raise TypeError("worker_context must be callable")
-    if not callable(getattr(cache, "quarantine", None)):
-        raise TypeError("cache must support quarantine")
-    if not callable(getattr(reservation, "__aenter__", None)) or not callable(
-        getattr(reservation, "__aexit__", None)
-    ):
-        raise TypeError("reservation must be an async context manager")
-
-    async with reservation:
-        task = asyncio.create_task(
-            asyncio.to_thread(
-                _run_and_fence, operation, cache, fence, worker_context
-            )
-        )
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError as cancellation:
-            # Do not cancel the asyncio.to_thread task: cancellation would stop
-            # awaiting its Future while leaving the native worker alive.
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    continue
-                except BaseException:
-                    break
-            try:
-                task.result()
-            except BaseException as worker_error:
-                if hasattr(cancellation, "add_note"):
-                    cancellation.add_note(
-                        f"GPU worker finished with {worker_error!r} while cancellation drained"
-                    )
-            raise cancellation

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import os
 import runpy
 import sys
@@ -11,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-from cached_model import install_cached_moe, run_reserved_sync
+from cached_model import install_cached_moe
 from expert_cache import FP4ExpertCache, FP4ExpertKey
 from expert_weights import LoadedFP4Expert
 
@@ -51,8 +53,23 @@ def main() -> None:
         os.environ.get("DS4_INFERENCE_DIR", "/srv/ai/models/deepseek-v4.1-flash-1017/inference")
     ).expanduser()
     model_path = inference_dir / "model.py"
-    if not model_path.is_file():
-        raise SystemExit(f"official DeepSeek inference/model.py not found: {model_path}")
+    config_path = inference_dir / "config.json"
+    if not model_path.is_file() or not config_path.is_file():
+        raise SystemExit(f"pinned DeepSeek inference source is incomplete: {inference_dir}")
+    model_config = json.loads(config_path.read_text())
+    swiglu_limit = model_config.get("swiglu_limit")
+    if (
+        isinstance(swiglu_limit, bool)
+        or not isinstance(swiglu_limit, (int, float))
+        or not math.isfinite(swiglu_limit)
+        or swiglu_limit <= 0
+    ):
+        raise SystemExit("pinned 1017 config must declare a positive swiglu_limit")
+    n_mtp_layers = model_config.get("num_nextn_predict_layers")
+    if type(n_mtp_layers) is not int or n_mtp_layers < 1:
+        raise SystemExit(
+            "pinned 1017 config must declare a positive num_nextn_predict_layers"
+        )
 
     adapter_dir = Path(__file__).resolve().parent
     checkpoint_root = inference_dir.parent
@@ -108,6 +125,8 @@ def main() -> None:
         dspark_block_size=6,
         dspark_target_layer_ids=(3, 4),
         temperature=0,
+        swiglu_limit=swiglu_limit,
+        n_mtp_layers=n_mtp_layers,
     )
     tokens = torch.randint(0, args.vocab_size, (2, 150))
     model = reference["Transformer"](args)
@@ -117,15 +136,18 @@ def main() -> None:
     def run_graph():
         snapshots = []
 
-        def snapshot(output_ids, logits, main_hidden):
+        def snapshot(values):
             return tuple(
                 None if value is None else value.detach().cpu().clone()
-                for value in (output_ids, logits, main_hidden)
+                for value in values
             )
 
         output_ids, logits, main_hidden = model(tokens[:, :128])
-        snapshots.append(snapshot(output_ids, logits, main_hidden))
-        model.forward_spec(output_ids, main_hidden)
+        prefill_snapshot = snapshot((output_ids, logits, main_hidden))
+        prefill_spec = model.forward_spec(output_ids, main_hidden)
+        if prefill_spec is not None:
+            raise RuntimeError("pinned graph returned a DSpark step during prefill")
+        snapshots.append((prefill_snapshot, None))
         for position in range(128, 150):
             output_ids, logits, main_hidden = model(
                 tokens[:, position : position + 1], position
@@ -133,7 +155,12 @@ def main() -> None:
             result = model.forward_spec(output_ids, main_hidden, position)
             if result is None:
                 raise RuntimeError("pinned graph did not return a DSpark step")
-            snapshots.append(snapshot(output_ids, logits, main_hidden))
+            snapshots.append(
+                (
+                    snapshot((output_ids, logits, main_hidden)),
+                    snapshot(result),
+                )
+            )
             output_ids, _, _ = result
         return snapshots
 
@@ -198,24 +225,54 @@ def main() -> None:
 
     with install_cached_moe(
         model, cache, reference["linear"], fence=request_fence
-    ):
+    ) as installation:
         actual = asyncio.run(
-            run_reserved_sync(
+            installation.run_reserved_sync(
                 run_graph,
                 SmokeReservation(),
-                cache=cache,
-                fence=request_fence,
                 worker_context=gpu_worker_context,
             )
         )
 
-    if len(actual) != len(expected) or any(
-        not torch.equal(expected_tensor, actual_tensor)
-        for expected_step, actual_step in zip(expected, actual)
-        for expected_tensor, actual_tensor in zip(expected_step, actual_step)
-        if expected_tensor is not None
-    ):
-        raise AssertionError("cached full-model graph differs from the pinned MoE path")
+    if len(actual) != len(expected):
+        raise AssertionError(
+            f"cached graph returned {len(actual)} steps; pinned graph returned {len(expected)}"
+        )
+    for step, (expected_step, actual_step) in enumerate(zip(expected, actual)):
+        for branch, expected_values, actual_values in zip(
+            ("main", "DSpark"), expected_step, actual_step
+        ):
+            if expected_values is None or actual_values is None:
+                if expected_values is not actual_values:
+                    raise AssertionError(
+                        f"cached graph step {step} {branch} output presence differs"
+                    )
+                continue
+            if len(expected_values) != len(actual_values):
+                raise AssertionError(
+                    f"cached graph step {step} {branch} output shape differs"
+                )
+            names = ("output_ids", "logits", "hidden") if branch == "main" else (
+                "output_ids",
+                "logits",
+                "confidence",
+            )
+            if len(expected_values) != len(names):
+                raise AssertionError(
+                    f"pinned graph step {step} {branch} returned an unexpected tuple"
+                )
+            for name, expected_tensor, actual_tensor in zip(
+                names, expected_values, actual_values
+            ):
+                if expected_tensor is None or actual_tensor is None:
+                    if expected_tensor is not actual_tensor:
+                        raise AssertionError(
+                            f"cached graph step {step} {branch} {name} presence differs"
+                        )
+                elif not torch.equal(expected_tensor, actual_tensor):
+                    raise AssertionError(
+                        f"cached graph step {step} {branch} {name} differs from pinned path"
+                    )
     stats = cache.stats
     if stats.leased_bytes or stats.loading_bytes or stats.pending_loads:
         raise RuntimeError("cached transformer returned with an outstanding expert lease")
@@ -229,6 +286,8 @@ def main() -> None:
         f"RoPE={usage['rope']}",
         f"cache_entries={stats.entries}",
         f"cache_capacity_bytes={stats.capacity_bytes}",
+        f"mtp_layers={args.n_mtp_layers}",
+        f"swiglu_limit={args.swiglu_limit}",
         "exact=True",
     )
 
