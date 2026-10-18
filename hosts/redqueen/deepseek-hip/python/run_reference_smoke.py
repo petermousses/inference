@@ -78,6 +78,11 @@ def main() -> None:
         raise SystemExit("pinned 1017 config must declare nonnegative compress_ratios")
     if len(compress_ratios) < model_n_layers + n_mtp_layers:
         raise SystemExit("pinned 1017 compress_ratios do not cover all MTP layers")
+    mtp_compress_ratios = tuple(
+        compress_ratios[model_n_layers : model_n_layers + n_mtp_layers]
+    )
+    if any(mtp_compress_ratios):
+        raise SystemExit("pinned 1017 MTP layers must use uncompressed attention")
 
     def source_layers(name):
         values = model_config.get(name)
@@ -88,8 +93,8 @@ def main() -> None:
             raise SystemExit(f"pinned 1017 config must declare valid {name}")
         return tuple(values)
 
-    kv_source_layers = source_layers("kv_source_layers")
-    index_source_layers = source_layers("index_source_layers")
+    pinned_kv_source_layers = source_layers("kv_source_layers")
+    pinned_index_source_layers = source_layers("index_source_layers")
 
     adapter_dir = Path(__file__).resolve().parent
     checkpoint_root = inference_dir.parent
@@ -141,15 +146,28 @@ def main() -> None:
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.manual_seed(0)
+    # Keep the graph small while preserving the pinned attention setup for its
+    # six backbone layers and mapping all released MTP blocks onto it.
+    synthetic_n_layers = 6
+    if synthetic_n_layers > model_n_layers:
+        raise SystemExit("pinned model has too few backbone layers for the smoke graph")
+    synthetic_compress_ratios = (
+        tuple(compress_ratios[:synthetic_n_layers]) + mtp_compress_ratios
+    )
     args = reference["ModelArgs"](
+        n_layers=synthetic_n_layers,
         dspark_block_size=6,
         dspark_target_layer_ids=(3, 4),
         temperature=0,
         swiglu_limit=swiglu_limit,
         n_mtp_layers=n_mtp_layers,
-        compress_ratios=tuple(compress_ratios),
-        kv_source_layers=kv_source_layers,
-        index_source_layers=index_source_layers,
+        compress_ratios=synthetic_compress_ratios,
+        kv_source_layers=tuple(
+            layer for layer in pinned_kv_source_layers if layer < synthetic_n_layers
+        ),
+        index_source_layers=tuple(
+            layer for layer in pinned_index_source_layers if layer < synthetic_n_layers
+        ),
     )
     if len(args.compress_ratios) < args.n_layers + args.n_mtp_layers:
         raise SystemExit("pinned 1017 compress_ratios do not cover all MTP layers")
