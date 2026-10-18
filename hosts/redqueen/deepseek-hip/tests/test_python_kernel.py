@@ -18,6 +18,63 @@ class NativeKernelModuleTest(unittest.TestCase):
         kernel._library()
         cls.e8m0 = torch.float8_e8m0fnu
 
+    def test_rmsnorm_matches_reference_with_strided_input_and_mixed_dtypes(self):
+        values = torch.randn((3, 2, 33), dtype=torch.float32, device="cuda")
+        values = values.to(torch.bfloat16).transpose(0, 1)
+        weight = torch.randn((33,), dtype=torch.float32, device="cuda")
+        self.assertFalse(values.is_contiguous())
+
+        result = kernel.rmsnorm(values, weight, 1e-20)
+        expected = (
+            values.float()
+            * torch.rsqrt(values.float().square().mean(dim=-1, keepdim=True) + 1e-20)
+            * weight
+        ).to(values.dtype)
+        self.assertEqual(result.shape, values.shape)
+        self.assertEqual(result.dtype, values.dtype)
+        torch.testing.assert_close(result.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+    def test_rmsnorm_rejects_nonpositive_epsilon_before_native_call(self):
+        values = torch.ones((2, 8), dtype=torch.bfloat16, device="cuda")
+        weight = torch.ones((8,), dtype=torch.bfloat16, device="cuda")
+        with self.assertRaisesRegex(ValueError, "finite positive number"):
+            kernel.rmsnorm(values, weight, 0.0)
+
+    def test_rope_matches_reference_for_strided_tail_and_inverse(self):
+        backing = torch.randn((2, 3, 4, 48), dtype=torch.float32, device="cuda").to(torch.bfloat16)
+        tail = backing[..., 8:40]
+        original = tail.float().contiguous()
+        angles = torch.randn((3, 16), dtype=torch.float32, device="cuda")
+        frequencies = torch.polar(torch.ones_like(angles), angles)
+        self.assertFalse(tail.is_contiguous())
+
+        pairs = torch.view_as_complex(original.view(2, 3, 4, 16, 2))
+        reference = torch.view_as_real(pairs * frequencies.view(1, 3, 1, 16)).flatten(-2).to(tail.dtype)
+        result = kernel.apply_rotary_emb(tail, frequencies)
+        self.assertIs(result, tail)
+        torch.testing.assert_close(tail.float(), reference.float(), rtol=1e-2, atol=1e-2)
+
+        after_forward = tail.float().contiguous()
+        inverse_pairs = torch.view_as_complex(after_forward.view(2, 3, 4, 16, 2))
+        inverse_reference = (
+            torch.view_as_real(inverse_pairs * frequencies.conj().view(1, 3, 1, 16))
+            .flatten(-2)
+            .to(tail.dtype)
+        )
+        kernel.apply_rotary_emb(tail, frequencies, inverse=True)
+        torch.testing.assert_close(tail.float(), inverse_reference.float(), rtol=1e-2, atol=1e-2)
+
+    def test_rope_rejects_nonunit_rotary_stride_without_mutating_storage(self):
+        backing = torch.full((1, 2, 1, 8), 3.0, dtype=torch.bfloat16, device="cuda")
+        original = backing.clone()
+        sliced = backing[..., ::2]
+        frequencies = torch.ones((2, 2), dtype=torch.complex64, device="cuda")
+        self.assertEqual(sliced.stride(-1), 2)
+        with self.assertRaisesRegex(ValueError, "contiguous rotary dimension"):
+            kernel.apply_rotary_emb(sliced, frequencies)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(backing, original))
+
     def test_act_quant_returns_reference_shapes_and_inplace_dequantization(self):
         values = torch.linspace(-24, 24, 3 * 64, dtype=torch.float32).reshape(1, 3, 64).to(torch.bfloat16).cuda()
         quantized, scales = kernel.act_quant(values, 32, "ue8m0", self.e8m0)

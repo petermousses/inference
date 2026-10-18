@@ -59,6 +59,31 @@ def _library() -> ctypes.CDLL:
         signatures = {
             "redqueen_ds4_quantize_activation": [pointer, pointer, pointer, integer, integer, integer, pointer],
             "redqueen_ds4_decode_e8m0": [pointer, pointer, integer, pointer],
+            "redqueen_ds4_rmsnorm": [
+                pointer,
+                pointer,
+                pointer,
+                integer,
+                integer,
+                integer,
+                integer,
+                floating,
+                pointer,
+            ],
+            "redqueen_ds4_rope_inplace": [
+                pointer,
+                pointer,
+                integer,
+                integer,
+                integer,
+                integer,
+                integer,
+                integer,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                pointer,
+            ],
             "redqueen_ds4_fp4_quantize_activation": [
                 pointer,
                 pointer,
@@ -185,6 +210,103 @@ def _c_int(value: int, name: str, *, positive: bool = True) -> int:
 
 def _contiguous(tensor: torch.Tensor) -> torch.Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Apply the pinned model's RMSNorm formula through the native HIP kernel."""
+    if x.ndim < 1 or weight.ndim != 1:
+        raise ValueError("RMSNorm expects input rank >= 1 and a one-dimensional weight")
+    device, stream = _validate_same_device(x, weight=weight)
+    supported_dtypes = (torch.float32, torch.bfloat16)
+    if x.dtype not in supported_dtypes or weight.dtype not in supported_dtypes:
+        raise NotImplementedError("native RMSNorm supports float32 and bfloat16 input and weight")
+    dim = _c_int(x.shape[-1], "RMSNorm dimension")
+    rows = _c_int(x.numel() // dim if dim else 0, "RMSNorm row count")
+    if dim == 0 or rows == 0 or weight.numel() != dim:
+        raise ValueError("RMSNorm input and weight dimensions are incompatible or empty")
+    if isinstance(eps, bool):
+        raise TypeError("RMSNorm eps must be a finite positive number")
+    try:
+        eps = float(eps)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("RMSNorm eps must be a finite positive number") from exc
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("RMSNorm eps must be a finite positive number")
+
+    contiguous_x = _contiguous(x)
+    contiguous_weight = _contiguous(weight)
+    contiguous_x.record_stream(stream)
+    contiguous_weight.record_stream(stream)
+    output = torch.empty(x.shape, dtype=x.dtype, device=device)
+    input_dtype = 0 if x.dtype == torch.float32 else 1
+    weight_dtype = 0 if weight.dtype == torch.float32 else 1
+    _check(
+        _library().redqueen_ds4_rmsnorm(
+            _ptr(contiguous_x),
+            _ptr(contiguous_weight),
+            _ptr(output),
+            rows,
+            dim,
+            input_dtype,
+            weight_dtype,
+            eps,
+            _stream_ptr(stream),
+        ),
+        "RMSNorm",
+    )
+    return output
+
+
+def apply_rotary_emb(
+    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
+    """Match the reference's in-place adjacent-pair RoPE operation."""
+    if x.ndim not in (3, 4):
+        raise ValueError("RoPE expects [batch, sequence, dim] or [batch, sequence, heads, dim]")
+    device, stream = _validate_same_device(x, freqs_cis=freqs_cis)
+    if x.dtype not in (torch.float32, torch.bfloat16):
+        raise NotImplementedError("native RoPE supports float32 and bfloat16 input")
+    if x.stride(-1) != 1:
+        raise ValueError("native RoPE requires a contiguous rotary dimension")
+    if freqs_cis.dtype != torch.complex64:
+        raise TypeError("RoPE frequencies must be complex64")
+    if not isinstance(inverse, bool):
+        raise TypeError("inverse must be a bool")
+
+    batch = _c_int(x.shape[0], "RoPE batch")
+    sequence = _c_int(x.shape[1], "RoPE sequence")
+    rotary_dim = _c_int(x.shape[-1], "RoPE dimension")
+    heads = _c_int(x.shape[2] if x.ndim == 4 else 1, "RoPE heads")
+    if rotary_dim % 2:
+        raise ValueError("RoPE dimension must be even")
+    if tuple(freqs_cis.shape) != (sequence, rotary_dim // 2):
+        raise ValueError("RoPE frequencies must have shape [sequence, rotary_dim / 2]")
+
+    frequencies = freqs_cis.resolve_conj()
+    frequencies = _contiguous(frequencies)
+    frequencies.record_stream(stream)
+    if x.ndim == 3:
+        batch_stride, sequence_stride, head_stride = x.stride(0), x.stride(1), 0
+    else:
+        batch_stride, sequence_stride, head_stride = x.stride(0), x.stride(1), x.stride(2)
+    _check(
+        _library().redqueen_ds4_rope_inplace(
+            _ptr(x),
+            _ptr(frequencies),
+            batch,
+            sequence,
+            heads,
+            rotary_dim,
+            0 if x.dtype == torch.float32 else 1,
+            int(inverse),
+            batch_stride,
+            sequence_stride,
+            head_stride,
+            _stream_ptr(stream),
+        ),
+        "RoPE",
+    )
+    return x
 
 
 def _e8m0_to_float(scales: torch.Tensor) -> torch.Tensor:
