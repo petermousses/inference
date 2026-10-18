@@ -5,6 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 rocm_path="${ROCM_PATH:-/opt/rocm}"
 build_dir="${BUILD_DIR:-${root}/build}"
 sources=(
+  "${root}/src/fp4_quant.hip"
   "${root}/src/quantization.hip"
   "${root}/src/fp4_gemm.hip"
   "${root}/src/fp8_gemm.hip"
