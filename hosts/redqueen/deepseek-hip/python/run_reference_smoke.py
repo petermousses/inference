@@ -1,11 +1,51 @@
-"""Run the pinned reference model's small built-in graph smoke test."""
+"""Compare cached native MoE execution with the pinned full-model graph."""
 
 from __future__ import annotations
 
+import asyncio
+import json
+import math
 import os
 import runpy
 import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
+
+
+from cached_model import install_cached_moe
+from expert_cache import FP4ExpertCache, FP4ExpertKey
+from expert_weights import LoadedFP4Expert
+
+
+def initialize_smoke_parameters(model, torch, device) -> None:
+    """Give the uncheckpointed reference graph finite, reproducible weights."""
+    fp4_dtype = torch.float4_e2m1fn_x2
+    scale_dtype = torch.float8_e8m0fnu
+    fp8_dtype = torch.float8_e4m3fn
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.dtype == fp4_dtype:
+                packed = torch.randint(
+                    0,
+                    256,
+                    parameter.shape,
+                    dtype=torch.uint8,
+                    device=device,
+                ).view(torch.int8)
+                parameter.copy_(packed.view(fp4_dtype))
+            elif parameter.dtype == scale_dtype:
+                parameter.fill_(1.0)
+            elif parameter.dtype == fp8_dtype:
+                values = torch.randn(
+                    parameter.shape, dtype=torch.float32, device=device
+                ).mul_(0.05)
+                parameter.copy_(values.to(fp8_dtype))
+            elif parameter.is_floating_point():
+                values = torch.randn(
+                    parameter.shape, dtype=torch.float32, device=device
+                ).mul_(0.02)
+                parameter.copy_(values.to(parameter.dtype))
 
 
 def main() -> None:
@@ -13,8 +53,48 @@ def main() -> None:
         os.environ.get("DS4_INFERENCE_DIR", "/srv/ai/models/deepseek-v4.1-flash-1017/inference")
     ).expanduser()
     model_path = inference_dir / "model.py"
-    if not model_path.is_file():
-        raise SystemExit(f"official DeepSeek inference/model.py not found: {model_path}")
+    config_path = inference_dir / "config.json"
+    if not model_path.is_file() or not config_path.is_file():
+        raise SystemExit(f"pinned DeepSeek inference source is incomplete: {inference_dir}")
+    model_config = json.loads(config_path.read_text())
+    swiglu_limit = model_config.get("swiglu_limit")
+    if (
+        isinstance(swiglu_limit, bool)
+        or not isinstance(swiglu_limit, (int, float))
+        or not math.isfinite(swiglu_limit)
+        or swiglu_limit <= 0
+    ):
+        raise SystemExit("pinned 1017 config must declare a positive swiglu_limit")
+    n_mtp_layers = model_config.get("n_mtp_layers")
+    if type(n_mtp_layers) is not int or n_mtp_layers < 1:
+        raise SystemExit("pinned 1017 config must declare a positive n_mtp_layers")
+    model_n_layers = model_config.get("n_layers")
+    if type(model_n_layers) is not int or model_n_layers < 1:
+        raise SystemExit("pinned 1017 config must declare a positive n_layers")
+    compress_ratios = model_config.get("compress_ratios")
+    if not isinstance(compress_ratios, list) or any(
+        type(ratio) is not int or ratio < 0 for ratio in compress_ratios
+    ):
+        raise SystemExit("pinned 1017 config must declare nonnegative compress_ratios")
+    if len(compress_ratios) < model_n_layers + n_mtp_layers:
+        raise SystemExit("pinned 1017 compress_ratios do not cover all MTP layers")
+    mtp_compress_ratios = tuple(
+        compress_ratios[model_n_layers : model_n_layers + n_mtp_layers]
+    )
+    if any(mtp_compress_ratios):
+        raise SystemExit("pinned 1017 MTP layers must use uncompressed attention")
+
+    def source_layers(name):
+        values = model_config.get(name)
+        if not isinstance(values, list) or any(
+            type(layer) is not int or not 0 <= layer < model_n_layers
+            for layer in values
+        ):
+            raise SystemExit(f"pinned 1017 config must declare valid {name}")
+        return tuple(values)
+
+    pinned_kv_source_layers = source_layers("kv_source_layers")
+    pinned_index_source_layers = source_layers("index_source_layers")
 
     adapter_dir = Path(__file__).resolve().parent
     checkpoint_root = inference_dir.parent
@@ -66,21 +146,193 @@ def main() -> None:
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
     torch.manual_seed(0)
-    args = reference["ModelArgs"](dspark_block_size=6, dspark_target_layer_ids=(3, 4))
+    # Keep the graph small while preserving the pinned attention setup for its
+    # six backbone layers and mapping all released MTP blocks onto it.
+    synthetic_n_layers = 6
+    if synthetic_n_layers > model_n_layers:
+        raise SystemExit("pinned model has too few backbone layers for the smoke graph")
+    synthetic_compress_ratios = (
+        tuple(compress_ratios[:synthetic_n_layers]) + mtp_compress_ratios
+    )
+    args = reference["ModelArgs"](
+        n_layers=synthetic_n_layers,
+        dspark_block_size=6,
+        dspark_target_layer_ids=(3, 4),
+        temperature=0,
+        swiglu_limit=swiglu_limit,
+        n_mtp_layers=n_mtp_layers,
+        compress_ratios=synthetic_compress_ratios,
+        kv_source_layers=tuple(
+            layer for layer in pinned_kv_source_layers if layer < synthetic_n_layers
+        ),
+        index_source_layers=tuple(
+            layer for layer in pinned_index_source_layers if layer < synthetic_n_layers
+        ),
+    )
+    if len(args.compress_ratios) < args.n_layers + args.n_mtp_layers:
+        raise SystemExit("pinned 1017 compress_ratios do not cover all MTP layers")
     tokens = torch.randint(0, args.vocab_size, (2, 150))
     model = reference["Transformer"](args)
-    output_ids, _, main_hidden = model(tokens[:, :128])
-    model.forward_spec(output_ids, main_hidden)
-    for position in range(128, 150):
-        output_ids, _, main_hidden = model(tokens[:, position : position + 1], position)
-        result = model.forward_spec(output_ids, main_hidden, position)
-        if result is None:
-            raise RuntimeError("pinned graph did not return a DSpark step")
-        output_ids, _, _ = result
-    torch.cuda.synchronize()
+    device = torch.device("cuda:0")
+    initialize_smoke_parameters(model, torch, device)
+
+    def run_graph():
+        snapshots = []
+
+        def snapshot(values):
+            return tuple(
+                None if value is None else value.detach().cpu().clone()
+                for value in values
+            )
+
+        output_ids, logits, main_hidden = model(tokens[:, :128])
+        prefill_snapshot = snapshot((output_ids, logits, main_hidden))
+        prefill_spec = model.forward_spec(output_ids, main_hidden)
+        if prefill_spec is not None:
+            raise RuntimeError("pinned graph returned a DSpark step during prefill")
+        snapshots.append((prefill_snapshot, None))
+        for position in range(128, 150):
+            output_ids, logits, main_hidden = model(
+                tokens[:, position : position + 1], position
+            )
+            result = model.forward_spec(output_ids, main_hidden, position)
+            if result is None:
+                raise RuntimeError("pinned graph did not return a DSpark step")
+            snapshots.append(
+                (
+                    snapshot((output_ids, logits, main_hidden)),
+                    snapshot(result),
+                )
+            )
+            output_ids, _, _ = result
+        return snapshots
+
+    expected = run_graph()
+
+    def moe_for(key):
+        if key.mtp_layer:
+            return model.mtp[key.layer_id].ffn
+        return model.layers[key.layer_id].ffn
+
+    def expert_for(key):
+        moe = moe_for(key)
+        expert = moe.experts[key.expert_id]
+        if expert is None:
+            raise RuntimeError(f"synthetic model has no expert for {key}")
+        return LoadedFP4Expert(
+            layer_id=key.layer_id,
+            expert_id=key.expert_id,
+            mtp_layer=key.mtp_layer,
+            w1=expert.w1.weight,
+            w2=expert.w2.weight,
+            w3=expert.w3.weight,
+        )
+
+    cache = FP4ExpertCache(
+        1,
+        estimate_resident_bytes=lambda key: expert_for(key).resident_bytes,
+        load=expert_for,
+    )
+    cache.resize(
+        max(
+            expert_for(FP4ExpertKey(layer_id, 0, mtp_layer=mtp_layer)).resident_bytes
+            for mtp_layer, blocks in ((False, model.layers), (True, model.mtp))
+            for layer_id in range(len(blocks))
+        )
+    )
+    reservation_active = threading.Event()
+
+    class SmokeReservation:
+        async def __aenter__(self):
+            reservation_active.set()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            reservation_active.clear()
+
+    def request_fence():
+        if not reservation_active.is_set():
+            raise RuntimeError("GPU fence ran outside the request memory reservation")
+        torch.cuda.synchronize(device)
+
+    @contextmanager
+    def gpu_worker_context():
+        previous_device = torch.cuda.current_device()
+        previous_default_device = torch.get_default_device()
+        torch.cuda.set_device(device)
+        torch.set_default_device(device)
+        try:
+            yield
+        finally:
+            torch.set_default_device(previous_default_device)
+            torch.cuda.set_device(previous_device)
+
+    with install_cached_moe(
+        model, cache, reference["linear"], fence=request_fence
+    ) as installation:
+        actual = asyncio.run(
+            installation.run_reserved_sync(
+                run_graph,
+                SmokeReservation(),
+                worker_context=gpu_worker_context,
+            )
+        )
+
+    if len(actual) != len(expected):
+        raise AssertionError(
+            f"cached graph returned {len(actual)} steps; pinned graph returned {len(expected)}"
+        )
+    for step, (expected_step, actual_step) in enumerate(zip(expected, actual)):
+        for branch, expected_values, actual_values in zip(
+            ("main", "DSpark"), expected_step, actual_step
+        ):
+            if expected_values is None or actual_values is None:
+                if expected_values is not actual_values:
+                    raise AssertionError(
+                        f"cached graph step {step} {branch} output presence differs"
+                    )
+                continue
+            if len(expected_values) != len(actual_values):
+                raise AssertionError(
+                    f"cached graph step {step} {branch} output shape differs"
+                )
+            names = ("output_ids", "logits", "hidden") if branch == "main" else (
+                "output_ids",
+                "logits",
+                "confidence",
+            )
+            if len(expected_values) != len(names):
+                raise AssertionError(
+                    f"pinned graph step {step} {branch} returned an unexpected tuple"
+                )
+            for name, expected_tensor, actual_tensor in zip(
+                names, expected_values, actual_values
+            ):
+                if expected_tensor is None or actual_tensor is None:
+                    if expected_tensor is not actual_tensor:
+                        raise AssertionError(
+                            f"cached graph step {step} {branch} {name} presence differs"
+                        )
+                elif not torch.equal(expected_tensor, actual_tensor):
+                    raise AssertionError(
+                        f"cached graph step {step} {branch} {name} differs from pinned path"
+                    )
+    stats = cache.stats
+    if stats.leased_bytes or stats.loading_bytes or stats.pending_loads:
+        raise RuntimeError("cached transformer returned with an outstanding expert lease")
+    if not stats.within_capacity or stats.entries > 1:
+        raise RuntimeError("single-expert cache exceeded its configured capacity")
     if not usage["rmsnorm"] or not usage["rope"]:
         raise RuntimeError(f"native graph overrides were not exercised: {usage}")
-    print(f"native reference graph passed: RMSNorm={usage['rmsnorm']}, RoPE={usage['rope']}")
+    print(
+        "cached native reference graph passed:",
+        f"RMSNorm={usage['rmsnorm']}",
+        f"RoPE={usage['rope']}",
+        f"cache_entries={stats.entries}",
+        f"cache_capacity_bytes={stats.capacity_bytes}",
+        f"mtp_layers={args.n_mtp_layers}",
+        f"swiglu_limit={args.swiglu_limit}",
+        "exact=True",
+    )
 
 
 if __name__ == "__main__":
