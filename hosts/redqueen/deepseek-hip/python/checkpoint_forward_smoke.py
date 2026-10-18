@@ -123,11 +123,14 @@ def run_checkpoint_forward_smoke(
     def gpu_worker_context():
         previous_device = torch.cuda.current_device()
         previous_default_device = torch.get_default_device()
+        previous_default_dtype = torch.get_default_dtype()
         torch.cuda.set_device(device)
         torch.set_default_device(device)
+        torch.set_default_dtype(torch.bfloat16)
         try:
             yield
         finally:
+            torch.set_default_dtype(previous_default_dtype)
             torch.set_default_device(previous_default_device)
             torch.cuda.set_device(previous_device)
 
@@ -154,12 +157,11 @@ def run_checkpoint_forward_smoke(
             with torch.inference_mode():
                 input_ids = torch.tensor([input_token_ids], dtype=torch.long, device=device)
                 output_ids, logits, main_hidden = model(input_ids, start_pos=0)
-                if output_ids.shape != input_ids.shape:
+                if output_ids.shape != (1,):
                     raise RuntimeError(
-                        f"pinned prefill returned output_ids shape {tuple(output_ids.shape)}; "
-                        f"expected {tuple(input_ids.shape)}"
+                        f"pinned prefill returned output_ids shape {tuple(output_ids.shape)}; expected (1,)"
                     )
-                if logits.shape != (1, input_token_count, args.vocab_size):
+                if logits.shape != (1, args.vocab_size):
                     raise RuntimeError(
                         f"pinned prefill returned logits shape {tuple(logits.shape)}"
                     )
@@ -173,12 +175,16 @@ def run_checkpoint_forward_smoke(
                     raise RuntimeError("pinned prefill returned non-finite logits or hidden state")
 
                 speculative = model.forward_spec(
-                    output_ids[:, -1:], main_hidden[:, -1:], start_pos=input_token_count
+                    output_ids, main_hidden[:, -1:], start_pos=input_token_count
                 )
                 if speculative is None or len(speculative) != 3:
                     raise RuntimeError("pinned DSpark graph did not return its decode step")
                 spec_ids, spec_logits, confidence = speculative
-                if spec_ids.shape != (1, 1) or spec_logits.shape != (1, 1, args.vocab_size):
+                if spec_ids.shape != (1, args.dspark_block_size + 1) or spec_logits.shape != (
+                    1,
+                    args.dspark_block_size,
+                    args.vocab_size,
+                ):
                     raise RuntimeError("pinned DSpark graph returned unexpected output shapes")
                 if not torch.isfinite(spec_logits).all().item():
                     raise RuntimeError("pinned DSpark graph returned non-finite logits")
@@ -188,7 +194,7 @@ def run_checkpoint_forward_smoke(
 
                 result = {
                     "input_token_count": input_token_count,
-                    "main_token_id": int(output_ids[0, -1].item()),
+                    "main_token_id": int(output_ids[0].item()),
                     "speculative_token_id": int(spec_ids[0, -1].item()),
                     "native_usage": dict(native_usage),
                 }

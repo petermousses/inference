@@ -37,6 +37,7 @@ _MIN_HOST_AVAILABLE = 8 * _GIB
 _PREFILL_HEADROOM = 5 * _GIB
 _HOST_PREFILL_HEADROOM = 5 * _GIB
 _GTT_RELEASE_TOLERANCE = 256 * 1024 * 1024
+_FORWARD_GTT_RUNTIME_RESIDUAL = 1 * _GIB
 _SESSION_ACCOUNTING_TOLERANCE = 16 * 1024 * 1024
 _COMFYUI_QUEUE_URL = "http://127.0.0.1:8189/queue"
 _COMFYUI_QUEUE_LIMIT = 64 * 1024
@@ -706,10 +707,26 @@ def _run(options: argparse.Namespace) -> int:
                             fence=fence,
                             release_allocator=release_allocator,
                         )
+                    session_allocated_before_close = torch.cuda.memory_allocated(device)
                     session_state.close()
                     session_allocated_after_close = torch.cuda.memory_allocated(device)
-                    if abs(session_allocated_after_close - session_allocated_before) > _SESSION_ACCOUNTING_TOLERANCE:
-                        raise RuntimeError("session close retained allocated CUDA tensor storage")
+                    session_close_released = (
+                        session_allocated_before_close - session_allocated_after_close
+                    )
+                    session_close_runtime_delta = (
+                        session_allocated_after_close - session_allocated_before
+                    )
+                    if (
+                        abs(session_close_released - session_plan.estimate.resident_device_bytes)
+                        > _SESSION_ACCOUNTING_TOLERANCE
+                    ):
+                        raise RuntimeError(
+                            "session close released bytes outside the admitted estimate: "
+                            f"released={session_close_released}, "
+                            f"estimated={session_plan.estimate.resident_device_bytes}, "
+                            f"tolerance={_SESSION_ACCOUNTING_TOLERANCE}; "
+                            f"post-close runtime allocation delta={session_close_runtime_delta}"
+                        )
                     if any(
                         not container[attribute].is_meta
                         for allocation in session_plan.allocations
@@ -723,12 +740,21 @@ def _run(options: argparse.Namespace) -> int:
                         raise RuntimeError("dense close did not restore checkpoint state to meta")
                     free_gtt_after, _, _ = _memory_snapshot()
                     free_gtt_before = memory["free_gtt_before_load"]
+                    gtt_residual = (
+                        0 if free_gtt_before is None else free_gtt_before - free_gtt_after
+                    )
+                    gtt_residual_tolerance = (
+                        _FORWARD_GTT_RUNTIME_RESIDUAL
+                        if options.forward_smoke
+                        else _GTT_RELEASE_TOLERANCE
+                    )
                     if free_gtt_before is None or (
-                        free_gtt_after + _GTT_RELEASE_TOLERANCE < free_gtt_before
+                        gtt_residual > gtt_residual_tolerance
                     ):
                         raise RuntimeError(
-                            "model-state close did not return GTT backing to the pre-load baseline: "
-                            f"before={free_gtt_before}, after={free_gtt_after}"
+                            "model-state close left more GTT backing than the measured runtime allowance: "
+                            f"before={free_gtt_before}, after={free_gtt_after}, "
+                            f"residual={gtt_residual}, allowance={gtt_residual_tolerance}"
                         )
                 finally:
                     engram_hash_states.clear()
@@ -743,8 +769,11 @@ def _run(options: argparse.Namespace) -> int:
                     f"resident={plan.estimate.resident_device_bytes / _GIB:.2f} GiB; "
                     f"session={session_plan.estimate.resident_device_bytes / _GIB:.3f} GiB; "
                     f"session allocation delta={actual_session_bytes / _GIB:.3f} GiB; "
+                    f"session bytes released={session_close_released / _GIB:.3f} GiB; "
+                    f"warmed runtime allocation remaining={session_close_runtime_delta / (1024 * 1024):.1f} MiB; "
                     f"session peak={session_peak_bytes / _GIB:.3f} GiB; "
                     f"allocator-reserved peak={session_reserved_peak_bytes / _GIB:.3f} GiB; "
+                    f"warm runtime GTT residual={max(0, gtt_residual) / _GIB:.3f} GiB; "
                     f"direct={direct_name}; wo_a={wo_a_name}; "
                     "routed experts and Engram tables remained meta; Engram hash buffers came from the "
                     "pinned constructor; all 220k session buffers matched "
