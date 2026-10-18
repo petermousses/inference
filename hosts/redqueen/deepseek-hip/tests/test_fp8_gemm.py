@@ -145,13 +145,15 @@ class NativeFp8GemmTest(unittest.TestCase):
     def test_e8m0_scale_decoder_matches_every_encoding(self):
         group_size = 32
         m, n, k = 256, 1, group_size
-        a = torch.ones((m, k), dtype=torch.float8_e4m3fn).view(torch.uint8)
-        b = torch.ones((n, k), dtype=torch.float8_e4m3fn).view(torch.uint8)
+        a = torch.zeros((m, k), dtype=torch.uint8)
+        a[:, 0] = torch.tensor(1.0, dtype=torch.float8_e4m3fn).view(torch.uint8)
+        b = torch.zeros((n, k), dtype=torch.uint8)
+        b[0, 0] = torch.tensor(1.0, dtype=torch.float8_e4m3fn).view(torch.uint8)
         scale_a = torch.arange(256, dtype=torch.int16).to(torch.uint8).reshape(m, 1)
         scale_b = torch.full((1, 1), 127, dtype=torch.uint8)
 
         actual = self.call_gemm(a, scale_a, b, scale_b, group_size)
-        expected = (32.0 * e8m0_values(scale_a)).reshape(m, 1)
+        expected = e8m0_values(scale_a).reshape(m, 1)
         finite = torch.isfinite(expected[:, 0])
         self.assertTrue(torch.equal(actual[finite], expected[finite]))
         self.assertTrue(torch.equal(torch.isnan(actual[:, 0]), torch.isnan(expected[:, 0])))
