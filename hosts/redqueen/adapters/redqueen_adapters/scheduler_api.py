@@ -26,6 +26,12 @@ from .ownership import OwnedRequest, abandoned, boot_id, records, remove_record
 LOG = logging.getLogger("redqueen.scheduler")
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
 MODEL_ENDPOINTS = {"/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/embeddings", "/completion", "/tokenize", "/detokenize"}
+OPENAI_REQUEST_SHAPES = {
+    "/v1/chat/completions": "openai.chat",
+    "/v1/completions": "openai.completion",
+    "/v1/responses": "openai.responses",
+    "/v1/embeddings": "openai.embeddings",
+}
 SSE_BOUNDARY = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 MAX_SSE_FRAME = 256 * 1024
 
@@ -58,6 +64,43 @@ def footprint(spec: dict) -> Memory:
     if total != Memory(spec["gpu_bytes"], spec["host_bytes"]):
         raise ValueError("worker memory components do not match its admission footprint")
     return total
+
+
+def is_openai_worker(spec: dict) -> bool:
+    """Whether the worker accepts requests through the public OpenAI gateway."""
+    return spec.get("kind") == "text" or (
+        spec.get("kind") == "service" and bool(spec.get("gateway_url"))
+    )
+
+
+def contains_image_input(value: object) -> bool:
+    """Recognize OpenAI chat and responses image content before admission."""
+    pending = [iter((value,))]
+    while pending:
+        try:
+            item = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        if isinstance(item, dict):
+            content_type = item.get("type")
+            if isinstance(content_type, str) and content_type in {"image", "image_url", "input_image"}:
+                return True
+            pending.append(
+                iter(item[key] for key in ("messages", "input", "content") if key in item)
+            )
+        elif isinstance(item, list):
+            pending.append(iter(item))
+    return False
+
+
+def request_shape(path: str, body: object) -> str | None:
+    shape = OPENAI_REQUEST_SHAPES.get(path)
+    if path == "/v1/chat/completions" and contains_image_input(body):
+        return "openai.multimodal_chat"
+    if path == "/v1/responses" and contains_image_input(body):
+        return "openai.multimodal_responses"
+    return shape
 
 
 def capacity_limits(policy: dict, *, gpu_total: int, host_total: int) -> Memory:
@@ -330,7 +373,7 @@ class Scheduler:
             # Existing warm work can proceed while another model loads. Probe
             # directly so a crashed warm model cannot autoload around the budget.
             if self.states.get(name) == "ready" and await self.runtime.ready(name):
-                if self.resources[name]["kind"] == "text":
+                if is_openai_worker(self.resources[name]):
                     busy = await self.runtime.busy(name)
                     if busy is not False:
                         raise AdmissionError(429 if busy is True else 503, "backend work is still active" if busy is True else "backend activity is unknown", "model_busy" if busy is True else "backend_health_uncertain")
@@ -350,7 +393,7 @@ class Scheduler:
                     # An existing lease may still own backend work. Recovery
                     # must use the idle reaper's exclusive lease and busy probe.
                     raise AdmissionError(503, "resident backend is not ready; retry later", "backend_unready")
-                if name in self.states and self.resources[name]["kind"] == "text":
+                if name in self.states and is_openai_worker(self.resources[name]):
                     busy = await self.runtime.busy(name)
                     if busy is not False:
                         raise AdmissionError(429 if busy is True else 503, "backend work is still active" if busy is True else "backend activity is unknown", "model_busy" if busy is True else "backend_health_uncertain")
@@ -428,7 +471,8 @@ class Scheduler:
 
     @asynccontextmanager
     async def request(self, name: str):
-        if name not in self.resources or self.resources[name]["kind"] != "text":
+        spec = self.resources.get(name)
+        if spec is None or not is_openai_worker(spec):
             raise AdmissionError(404, "model is not configured", "model_not_found")
         async with self.execution.hold():
             limit = self.resources[name].get(
@@ -683,6 +727,8 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
         if model is not None:
             aliases = {alias: name for name, spec in resources.items() for alias in spec.get("aliases", [])}
             model = aliases.get(model, model)
+            if path.startswith("/upstream/") and resources.get(model, {}).get("gateway_url"):
+                raise AdmissionError(404, "unknown inference route", "not_found")
         content_type = request.headers.get("Content-Type", "application/json")
         if body is not None:
             # Python and llama-swap's JSON parser disagree on duplicate keys;
@@ -694,6 +740,14 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
         else:
             async with body_timeout():
                 data = await request.read()
+        upstream_url = policy["upstream_url"].rstrip("/")
+        direct_spec = resources.get(model) if model is not None else None
+        if path in MODEL_ENDPOINTS and direct_spec and direct_spec.get("gateway_url"):
+            shape = request_shape(path, body)
+            supported_shapes = direct_spec.get("supported_request_shapes", [])
+            if shape is None or shape not in supported_shapes:
+                raise AdmissionError(400, "worker does not support this request shape", "unsupported_request_shape")
+            upstream_url = direct_spec["gateway_url"].rstrip("/")
         async def forward():
             response = None
             pending = None
@@ -717,7 +771,7 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 return task.result()
 
             try:
-                pending = asyncio.create_task(state["session"].request(request.method, f"{policy['upstream_url']}{request.rel_url}", data=data, headers={"Authorization": f"Bearer {api_key}", "Content-Type": content_type, "X-Request-ID": request.get("request_id", "")}, allow_redirects=False))
+                pending = asyncio.create_task(state["session"].request(request.method, f"{upstream_url}{request.rel_url}", data=data, headers={"Authorization": f"Bearer {api_key}", "Content-Type": content_type, "X-Request-ID": request.get("request_id", "")}, allow_redirects=False))
                 upstream = await wait_with_heartbeat(pending) if streaming else await pending
                 pending = None
                 async with upstream:
