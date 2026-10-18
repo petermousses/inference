@@ -31,6 +31,10 @@ class ExpertCacheCapacityError(RuntimeError):
     """The requested expert cannot fit without evicting a leased expert."""
 
 
+class ExpertCacheBusyError(RuntimeError):
+    """The expert cache is not quiescent enough for an atomic resize."""
+
+
 class ExpertCacheError(RuntimeError):
     """The loader returned an expert inconsistent with its key or estimate."""
 
@@ -52,6 +56,7 @@ class ExpertCacheStats:
     idle_bytes: int
     entries: int
     pending_loads: int
+    pending_backing_release: bool
     quarantined: bool
 
     @property
@@ -169,6 +174,8 @@ class FP4ExpertCache:
         self._resident_bytes = 0
         self._loading_bytes = 0
         self._releasing_bytes = 0
+        self._pending_backing_release = False
+        self._resizing = False
         self._quarantined = False
 
     @staticmethod
@@ -204,6 +211,7 @@ class FP4ExpertCache:
             idle_bytes=self._resident_bytes - leased_bytes,
             entries=len(self._entries),
             pending_loads=len(self._loading),
+            pending_backing_release=self._pending_backing_release,
             quarantined=self._quarantined,
         )
 
@@ -227,6 +235,8 @@ class FP4ExpertCache:
             entry = self._entries.pop(key)
             self._resident_bytes -= entry.resident_bytes
             evicted.append(entry)
+        if evicted:
+            self._pending_backing_release = True
         self._releasing_bytes += sum(entry.resident_bytes for entry in evicted)
         return evicted
 
@@ -270,7 +280,7 @@ class FP4ExpertCache:
             dropped = []
             capacity_error = None
             with self._condition:
-                while key in self._loading or self._releasing_bytes:
+                while key in self._loading or self._releasing_bytes or self._resizing:
                     if self._quarantined:
                         raise self._quarantined_error()
                     self._condition.wait()
@@ -374,12 +384,79 @@ class FP4ExpertCache:
         """
         self._validate_capacity(capacity_bytes)
         with self._condition:
+            while self._resizing:
+                if self._quarantined:
+                    raise self._quarantined_error()
+                self._condition.wait()
             if self._quarantined:
                 raise self._quarantined_error()
+            if capacity_bytes < self._capacity_bytes:
+                self._pending_backing_release = True
             self._capacity_bytes = capacity_bytes
             dropped = self._evict_idle_locked()
             evicted_bytes = sum(entry.resident_bytes for entry in dropped)
         self._finish_eviction(dropped)
         with self._condition:
             stats = self._stats_locked()
+        return ExpertCacheResize(stats=stats, evicted_logical_bytes=evicted_bytes)
+
+    def resize_when_idle(
+        self,
+        capacity_bytes: int,
+        *,
+        after_drop: Callable[[], None] | None = None,
+    ) -> ExpertCacheResize:
+        """Resize only from a quiescent point and block acquisitions until eviction ends.
+
+        Unlike ``resize``, this operation fails without changing capacity if any
+        expert is leased, loading, or still being released. The resize gate keeps
+        a new acquisition from racing reference drops and the optional
+        ``after_drop`` callback. Callers must fence GPU work before invoking
+        this method and separately confirm physical memory returned by the
+        allocator or host runtime.
+        """
+        self._validate_capacity(capacity_bytes)
+        if after_drop is not None and not callable(after_drop):
+            raise TypeError("after_drop must be callable")
+        with self._condition:
+            while self._resizing:
+                if self._quarantined:
+                    raise self._quarantined_error()
+                self._condition.wait()
+            if self._quarantined:
+                raise self._quarantined_error()
+            if (
+                self._loading
+                or self._releasing_bytes
+                or any(entry.leases for entry in self._entries.values())
+            ):
+                raise ExpertCacheBusyError("expert cache cannot resize while entries are in use")
+            self._resizing = True
+            previous_capacity = self._capacity_bytes
+            if capacity_bytes < previous_capacity:
+                self._pending_backing_release = True
+            self._capacity_bytes = capacity_bytes
+            dropped = self._evict_idle_locked()
+            evicted_bytes = sum(entry.resident_bytes for entry in dropped)
+            release_backing = after_drop is not None and self._pending_backing_release
+
+        try:
+            try:
+                self._finish_eviction(dropped)
+            except BaseException:
+                self.quarantine()
+                raise
+            if release_backing:
+                after_drop()
+                with self._condition:
+                    self._pending_backing_release = False
+        finally:
+            with self._condition:
+                self._resizing = False
+                self._condition.notify_all()
+
+        with self._condition:
+            stats = self._stats_locked()
+        if not stats.within_capacity:
+            raise ExpertCacheError("quiescent cache resize did not reach its requested capacity")
         return ExpertCacheResize(stats=stats, evicted_logical_bytes=evicted_bytes)

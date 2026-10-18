@@ -7,6 +7,7 @@ import unittest
 import weakref
 
 from expert_cache import (
+    ExpertCacheBusyError,
     ExpertCacheCapacityError,
     ExpertCacheError,
     FP4ExpertCache,
@@ -144,6 +145,114 @@ class ExpertCacheTest(unittest.TestCase):
         self.assertTrue(cache.stats.within_capacity)
         self.assertEqual(cache.stats.resident_bytes, 0)
         self.assertEqual(cache.stats.entries, 0)
+
+    def test_idle_resize_rejects_leased_entries_without_changing_capacity(self):
+        first = self.key(1)
+        cache = self.cache(capacity=100)
+        with cache.acquire(first):
+            with self.assertRaises(ExpertCacheBusyError):
+                cache.resize_when_idle(0)
+            self.assertEqual(cache.stats.capacity_bytes, 100)
+            self.assertEqual(cache.stats.resident_bytes, 100)
+
+    def test_idle_resize_growth_keeps_entries_and_skips_allocator_release(self):
+        first = self.key(1)
+        cache = self.cache(capacity=100)
+        with cache.acquire(first):
+            pass
+        released = []
+
+        result = cache.resize_when_idle(200, after_drop=lambda: released.append(True))
+
+        self.assertEqual(result.evicted_logical_bytes, 0)
+        self.assertEqual(cache.stats.capacity_bytes, 200)
+        self.assertEqual(cache.stats.resident_bytes, 100)
+        self.assertEqual(cache.stats.entries, 1)
+        self.assertEqual(released, [])
+
+    def test_idle_resize_retries_allocator_release_after_callback_failure(self):
+        first = self.key(1)
+        cache = self.cache(capacity=100)
+        with cache.acquire(first):
+            pass
+        callback_calls = []
+
+        def fail_once():
+            callback_calls.append("release")
+            if len(callback_calls) == 1:
+                raise RuntimeError("allocator release failed")
+
+        with self.assertRaisesRegex(RuntimeError, "allocator release failed"):
+            cache.resize_when_idle(0, after_drop=fail_once)
+
+        self.assertTrue(cache.stats.pending_backing_release)
+        self.assertEqual(cache.stats.capacity_bytes, 0)
+        self.assertEqual(cache.stats.resident_bytes, 0)
+
+        result = cache.resize_when_idle(0, after_drop=fail_once)
+
+        self.assertEqual(callback_calls, ["release", "release"])
+        self.assertFalse(result.stats.pending_backing_release)
+        self.assertEqual(result.stats.capacity_bytes, 0)
+        self.assertTrue(result.stats.within_capacity)
+
+    def test_idle_resize_retries_pending_release_from_plain_resize(self):
+        first = self.key(1)
+        cache = self.cache(capacity=100)
+        with cache.acquire(first):
+            pass
+
+        cache.resize(0)
+
+        self.assertTrue(cache.stats.pending_backing_release)
+        calls = []
+        result = cache.resize_when_idle(0, after_drop=lambda: calls.append("release"))
+
+        self.assertEqual(calls, ["release"])
+        self.assertFalse(result.stats.pending_backing_release)
+
+    def test_idle_resize_blocks_new_acquisitions_until_references_drop(self):
+        first, second = self.key(1), self.key(2)
+        cache = self.cache(capacity=200)
+        for key in (first, second):
+            with cache.acquire(key):
+                pass
+
+        release_started = threading.Event()
+        allow_release = threading.Event()
+        acquisition_started = threading.Event()
+        acquisition_finished = threading.Event()
+        loads_before = len(self.loads)
+
+        def delayed_release():
+            release_started.set()
+            if not allow_release.wait(timeout=3):
+                raise TimeoutError("test did not release cache resize")
+
+        def acquire_once():
+            acquisition_started.set()
+            try:
+                with cache.acquire(first):
+                    pass
+            finally:
+                acquisition_finished.set()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            resize = pool.submit(cache.resize_when_idle, 0, after_drop=delayed_release)
+            self.assertTrue(release_started.wait(timeout=2))
+            acquire = pool.submit(acquire_once)
+            self.assertTrue(acquisition_started.wait(timeout=2))
+            self.assertFalse(acquisition_finished.wait(timeout=0.1))
+            allow_release.set()
+            result = resize.result(timeout=3)
+            with self.assertRaises(ExpertCacheCapacityError):
+                acquire.result(timeout=3)
+
+        self.assertEqual(result.evicted_logical_bytes, 200)
+        self.assertEqual(cache.stats.resident_bytes, 0)
+        self.assertTrue(cache.stats.within_capacity)
+        self.assertTrue(acquisition_finished.is_set())
+        self.assertEqual(len(self.loads), loads_before)
 
     def test_concurrent_acquisition_loads_one_copy(self):
         key = self.key(1)
