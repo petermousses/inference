@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -161,12 +162,17 @@ def install_cached_moe(
 
 
 def _run_and_fence(
-    operation: Callable[[], _T], cache: object, fence: Callable[[], None]
+    operation: Callable[[], _T],
+    cache: object,
+    fence: Callable[[], None],
+    worker_context: Callable[[], object] | None,
 ) -> _T:
     result: _T | None = None
     operation_error: BaseException | None = None
     try:
-        result = operation()
+        context = worker_context() if worker_context is not None else nullcontext()
+        with context:
+            result = operation()
     except BaseException as error:
         operation_error = error
 
@@ -195,6 +201,7 @@ async def run_reserved_sync(
     *,
     cache: object,
     fence: Callable[[], None],
+    worker_context: Callable[[], object] | None = None,
 ) -> _T:
     """Run synchronous GPU work under an async broker lease without early release.
 
@@ -203,11 +210,15 @@ async def run_reserved_sync(
     reservation remains held; ``asyncio.to_thread`` cancellation alone does
     not stop native or PyTorch work. The operation must consume or copy any GPU
     result before returning, so the reservation covers all live request state.
+    ``worker_context`` can install thread-local device/runtime state that the
+    event loop does not propagate, and must restore that state when it exits.
     """
     if not callable(operation):
         raise TypeError("operation must be callable")
     if not callable(fence):
         raise TypeError("fence must be callable")
+    if worker_context is not None and not callable(worker_context):
+        raise TypeError("worker_context must be callable")
     if not callable(getattr(cache, "quarantine", None)):
         raise TypeError("cache must support quarantine")
     if not callable(getattr(reservation, "__aenter__", None)) or not callable(
@@ -217,7 +228,9 @@ async def run_reserved_sync(
 
     async with reservation:
         task = asyncio.create_task(
-            asyncio.to_thread(_run_and_fence, operation, cache, fence)
+            asyncio.to_thread(
+                _run_and_fence, operation, cache, fence, worker_context
+            )
         )
         try:
             return await asyncio.shield(task)

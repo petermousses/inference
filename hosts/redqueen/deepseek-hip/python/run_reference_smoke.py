@@ -7,6 +7,7 @@ import os
 import runpy
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -183,15 +184,28 @@ def main() -> None:
             raise RuntimeError("GPU fence ran outside the request memory reservation")
         torch.cuda.synchronize(device)
 
+    @contextmanager
+    def gpu_worker_context():
+        previous_device = torch.cuda.current_device()
+        previous_default_device = torch.get_default_device()
+        torch.cuda.set_device(device)
+        torch.set_default_device(device)
+        try:
+            yield
+        finally:
+            torch.set_default_device(previous_default_device)
+            torch.cuda.set_device(previous_device)
+
     with install_cached_moe(
         model, cache, reference["linear"], fence=request_fence
     ):
         actual = asyncio.run(
             run_reserved_sync(
-                lambda: (torch.cuda.set_device(device), run_graph())[1],
+                run_graph,
                 SmokeReservation(),
                 cache=cache,
                 fence=request_fence,
+                worker_context=gpu_worker_context,
             )
         )
 

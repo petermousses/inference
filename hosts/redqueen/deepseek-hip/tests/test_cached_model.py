@@ -170,6 +170,30 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(events, ["enter", "operation", "fence", "exit"])
 
+    async def test_worker_context_wraps_operation_and_restores_before_fence(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache()
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+
+        await run_reserved_sync(
+            lambda: events.append("operation"),
+            reservation,
+            cache=cache,
+            fence=lambda: events.append("fence"),
+            worker_context=WorkerContext,
+        )
+        self.assertEqual(
+            events,
+            ["enter", "worker-enter", "operation", "worker-exit", "fence", "exit"],
+        )
+
     async def test_fence_failure_quarantines_before_reservation_release(self):
         events = []
         reservation = _Reservation(events)
