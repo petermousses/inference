@@ -1,5 +1,6 @@
 """Tiled exact-index selection parity against the pinned eager tensor expression."""
 
+import os
 import unittest
 
 import torch
@@ -273,6 +274,110 @@ class TiledIndexerSelectionTest(unittest.TestCase):
         )
         self.assertIsNone(candidates)
         self.assertTrue(torch.equal(actual, expected))
+
+    @unittest.skipUnless(
+        os.environ.get("DS4_HIP_220K_INDEXER_PEAK") == "1",
+        "set DS4_HIP_220K_INDEXER_PEAK=1 for the large Redqueen peak check",
+    )
+    def test_220k_profile_single_tile_peak_includes_full_sequence_state(self):
+        """Measure one worst-case index tile with 220k inputs and full outputs resident.
+
+        This checks the tiled indexer component only. It does not run the 220k
+        model graph or qualify full-request admission.
+        """
+        sequence = 220_000
+        tile_rows = 64
+        heads = 32
+        index_dim = 128
+        candidate_blocks = 2_048
+        selected_per_query = 512
+        gib = 1024**3
+
+        torch.cuda.synchronize(self.device)
+        baseline_allocated = torch.cuda.memory_allocated(self.device)
+        baseline_reserved = torch.cuda.memory_reserved(self.device)
+        query_source = torch.zeros(
+            (1, sequence, 1_280), dtype=torch.bfloat16, device=self.device
+        )
+        hidden_source = torch.zeros(
+            (1, sequence, 5_120), dtype=torch.bfloat16, device=self.device
+        )
+        keys = torch.zeros(
+            (1, sequence, index_dim), dtype=torch.bfloat16, device=self.device
+        )
+        query_weight = torch.zeros(
+            (heads * index_dim, 1_280), dtype=torch.bfloat16, device=self.device
+        )
+        head_weight = torch.zeros(
+            (heads, 5_120), dtype=torch.bfloat16, device=self.device
+        )
+        # The production function allocates both full-sequence result buffers
+        # before it starts visiting the query tiles. Keep equal-sized state live
+        # while measuring the score and candidate-selection scratch for one tile.
+        selected_state = torch.zeros(
+            (1, sequence, selected_per_query), dtype=torch.int32, device=self.device
+        )
+        candidate_state = torch.zeros(
+            (1, sequence, candidate_blocks), dtype=torch.int16, device=self.device
+        )
+        torch.cuda.synchronize(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+
+        def project_query(values, _first, _last):
+            return torch.nn.functional.linear(values, query_weight).unflatten(
+                -1, (heads, index_dim)
+            )
+
+        def project_weights(values, _first, _last):
+            return torch.nn.functional.linear(values, head_weight)
+
+        last = sequence - tile_rows
+        valid = torch.arange(
+            last + 1, sequence + 1, dtype=torch.int32, device=self.device
+        )
+        selected, candidates = tiled_indexer_selection(
+            query_source[:, last:],
+            keys,
+            hidden_source[:, last:],
+            query_heads=heads,
+            query_projection=project_query,
+            head_weights_projection=project_weights,
+            valid_positions=valid,
+            topk=selected_per_query,
+            offset=0,
+            query_tile_rows=tile_rows,
+            candidate_block_size=8,
+            candidate_selector=reference_candidate_blocks,
+            candidate_topk_blocks=candidate_blocks,
+        )
+        torch.cuda.synchronize(self.device)
+        allocated_peak = (
+            torch.cuda.max_memory_allocated(self.device) - baseline_allocated
+        )
+        reserved_peak = torch.cuda.max_memory_reserved(self.device)
+        reserved_increment = reserved_peak - baseline_reserved
+        print(
+            "220k-profile single-tile indexer peak including full-sequence inputs "
+            f"and output state: allocated={allocated_peak / gib:.2f} GiB, "
+            f"reserved={reserved_peak / gib:.2f} GiB total "
+            f"(+{reserved_increment / gib:.2f} GiB)",
+            flush=True,
+        )
+        self.assertEqual(selected.shape, (1, tile_rows, selected_per_query))
+        self.assertEqual(candidates.shape, (1, tile_rows, candidate_blocks))
+        self.assertLess(
+            allocated_peak,
+            8 * gib,
+            "the 220k-profile indexer live allocations alone must stay below the 8 GiB request peak budget",
+        )
+        self.assertLess(
+            reserved_peak,
+            8 * gib,
+            "the 220k-profile indexer allocator-reserved peak must stay below the 8 GiB request peak budget",
+        )
+        # Keep every modeled full-sequence allocation alive through the peak read.
+        self.assertEqual(selected_state.shape[1], sequence)
+        self.assertEqual(candidate_state.shape[1], sequence)
 
 
 if __name__ == "__main__":
