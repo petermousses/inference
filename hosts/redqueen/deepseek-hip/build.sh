@@ -10,7 +10,9 @@ mkdir -p "${build_dir}"
   --offload-arch=gfx1151 \
   -std=c++17 \
   -O3 \
+  -ffp-contract=off \
   -fPIC \
   -shared \
   "${root}/src/quantization.hip" \
-  -o "${build_dir}/libredqueen_ds4_quantization.so"
+  "${root}/src/fp8_gemm.hip" \
+  -o "${build_dir}/libredqueen_ds4_hip.so"
