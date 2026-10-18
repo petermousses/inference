@@ -130,7 +130,7 @@ class ExpertCacheLease:
         if self._cache is None:
             raise ExpertCacheError("expert lease is no longer active")
         self._quarantined = True
-        self._cache._quarantine()
+        self._cache.quarantine()
 
 
 class FP4ExpertCache:
@@ -175,7 +175,8 @@ class FP4ExpertCache:
     def _quarantined_error() -> ExpertCacheError:
         return ExpertCacheError("expert cache is quarantined; worker restart is required")
 
-    def _quarantine(self) -> None:
+    def quarantine(self) -> None:
+        """Reject new work after a device fence fails; restart to clear it."""
         with self._condition:
             self._quarantined = True
             self._condition.notify_all()
