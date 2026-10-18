@@ -68,6 +68,11 @@ def main() -> None:
     n_mtp_layers = model_config.get("n_mtp_layers")
     if type(n_mtp_layers) is not int or n_mtp_layers < 1:
         raise SystemExit("pinned 1017 config must declare a positive n_mtp_layers")
+    compress_ratios = model_config.get("compress_ratios")
+    if not isinstance(compress_ratios, list) or any(
+        type(ratio) is not int or ratio < 0 for ratio in compress_ratios
+    ):
+        raise SystemExit("pinned 1017 config must declare nonnegative compress_ratios")
 
     adapter_dir = Path(__file__).resolve().parent
     checkpoint_root = inference_dir.parent
@@ -125,7 +130,10 @@ def main() -> None:
         temperature=0,
         swiglu_limit=swiglu_limit,
         n_mtp_layers=n_mtp_layers,
+        compress_ratios=tuple(compress_ratios),
     )
+    if len(args.compress_ratios) < args.n_layers + args.n_mtp_layers:
+        raise SystemExit("pinned 1017 compress_ratios do not cover all MTP layers")
     tokens = torch.randint(0, args.vocab_size, (2, 150))
     model = reference["Transformer"](args)
     device = torch.device("cuda:0")
