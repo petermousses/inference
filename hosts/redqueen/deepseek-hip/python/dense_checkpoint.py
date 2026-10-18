@@ -666,6 +666,7 @@ def load_dense_checkpoint(
 
     loaded: dict[str, object] = {}
     assigned: list[tuple[str, object, str, object]] = []
+    replacements_by_original_id: dict[int, object] = {}
     target = None
     destination = None
     locations = None
@@ -725,6 +726,31 @@ def load_dense_checkpoint(
                 )
             else:
                 replacement = destination
+            replacements_by_original_id[id(target)] = replacement
+
+        # The pinned graph attaches each quantized Linear scale to both the module and its
+        # weight Parameter (`weight.scale = self.scale`). Replacing the registered Parameters
+        # does not preserve that non-registered attribute, so reconnect it to the new scale.
+        for item in plan.tensors:
+            target, _destination, locations = loaded[item.target_name]
+            if locations[0][0] != "parameter":
+                continue
+            attached_scale = getattr(target, "scale", None)
+            if attached_scale is None:
+                continue
+            replacement = replacements_by_original_id[id(target)]
+            replacement_scale = replacements_by_original_id.get(id(attached_scale))
+            if replacement_scale is None:
+                if getattr(attached_scale, "is_meta", False):
+                    raise CheckpointError(
+                        f"dense quantized parameter has no loaded attached scale: {item.target_name}"
+                    )
+                replacement_scale = attached_scale
+            replacement.scale = replacement_scale
+
+        for item in plan.tensors:
+            target, _destination, locations = loaded[item.target_name]
+            replacement = replacements_by_original_id[id(target)]
             for _kind, container, attribute, original in locations:
                 assigned.append((_kind, container, attribute, original))
                 container[attribute] = replacement
@@ -750,6 +776,7 @@ def load_dense_checkpoint(
             target = None
             locations = None
             loaded.clear()
+            replacements_by_original_id.clear()
             gc.collect()
             _call_sync(release_allocator, "failed-load release_allocator")
             _call_sync(fence, "failed-load post-release GPU fence")

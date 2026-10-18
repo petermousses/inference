@@ -57,15 +57,22 @@ class DenseCheckpointTest(unittest.TestCase):
 
     def _model_and_values(self):
         class DenseModule(torch.nn.Module):
-            def __init__(self, shape, dtype):
+            def __init__(self, shape, dtype, scale_shape=None):
                 super().__init__()
                 self.weight = DenseCheckpointTest._meta_parameter(shape, dtype)
+                if scale_shape is not None:
+                    self.scale = DenseCheckpointTest._meta_parameter(
+                        scale_shape, torch.float8_e8m0fnu
+                    )
+                    self.weight.scale = self.scale
 
         class Attention(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.wo_a = DenseModule((64, 64), torch.bfloat16)
-                self.linear = DenseModule((4, 4), torch.bfloat16)
+                self.linear = DenseModule(
+                    (4, 4), torch.float8_e4m3fn, scale_shape=(1, 1)
+                )
 
         class Engram(torch.nn.Module):
             def __init__(self):
@@ -130,7 +137,8 @@ class DenseCheckpointTest(unittest.TestCase):
             .reshape(64, 64)
             .to(torch.float8_e4m3fn),
             "wo_a_scale": torch.ones((2, 2), dtype=torch.float8_e8m0fnu),
-            "linear": torch.arange(16, dtype=torch.float32).reshape(4, 4).to(torch.bfloat16),
+            "linear": torch.arange(16, dtype=torch.float32).reshape(4, 4).to(torch.float8_e4m3fn),
+            "linear_scale": torch.ones((1, 1), dtype=torch.float8_e8m0fnu),
             "vision_norm": torch.tensor([1.5, -2.25], dtype=torch.bfloat16),
             "expert": torch.tensor([[1, 2], [3, 4]], dtype=torch.uint8),
             "engram_weight": torch.arange(5 * 64, dtype=torch.float32)
@@ -162,9 +170,14 @@ class DenseCheckpointTest(unittest.TestCase):
                 self._raw(values["wo_a_scale"]),
             ),
             "model.layers.0.attn.linear.weight": (
-                "BF16",
+                "F8_E4M3",
                 [4, 4],
                 self._raw(values["linear"]),
+            ),
+            "model.layers.0.attn.linear.scale": (
+                "F8_E8M0",
+                [1, 1],
+                self._raw(values["linear_scale"]),
             ),
             "model.vision.norm.weight": (
                 "BF16",
@@ -262,6 +275,16 @@ class DenseCheckpointTest(unittest.TestCase):
         self.assertTrue(torch.equal(loaded["embed.weight"], self.values["embed"]))
         self.assertTrue(torch.equal(loaded["vision.norm.weight"], self.values["vision_norm"].float()))
         self.assertTrue(torch.equal(loaded["layers.0.engram.wkv.weight"], self.values["engram_wkv"]))
+        self.assertIs(
+            loaded["layers.0.attn.linear.weight"].scale,
+            loaded["layers.0.attn.linear.scale"],
+        )
+        self.assertTrue(
+            torch.equal(
+                loaded["layers.0.attn.linear.weight"].scale,
+                self.values["linear_scale"],
+            )
+        )
 
         expected_wo_a = (
             self.values["wo_a"]
@@ -280,6 +303,10 @@ class DenseCheckpointTest(unittest.TestCase):
         restored = self.model.state_dict(keep_vars=True)
         self.assertTrue(all(tensor.is_meta for tensor in restored.values()))
         self.assertIs(restored["mtp.0.embed.weight"], restored["embed.weight"])
+        self.assertIs(
+            restored["layers.0.attn.linear.weight"].scale,
+            restored["layers.0.attn.linear.scale"],
+        )
         self.assertIn(("release", None), events)
         self.assertTrue(any(kind == "exit" for kind, _ in events))
         state.close()
