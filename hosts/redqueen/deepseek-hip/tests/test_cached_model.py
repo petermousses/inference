@@ -36,6 +36,7 @@ class _Cache:
 
     def quarantine(self):
         self.quarantined = True
+        self._stats = SimpleNamespace(**{**vars(self._stats), "quarantined": True})
 
     @property
     def stats(self):
@@ -442,10 +443,76 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
                 await installation.resize_cache(
                     0, release_allocator=lambda: events.append("allocator-release")
                 )
+            self.assertTrue(installation._quarantined)
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                await installation.run_reserved_sync(lambda: None, _Reservation(events))
+            with self.assertRaisesRegex(RuntimeError, "undrained callback"):
+                installation.close()
 
         self.assertTrue(cache.quarantined)
         self.assertEqual(events, ["fence"])
         self.assertEqual(cache.resize_calls, [])
+
+    async def test_cache_resize_post_release_fence_failure_quarantines_installation(self):
+        events = []
+        cache = _Cache(events)
+        fence_calls = 0
+
+        def fence():
+            nonlocal fence_calls
+            fence_calls += 1
+            events.append("fence")
+            if fence_calls == 2:
+                raise RuntimeError("post-release GPU fence failed")
+
+        with _installation(cache, fence) as installation:
+            with self.assertRaisesRegex(RuntimeError, "post-release GPU fence failed"):
+                await installation.resize_cache(
+                    0, release_allocator=lambda: events.append("allocator-release")
+                )
+            self.assertTrue(installation._quarantined)
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                await installation.run_reserved_sync(lambda: None, _Reservation(events))
+
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(cache.resize_calls, [0])
+        self.assertIn("allocator-release", events)
+
+    async def test_cancelled_resize_marks_installation_quarantined_after_fence_failure(self):
+        events = []
+        cache = _Cache(events)
+        fence_started = threading.Event()
+        finish_fence = threading.Event()
+        fence_calls = 0
+
+        def fence():
+            nonlocal fence_calls
+            fence_calls += 1
+            if fence_calls == 2:
+                fence_started.set()
+                if not finish_fence.wait(3):
+                    raise TimeoutError("test did not release final fence")
+                raise RuntimeError("final fence failed")
+
+        with _installation(cache, fence) as installation:
+            resizing = asyncio.create_task(
+                installation.resize_cache(
+                    0, release_allocator=lambda: events.append("allocator-release")
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(fence_started.wait, 2))
+            resizing.cancel()
+            await asyncio.sleep(0.05)
+            self.assertFalse(resizing.done())
+            finish_fence.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await resizing
+
+            self.assertTrue(installation._quarantined)
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                await installation.run_reserved_sync(lambda: None, _Reservation(events))
+
+        self.assertTrue(cache.quarantined)
 
     async def test_cache_resize_waits_until_model_execution_is_fenced(self):
         events = []
@@ -620,6 +687,11 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
                 await installation.run_reserved_sync(
                     lambda: events.append("operation"), reservation
                 )
+            self.assertTrue(installation._quarantined)
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                await installation.run_reserved_sync(lambda: None, _Reservation(events))
+            with self.assertRaisesRegex(RuntimeError, "undrained callback"):
+                installation.close()
         self.assertTrue(cache.quarantined)
         self.assertEqual(events, ["enter", "operation", "fence", "exit"])
 

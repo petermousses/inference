@@ -25,6 +25,12 @@ class _UnsafeCallbackResult(TypeError):
 
 
 @dataclass(frozen=True)
+class _WorkerResult:
+    value: Any = None
+    error: BaseException | None = None
+
+
+@dataclass(frozen=True)
 class _ForwardPatch:
     moe: Any
     original: Callable
@@ -116,6 +122,7 @@ class CachedMoEInstallation:
             async with reservation:
                 task = asyncio.create_task(
                     asyncio.to_thread(
+                        _capture_sync_call,
                         _run_and_fence,
                         operation,
                         self._cache,
@@ -124,7 +131,7 @@ class CachedMoEInstallation:
                     )
                 )
                 try:
-                    return await asyncio.shield(task)
+                    result = await asyncio.shield(task)
                 except asyncio.CancelledError as cancellation:
                     # Do not cancel the worker: it must finish and fence while
                     # both the reservation and execution lock remain held.
@@ -136,14 +143,34 @@ class CachedMoEInstallation:
                         except BaseException:
                             break
                     try:
-                        task.result()
+                        result = task.result()
                     except BaseException as worker_error:
+                        if _cache_is_quarantined(self._cache):
+                            self._quarantined = True
                         if hasattr(cancellation, "add_note"):
                             cancellation.add_note(
                                 "GPU worker finished with "
                                 f"{worker_error!r} while cancellation drained"
                             )
+                    else:
+                        if result.error is not None:
+                            if _cache_is_quarantined(self._cache):
+                                self._quarantined = True
+                            if hasattr(cancellation, "add_note"):
+                                cancellation.add_note(
+                                    "GPU worker finished with "
+                                    f"{result.error!r} while cancellation drained"
+                                )
                     raise cancellation
+                except BaseException:
+                    if _cache_is_quarantined(self._cache):
+                        self._quarantined = True
+                    raise
+                if result.error is not None:
+                    if _cache_is_quarantined(self._cache):
+                        self._quarantined = True
+                    raise result.error
+                return result.value  # type: ignore[return-value]
 
     async def resize_cache(
         self,
@@ -186,6 +213,7 @@ class CachedMoEInstallation:
                 raise RuntimeError("cached MoE installation is quarantined; worker restart is required")
             task = asyncio.create_task(
                 asyncio.to_thread(
+                    _capture_sync_call,
                     _resize_cache_sync,
                     self._cache,
                     capacity_bytes,
@@ -195,10 +223,7 @@ class CachedMoEInstallation:
                 )
             )
             try:
-                return await asyncio.shield(task)
-            except _UnsafeCallbackResult:
-                self._quarantined = True
-                raise
+                result = await asyncio.shield(task)
             except asyncio.CancelledError as cancellation:
                 # A cancelled control request must not release the execution
                 # lock while the worker is dropping live tensor references.
@@ -210,16 +235,34 @@ class CachedMoEInstallation:
                     except BaseException:
                         break
                 try:
-                    task.result()
+                    result = task.result()
                 except BaseException as worker_error:
-                    if isinstance(worker_error, _UnsafeCallbackResult):
+                    if _cache_is_quarantined(self._cache):
                         self._quarantined = True
                     if hasattr(cancellation, "add_note"):
                         cancellation.add_note(
                             "cache resize worker finished with "
                             f"{worker_error!r} while cancellation drained"
                         )
+                else:
+                    if result.error is not None:
+                        if _cache_is_quarantined(self._cache):
+                            self._quarantined = True
+                        if hasattr(cancellation, "add_note"):
+                            cancellation.add_note(
+                                "cache resize worker finished with "
+                                f"{result.error!r} while cancellation drained"
+                            )
                 raise cancellation
+            except BaseException:
+                if _cache_is_quarantined(self._cache):
+                    self._quarantined = True
+                raise
+            if result.error is not None:
+                if _cache_is_quarantined(self._cache):
+                    self._quarantined = True
+                raise result.error
+            return result.value  # type: ignore[return-value]
 
 
 def _blocks(value: object, name: str) -> list[object]:
@@ -456,6 +499,19 @@ def _quarantine_after_fence_failure(cache: object, fence_error: BaseException) -
     except BaseException as quarantine_error:
         if hasattr(fence_error, "add_note"):
             fence_error.add_note(f"cache quarantine also failed: {quarantine_error!r}")
+
+
+def _cache_is_quarantined(cache: object) -> bool:
+    if getattr(cache, "quarantined", False):
+        return True
+    return bool(getattr(getattr(cache, "stats", None), "quarantined", False))
+
+
+def _capture_sync_call(callback: Callable[..., _T], *args: object) -> _WorkerResult:
+    try:
+        return _WorkerResult(value=callback(*args))
+    except BaseException as error:
+        return _WorkerResult(error=error)
 
 
 def _validate_sync_callable(callback: Callable[..., object], name: str) -> None:
