@@ -1,7 +1,7 @@
 [Unit]
 Description=ComfyUI Qwen Image 2.1 backend
-Wants=network-online.target
-After=network-online.target redqueen-preflight.service
+Wants=network-online.target redqueen-scheduler.service
+After=network-online.target redqueen-preflight.service redqueen-scheduler.service
 ConditionPathIsDirectory=/srv/ai/comfyui/source
 ConditionPathIsDirectory=/srv/ai/comfyui/venv
 ConditionPathExists=/srv/ai/comfyui/extra-model-paths.yaml
@@ -16,6 +16,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=HF_HOME=/srv/ai/cache/huggingface
 Environment=TORCH_HOME=/srv/ai/cache/torch
 Environment=XDG_CACHE_HOME=/srv/ai/cache
+Environment=REDQUEEN_SCHEDULER_SOCKET=/srv/ai/model-router/run/scheduler.sock
 ExecStartPre=/usr/bin/mkdir -p /srv/ai/comfyui/state/custom_nodes /srv/ai/comfyui/state/input /srv/ai/comfyui/state/models /srv/ai/comfyui/state/output /srv/ai/comfyui/state/temp /srv/ai/comfyui/state/user/default/workflows
 ExecStart=/srv/ai/comfyui/venv/bin/python /srv/ai/comfyui/source/main.py --listen 127.0.0.1 --port 8189 --disable-auto-launch --base-directory /srv/ai/comfyui/state --extra-model-paths-config /srv/ai/comfyui/extra-model-paths.yaml
 ExecStartPost=/srv/ai/comfyui/venv/bin/python /srv/ai/config/hosts/redqueen/comfyui/check_admission_guard.py
@@ -51,6 +52,8 @@ ReadOnlyPaths=/srv/ai/models/qwen-image-2.1
 ReadOnlyPaths=/srv/ai/models/qwen-image-2.1-uncensored
 ReadWritePaths=/srv/ai/comfyui/state
 ReadWritePaths=/srv/ai/cache
+ReadWritePaths=/srv/ai/model-router/run/leases
+ReadWritePaths=/srv/ai/model-router/run/requests
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true

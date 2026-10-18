@@ -392,6 +392,16 @@ class ComfyUISmokeGuardTest(unittest.TestCase):
 
 
 class AdmissionTest(unittest.TestCase):
+    def test_checkpoint_smoke_requires_the_host_recovery_lease_directory(self):
+        expected = run_dense_checkpoint_smoke._HOST_LEASE_DIRECTORY
+        self.assertEqual(
+            run_dense_checkpoint_smoke._validate_lease_directory(expected),
+            expected.resolve(),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(RuntimeError, "custom paths bypass host recovery coordination"):
+                run_dense_checkpoint_smoke._validate_lease_directory(Path(temporary))
+
     def test_host_admission_keeps_eight_gib_minimum_plus_five_gib_headroom(self):
         estimate = SimpleNamespace(
             device_peak_bytes=1 * run_dense_checkpoint_smoke._GIB,

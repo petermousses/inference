@@ -683,7 +683,14 @@ class ComfyBackend:
         prompt_id = owner.record["job_id"]
         owner.update(submitted=True)
         try:
-            async with self._client().post(self.settings.comfy_url + "/prompt", json={"prompt": workflow, "client_id": owner.record["client_id"], "prompt_id": prompt_id}) as response:
+            async with self._client().post(
+                self.settings.comfy_url + "/prompt",
+                json={"prompt": workflow, "client_id": owner.record["client_id"], "prompt_id": prompt_id},
+                headers={
+                    "X-Redqueen-Request-ID": owner.id,
+                    "X-Redqueen-Job-ID": prompt_id,
+                },
+            ) as response:
                 if response.status in {400, 422}:
                     owner.update(submitted=False)
                     raise UpstreamError(502, "image backend rejected its workflow", "image_backend_rejected")

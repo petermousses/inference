@@ -42,6 +42,22 @@ _COMFYUI_QUEUE_URL = "http://127.0.0.1:8189/queue"
 _COMFYUI_QUEUE_LIMIT = 64 * 1024
 _COMFYUI_GUARD_URL = "http://127.0.0.1:8189/redqueen/admission-guard"
 _COMFYUI_RESTORE_MARKER = Path("/srv/ai/model-router/run/comfyui-restore.json")
+_HOST_LEASE_DIRECTORY = Path("/srv/ai/model-router/run/leases")
+
+
+def _validate_lease_directory(lease_directory: Path) -> Path:
+    """Require the lock and restore marker paths shared by host recovery."""
+    try:
+        selected = lease_directory.expanduser().resolve()
+        expected = _HOST_LEASE_DIRECTORY.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("cannot resolve the host scheduler lease directory") from exc
+    if selected != expected:
+        raise RuntimeError(
+            "checkpoint smoke must use the host scheduler lease directory "
+            f"{expected}; custom paths bypass host recovery coordination"
+        )
+    return expected
 
 
 def _comfyui_state() -> str:
@@ -385,7 +401,7 @@ def main() -> int:
         default=Path(
             os.environ.get(
                 "DS4_LEASE_DIRECTORY",
-                "/srv/ai/model-router/run/leases",
+                str(_HOST_LEASE_DIRECTORY),
             )
         ).expanduser(),
         help="scheduler lease directory used to drain brokered model work",
@@ -393,6 +409,7 @@ def main() -> int:
     options = parser.parse_args()
     if options.estimate_only:
         return _run(options)
+    options.lease_directory = _validate_lease_directory(options.lease_directory)
 
     adapter_source = Path(__file__).resolve().parents[2] / "adapters"
     sys.path.insert(0, str(adapter_source))

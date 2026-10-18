@@ -39,6 +39,7 @@
     },
     "comfyui": {
       "units": ["comfyui.service"],
+      "start_command_timeout_s": 240,
       "health_url": "http://127.0.0.1:8189/system_stats",
       "queue_url": "http://127.0.0.1:8189/queue",
       "nodes_url": "http://127.0.0.1:8189/object_info",

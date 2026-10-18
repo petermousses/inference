@@ -347,6 +347,20 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         await self.scheduler.reap()
         self.assertEqual(self.runtime.stops, [])
 
+    async def test_pending_comfyui_restore_blocks_model_load_after_operation_lock_release(self):
+        directory = Path(self.directory.name)
+        self.scheduler = Scheduler(self.resources, self.runtime, directory / "leases", self.policy, clock=lambda: 1000)
+        (directory / "comfyui-restore.json").write_text(
+            '{"version":1,"unit":"comfyui.service","was_active":true,"pid":123}'
+        )
+
+        with self.assertRaises(AdmissionError) as error:
+            await self.scheduler.admit("a")
+
+        self.assertEqual(error.exception.code, "maintenance")
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.runtime.stops, [])
+
     async def test_warm_admission_preserves_busy_and_unknown_activity_during_other_load(self):
         self.runtime.loaded = {"a": "ready"}
         await self.scheduler.refresh()
@@ -1032,6 +1046,18 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await runtime.ready("comfyui"))
         self.api_ready = True
         self.assertTrue(await runtime.ready("comfyui"))
+
+    async def test_comfy_start_command_waits_past_systemd_readiness_deadline(self):
+        self.resources["comfyui"].update(
+            units=["comfyui.service"], start_command_timeout_s=240
+        )
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+        with patch.object(runtime, "command", new=AsyncMock(return_value="")) as command, patch.object(
+            runtime, "ready", new=AsyncMock(return_value=True)
+        ):
+            await runtime.start("comfyui")
+        self.assertEqual(command.await_args.args, ("start", "comfyui.service"))
+        self.assertEqual(command.await_args.kwargs["timeout"], 240)
 
     async def test_image_readiness_requires_installed_workflow_nodes(self):
         self.resources["comfyui"].update(health_url=str(self.upstream.make_url("/health")), nodes_url=str(self.upstream.make_url("/object_info")), required_nodes=["UnetLoaderGGUF"])

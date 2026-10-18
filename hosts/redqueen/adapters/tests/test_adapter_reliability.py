@@ -50,6 +50,7 @@ class ComfyFixture:
         self.malformed_prompt = False
         self.malformed_upload = False
         self.partial_output = False
+        self.prompt_headers: dict[str, str] = {}
         self.image = png((512, 512), alpha=255)
         self.pre_recorded = False
         app = web.Application()
@@ -65,6 +66,7 @@ class ComfyFixture:
 
     async def prompt(self, request):
         body = await request.json()
+        self.prompt_headers = dict(request.headers)
         job_id = body["prompt_id"]
         uuid.UUID(job_id)
         manifests = records(self.root / "requests", "comfyui")
@@ -398,7 +400,14 @@ class AdapterReliabilityTest(unittest.IsolatedAsyncioTestCase):
             done, _ = await asyncio.wait([task], timeout=.05)
             self.assertFalse(done)
             self.assertTrue(fixture.pre_recorded)
-            self.assertEqual(len(records(self.root / "requests", "comfyui")), 1)
+            owners = records(self.root / "requests", "comfyui")
+            self.assertEqual(len(owners), 1)
+            self.assertEqual(
+                fixture.prompt_headers["X-Redqueen-Request-ID"], owners[0]["id"]
+            )
+            self.assertEqual(
+                fixture.prompt_headers["X-Redqueen-Job-ID"], owners[0]["job_id"]
+            )
         finally:
             fixture.complete.set()
         self.assertTrue((await task).startswith(b"\x89PNG"))

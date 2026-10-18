@@ -438,6 +438,27 @@ class SupervisorTest(HostFixture):
         self.assertNotIn("comfyui_restore", state)
         self.assertTrue(any(call.args[:2] == ("start", "comfyui.service") for call in calls.call_args_list))
 
+    def test_supervisor_restarts_active_comfyui_when_its_guard_is_unhealthy(self):
+        marker = self.directory / "comfyui-restore.json"
+        host.atomic_json(marker, {
+            "version": 1, "unit": "comfyui.service", "was_active": True, "pid": 123,
+        })
+
+        def control(*args, **kwargs):
+            if args[:2] == ("show", "comfyui.service"):
+                return subprocess.CompletedProcess(args, 0, "active\n", "")
+            return self.result(*args, **kwargs)
+
+        with patch.object(host, "systemctl", side_effect=control) as calls, patch.object(
+            host, "comfyui_guard_ready", side_effect=(False, True)
+        ):
+            state = {}
+            host.restore_comfyui_if_requested(self.root, state, now=0)
+
+        self.assertFalse(marker.exists())
+        self.assertNotIn("comfyui_restore", state)
+        calls.assert_any_call("restart", "comfyui.service", timeout=240)
+
     def test_comfyui_restore_waits_for_inference_leases(self):
         marker = self.directory / "comfyui-restore.json"
         host.atomic_json(marker, {

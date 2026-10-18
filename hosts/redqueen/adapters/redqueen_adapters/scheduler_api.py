@@ -277,7 +277,17 @@ class Runtime:
                     raise RuntimeError("model failed to load")
                 await read_limited(response, 64 * 1024)
             return
-        await self.command("start", *spec["units"], timeout=10)
+        # systemctl waits for ExecStartPost as part of the start job. ComfyUI's
+        # admission-guard readiness probe can take 30 seconds after its 180s
+        # unit start deadline, so the command timeout must exceed both.
+        command_timeout = spec.get("start_command_timeout_s", 10)
+        if (
+            isinstance(command_timeout, bool)
+            or not isinstance(command_timeout, (int, float))
+            or command_timeout <= 0
+        ):
+            raise RuntimeError("backend start command timeout is invalid")
+        await self.command("start", *spec["units"], timeout=command_timeout)
         while not await self.ready(name):
             if await self.failed(name):
                 raise RuntimeError("backend process exited during loading")
@@ -335,9 +345,13 @@ class Scheduler:
         if not operation.acquire():
             raise AdmissionError(503, "deployment or host recovery is in progress", "maintenance")
         try:
-            marker = self.lock_dir.parent / "maintenance.json"
-            if marker.exists() or marker.is_symlink():
-                raise AdmissionError(503, "host recovery has pending service work", "maintenance")
+            for marker_name, reason in (
+                ("maintenance.json", "host recovery has pending service work"),
+                ("comfyui-restore.json", "ComfyUI restore is still pending"),
+            ):
+                marker = self.lock_dir.parent / marker_name
+                if marker.exists() or marker.is_symlink():
+                    raise AdmissionError(503, reason, "maintenance")
             if hasattr(self.runtime, "verify_configuration"):
                 try:
                     self.runtime.verify_configuration()

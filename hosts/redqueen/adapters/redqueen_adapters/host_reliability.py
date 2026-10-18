@@ -727,10 +727,12 @@ def restore_comfyui_if_requested(root: Path, state: dict, *, now: float) -> None
             if active_state in {"inactive", "failed"}:
                 systemctl("reset-failed", "comfyui.service", check=False)
                 systemctl("start", "comfyui.service", timeout=240)
-                active = systemctl(
-                    "show", "comfyui.service", "--property=ActiveState", "--value"
-                )
-                active_state = active.stdout.strip()
+            elif active_state == "active" and not comfyui_guard_ready():
+                systemctl("restart", "comfyui.service", timeout=240)
+            active = systemctl(
+                "show", "comfyui.service", "--property=ActiveState", "--value"
+            )
+            active_state = active.stdout.strip()
             if active_state != "active" or not comfyui_guard_ready():
                 raise RuntimeError("ComfyUI did not return with its admission guard ready")
             durable_unlink(marker)
