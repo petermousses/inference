@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import math
 import threading
+from concurrent.futures import Future as ConcurrentFuture
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ from expert_moe import execute_cached_moe
 _T = TypeVar("_T")
 _INSTALLATION_MARKER = "_redqueen_cached_moe_installation"
 _INSTALLATION_LOCK = threading.Lock()
+
+
+class _UnsafeCallbackResult(TypeError):
+    """An invalid async callback result could not be proven stopped."""
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,7 @@ class CachedMoEInstallation:
         self._fence = fence
         self._execution_lock = asyncio.Lock()
         self._closed = False
+        self._quarantined = False
 
     def __enter__(self) -> CachedMoEInstallation:
         if self._closed:
@@ -47,12 +53,17 @@ class CachedMoEInstallation:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
+        if not self._quarantined:
+            self.close()
 
     def close(self) -> None:
         with _INSTALLATION_LOCK:
             if self._closed:
                 return
+            if self._quarantined:
+                raise RuntimeError(
+                    "cannot close a cached MoE installation with an undrained callback"
+                )
             if self._execution_lock.locked():
                 raise RuntimeError("cannot close cached MoE installation during model work")
             for patch in self._patches:
@@ -82,6 +93,8 @@ class CachedMoEInstallation:
         """
         if self._closed:
             raise RuntimeError("cached MoE installation is already closed")
+        if self._quarantined:
+            raise RuntimeError("cached MoE installation is quarantined; worker restart is required")
         if not callable(operation):
             raise TypeError("operation must be callable")
         if not callable(self._fence):
@@ -98,6 +111,8 @@ class CachedMoEInstallation:
         async with self._execution_lock:
             if self._closed:
                 raise RuntimeError("cached MoE installation is already closed")
+            if self._quarantined:
+                raise RuntimeError("cached MoE installation is quarantined; worker restart is required")
             async with reservation:
                 task = asyncio.create_task(
                     asyncio.to_thread(
@@ -146,10 +161,13 @@ class CachedMoEInstallation:
         admitting another worker. The host broker must serialize this control
         call with requests across workers; this lock protects only this model
         graph. Allocator release runs only while backing release is pending,
-        including after a shrink, eviction, or failed release callback.
+        including after a shrink, eviction, or failed release callback. Fence
+        and allocator callbacks must be synchronous and return ``None``.
         """
         if isinstance(capacity_bytes, bool) or type(capacity_bytes) is not int or capacity_bytes < 0:
             raise ValueError("cache capacity must be a nonnegative integer")
+        if self._quarantined:
+            raise RuntimeError("cached MoE installation is quarantined; worker restart is required")
         if not callable(self._fence):
             raise ValueError("cached MoE installation requires a final GPU fence")
         _validate_sync_callable(self._fence, "GPU fence")
@@ -164,6 +182,8 @@ class CachedMoEInstallation:
         async with self._execution_lock:
             if self._closed:
                 raise RuntimeError("cached MoE installation is already closed")
+            if self._quarantined:
+                raise RuntimeError("cached MoE installation is quarantined; worker restart is required")
             task = asyncio.create_task(
                 asyncio.to_thread(
                     _resize_cache_sync,
@@ -176,6 +196,9 @@ class CachedMoEInstallation:
             )
             try:
                 return await asyncio.shield(task)
+            except _UnsafeCallbackResult:
+                self._quarantined = True
+                raise
             except asyncio.CancelledError as cancellation:
                 # A cancelled control request must not release the execution
                 # lock while the worker is dropping live tensor references.
@@ -189,6 +212,8 @@ class CachedMoEInstallation:
                 try:
                     task.result()
                 except BaseException as worker_error:
+                    if isinstance(worker_error, _UnsafeCallbackResult):
+                        self._quarantined = True
                     if hasattr(cancellation, "add_note"):
                         cancellation.add_note(
                             "cache resize worker finished with "
@@ -375,11 +400,15 @@ def _resize_cache_sync(
     release_allocator: Callable[[], None],
     worker_context: Callable[[], object] | None,
 ) -> ExpertCacheResize:
-    context = (
-        _call_sync(worker_context, "worker_context")
-        if worker_context is not None
-        else nullcontext()
-    )
+    try:
+        context = (
+            _call_sync(worker_context, "worker_context", allow_result=True)
+            if worker_context is not None
+            else nullcontext()
+        )
+    except _UnsafeCallbackResult as callback_error:
+        _quarantine_after_fence_failure(cache, callback_error)
+        raise
     with context:
         try:
             _call_sync(fence, "GPU fence")
@@ -395,10 +424,14 @@ def _resize_cache_sync(
                 _quarantine_after_fence_failure(cache, fence_error)
                 raise
 
-        resized = cache.resize_when_idle(
-            capacity_bytes,
-            after_drop=release_and_fence,
-        )
+        try:
+            resized = cache.resize_when_idle(
+                capacity_bytes,
+                after_drop=release_and_fence,
+            )
+        except _UnsafeCallbackResult as callback_error:
+            _quarantine_after_fence_failure(cache, callback_error)
+            raise
         if not isinstance(resized, ExpertCacheResize):
             raise TypeError("cache resize_when_idle must return ExpertCacheResize")
 
@@ -434,20 +467,74 @@ def _validate_sync_callable(callback: Callable[..., object], name: str) -> None:
         raise TypeError(f"{name} must be synchronous")
 
 
-def _call_sync(callback: Callable[..., _T], name: str) -> _T:
+def _call_sync(
+    callback: Callable[..., _T],
+    name: str,
+    *,
+    allow_result: bool = False,
+) -> _T | None:
     result = callback()
-    if inspect.isawaitable(result):
-        close = getattr(result, "close", None)
-        cancel = getattr(result, "cancel", None)
+    if result is None:
+        return
+    if isinstance(result, ConcurrentFuture):
+        result.cancel()
         try:
-            if callable(close):
-                close()
-            elif callable(cancel):
-                cancel()
-        except BaseException as cleanup_error:
-            error = TypeError(f"{name} returned an awaitable; callbacks must be synchronous")
-            if hasattr(error, "add_note"):
-                error.add_note(f"awaitable cleanup also failed: {cleanup_error!r}")
-            raise error from cleanup_error
-        raise TypeError(f"{name} returned an awaitable; callbacks must be synchronous")
-    return result
+            result.result()
+        except BaseException:
+            pass
+        raise TypeError(f"{name} returned a future; callbacks must return None")
+    if isinstance(result, asyncio.Future):
+        _cancel_and_drain_asyncio_future(result, name)
+        raise TypeError(f"{name} returned a future; callbacks must return None")
+    if inspect.iscoroutine(result):
+        result.close()
+        raise TypeError(f"{name} returned an awaitable; callbacks must return None")
+    if inspect.isawaitable(result):
+        raise _UnsafeCallbackResult(
+            f"{name} returned an unsupported awaitable; worker restart is required"
+        )
+    if allow_result:
+        return result
+    raise _UnsafeCallbackResult(
+        f"{name} returned a non-None result; worker restart is required"
+    )
+
+
+async def _cancel_and_drain(future: asyncio.Future) -> None:
+    if not future.done():
+        future.cancel()
+    try:
+        await future
+    except BaseException:
+        pass
+
+
+def _cancel_and_drain_asyncio_future(future: asyncio.Future, name: str) -> None:
+    loop = future.get_loop()
+    if future.done():
+        try:
+            future.result()
+        except BaseException:
+            pass
+        return
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is loop:
+        raise _UnsafeCallbackResult(
+            f"{name} returned a pending future on the current loop; worker restart is required"
+        )
+    if loop.is_closed():
+        raise _UnsafeCallbackResult(
+            f"{name} returned a pending future on a closed loop; worker restart is required"
+        )
+    try:
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(_cancel_and_drain(future), loop).result()
+        else:
+            loop.run_until_complete(_cancel_and_drain(future))
+    except BaseException as drain_error:
+        raise _UnsafeCallbackResult(
+            f"{name} returned a future that could not be drained; worker restart is required"
+        ) from drain_error

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -302,6 +302,102 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cache.resize_calls, [0, 0])
         self.assertEqual(release_body_calls, [])
         self.assertIn("allocator-release", events)
+
+    async def test_cache_resize_waits_for_concurrent_future_before_unlocking(self):
+        events = []
+        cache = _Cache(events)
+        release_started = threading.Event()
+        finish_release = threading.Event()
+        second_started = threading.Event()
+        future = Future()
+        self.assertTrue(future.set_running_or_notify_cancel())
+
+        def finish_future():
+            release_started.set()
+            if not finish_release.wait(3):
+                future.set_exception(TimeoutError("test did not finish allocator future"))
+            else:
+                future.set_result(None)
+
+        completer = threading.Thread(target=finish_future, daemon=True)
+        completer.start()
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            resizing = asyncio.create_task(
+                installation.resize_cache(0, release_allocator=lambda: future)
+            )
+            self.assertTrue(await asyncio.to_thread(release_started.wait, 2))
+            second = asyncio.create_task(
+                installation.run_reserved_sync(
+                    lambda: second_started.set(), _Reservation(events)
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(resizing.done())
+            self.assertFalse(second_started.is_set())
+            finish_release.set()
+            with self.assertRaisesRegex(TypeError, "returned a future"):
+                await resizing
+            await second
+
+        completer.join(timeout=2)
+        self.assertTrue(future.done())
+        self.assertTrue(cache.stats.pending_backing_release)
+        self.assertEqual(cache.resize_calls, [0])
+        self.assertTrue(second_started.is_set())
+
+    async def test_cache_resize_cancels_and_drains_task_cleanup_before_unlocking(self):
+        events = []
+        cache = _Cache(events)
+        cleanup_started = threading.Event()
+        finish_cleanup = threading.Event()
+
+        async def background_release():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_started.set()
+                if not await asyncio.to_thread(finish_cleanup.wait, 3):
+                    raise TimeoutError("test did not finish async cleanup")
+
+        task = asyncio.create_task(background_release())
+        await asyncio.sleep(0)
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            resizing = asyncio.create_task(
+                installation.resize_cache(0, release_allocator=lambda: task)
+            )
+            try:
+                self.assertTrue(await asyncio.to_thread(cleanup_started.wait, 2))
+                await asyncio.sleep(0.05)
+                self.assertFalse(resizing.done())
+            finally:
+                finish_cleanup.set()
+            with self.assertRaisesRegex(TypeError, "returned a future"):
+                await resizing
+
+        self.assertTrue(task.done())
+        self.assertTrue(cache.stats.pending_backing_release)
+        self.assertEqual(cache.resize_calls, [0])
+
+    async def test_cache_resize_quarantines_when_opaque_awaitable_cannot_be_drained(self):
+        events = []
+        cache = _Cache(events)
+
+        class OpaqueAwaitable:
+            def __await__(self):
+                yield
+
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            with self.assertRaisesRegex(TypeError, "worker restart is required"):
+                await installation.resize_cache(
+                    0, release_allocator=OpaqueAwaitable
+                )
+
+            self.assertTrue(cache.quarantined)
+            with self.assertRaisesRegex(RuntimeError, "worker restart is required"):
+                await installation.run_reserved_sync(lambda: None, _Reservation(events))
+
+        self.assertTrue(cache.stats.pending_backing_release)
+        self.assertEqual(cache.resize_calls, [0])
 
     async def test_cache_resize_fences_and_releases_allocator_at_worker_boundary(self):
         events = []
