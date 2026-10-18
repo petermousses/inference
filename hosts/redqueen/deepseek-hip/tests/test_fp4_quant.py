@@ -209,6 +209,26 @@ class NativeFp4QuantizationTest(unittest.TestCase):
                     self.assertTrue(torch.equal(packed, torch.zeros_like(packed)))
                     self.assertTrue(torch.equal(scales, torch.ones_like(scales)))
 
+    def test_e4m3_scale_rounding_ties_and_finite_saturation(self):
+        maxima = (
+            3.171875,
+            3.1875,
+            3.203125,
+            3.546875,
+            3.5625,
+            3.578125,
+            2688.0,
+            3000.0,
+        )
+        expected_scale_bytes = torch.tensor([0x30, 0x30, 0x31, 0x31, 0x32, 0x32, 0x7E, 0x7E], dtype=torch.uint8)
+        values = torch.zeros((len(maxima), 16), dtype=torch.bfloat16)
+        values[:, 0] = torch.tensor(maxima, dtype=torch.bfloat16)
+
+        _, scales = self.quantize(values, 16, SCALE_E4M3)
+        self.assertTrue(torch.equal(scales[:, 0], expected_scale_bytes))
+        _, expected_scales, _ = reference_fp4_quantize(values, 16, SCALE_E4M3)
+        self.assertTrue(torch.equal(scales, expected_scales))
+
     def test_rejects_invalid_arguments_without_launching(self):
         rows, cols = 2, 64
         source = torch.full((rows, cols), 3.0, dtype=torch.bfloat16, device="cuda")
