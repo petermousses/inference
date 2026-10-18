@@ -110,7 +110,8 @@ def main() -> None:
     )
     tokens = torch.randint(0, args.vocab_size, (2, 150))
     model = reference["Transformer"](args)
-    initialize_smoke_parameters(model, torch, torch.device("cuda"))
+    device = torch.device("cuda")
+    initialize_smoke_parameters(model, torch, device)
 
     def run_graph():
         snapshots = []
