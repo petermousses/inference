@@ -139,8 +139,26 @@ def operation_lock(directory: Path, *, wait: bool = False):
 def leases_held(directory: Path) -> bool:
     """Only flock ownership matters; file timestamps never expire work."""
     for path in sorted((directory / "leases").glob("*")):
-        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
         try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            # Queue tickets can be removed while a recovery scan is underway.
+            continue
+        if stat.S_ISDIR(mode):
+            # SerializedExecution stores its FIFO tickets in this child
+            # directory. It is not itself a request lease.
+            continue
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"unexpected non-regular lease entry: {path}")
+        try:
+            descriptor = os.open(
+                path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+            )
+        except FileNotFoundError:
+            continue
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise RuntimeError(f"lease entry changed type while scanning: {path}")
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:

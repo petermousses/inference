@@ -2,10 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -z "${DS4_HIP_LIBRARY:-}" ]]; then
-  "${root}/build.sh"
-  export DS4_HIP_LIBRARY="${BUILD_DIR:-${root}/build}/libredqueen_ds4_hip.so"
-elif [[ ! -f "${DS4_HIP_LIBRARY}" ]]; then
+if [[ -n "${DS4_HIP_LIBRARY:-}" && ! -f "${DS4_HIP_LIBRARY}" ]]; then
   echo "native DeepSeek HIP library not found: ${DS4_HIP_LIBRARY}" >&2
   exit 1
 fi

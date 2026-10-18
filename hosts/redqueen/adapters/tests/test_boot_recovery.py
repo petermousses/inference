@@ -240,6 +240,20 @@ class RecoveryTest(HostFixture):
             self.assertTrue(host.leases_held(self.directory))
         self.assertFalse(host.leases_held(self.directory))
 
+    def test_execution_queue_directory_is_not_a_request_lease(self):
+        queue = self.directory / "leases/execution-queue"
+        queue.mkdir()
+        self.assertFalse(host.leases_held(self.directory))
+        with (self.directory / "leases/glm").open("w") as stream:
+            fcntl.flock(stream, fcntl.LOCK_SH)
+            self.assertTrue(host.leases_held(self.directory))
+
+    def test_non_regular_lease_entry_fails_closed(self):
+        path = self.directory / "leases/unexpected"
+        path.symlink_to(self.directory / "leases/glm")
+        with self.assertRaisesRegex(RuntimeError, "non-regular lease entry"):
+            host.leases_held(self.directory)
+
     def test_interrupted_deployment_defers_rollback_for_protected_requests(self):
         journal = self.directory / "deployment.json"
         journal.write_text("{}")

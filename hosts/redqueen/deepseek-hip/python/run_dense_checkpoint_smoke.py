@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -280,6 +281,14 @@ def _run(options: argparse.Namespace) -> int:
         os.environ.get("DS4_CHECKPOINT_DIR", str(inference_dir.parent))
     ).expanduser()
     adapter_dir = Path(__file__).resolve().parent
+    if options.forward_smoke and not os.environ.get("DS4_HIP_LIBRARY"):
+        subprocess.run([str(adapter_dir.parent / "build.sh")], check=True)
+        build_directory = Path(
+            os.environ.get("BUILD_DIR", str(adapter_dir.parent / "build"))
+        ).expanduser()
+        os.environ["DS4_HIP_LIBRARY"] = str(
+            build_directory / "libredqueen_ds4_hip.so"
+        )
     source_bytes = verify_pinned_inference_sources(inference_dir)
     model_path = inference_dir / "model.py"
 
