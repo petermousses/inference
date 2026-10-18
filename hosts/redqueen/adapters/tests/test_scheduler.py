@@ -435,6 +435,77 @@ class ExecutionGateTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(first, second, third)
             self.assertTrue(third_started.is_set())
 
+    async def test_maintenance_window_keeps_fifo_and_host_operation_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lease_directory = root / "leases"
+            normal = SerializedExecution(lease_directory)
+            maintenance = SerializedExecution(lease_directory)
+            later = SerializedExecution(lease_directory)
+            queue = lease_directory / "execution-queue"
+            first_started, release_first = asyncio.Event(), asyncio.Event()
+            maintenance_started, release_maintenance = asyncio.Event(), asyncio.Event()
+            later_started = asyncio.Event()
+
+            async def hold_first():
+                async with normal.hold():
+                    first_started.set()
+                    await release_first.wait()
+
+            async def hold_maintenance():
+                async with maintenance.hold_maintenance():
+                    execution_probe = ResourceLock(
+                        lease_directory, "global-execution", exclusive=True
+                    )
+                    self.assertFalse(execution_probe.acquire())
+                    execution_probe.close()
+                    operations_probe = ResourceLock(root, "operations.lock", exclusive=True)
+                    self.assertFalse(operations_probe.acquire())
+                    operations_probe.close()
+                    maintenance_started.set()
+                    await release_maintenance.wait()
+
+            async def hold_later():
+                async with later.hold():
+                    later_started.set()
+
+            async def wait_for_tickets(count):
+                for _ in range(100):
+                    if len(list(queue.glob("*.ticket"))) >= count:
+                        return
+                    await asyncio.sleep(0.01)
+                self.fail("execution ticket was not queued")
+
+            first = asyncio.create_task(hold_first())
+            await first_started.wait()
+            middle = asyncio.create_task(hold_maintenance())
+            await wait_for_tickets(1)
+            queued = asyncio.create_task(hold_later())
+            await wait_for_tickets(2)
+
+            release_first.set()
+            await maintenance_started.wait()
+            self.assertFalse(later_started.is_set())
+            release_maintenance.set()
+            await asyncio.gather(first, middle, queued)
+            self.assertTrue(later_started.is_set())
+
+    async def test_maintenance_window_fails_closed_when_host_operations_are_busy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lease_directory = root / "leases"
+            operations = ResourceLock(root, "operations.lock", exclusive=True)
+            self.assertTrue(operations.acquire())
+            self.addCleanup(operations.close)
+
+            with self.assertRaisesRegex(RuntimeError, "host operations are busy"):
+                async with SerializedExecution(lease_directory).hold_maintenance():
+                    self.fail("maintenance entered despite an occupied host operations lock")
+
+            execution = ResourceLock(lease_directory, "global-execution", exclusive=True)
+            self.assertTrue(execution.acquire())
+            execution.close()
+
 
 class ProxyTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

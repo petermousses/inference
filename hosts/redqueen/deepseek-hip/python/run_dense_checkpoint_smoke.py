@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
+import asyncio
 import json
 import os
 import sys
@@ -215,38 +215,54 @@ def main() -> int:
         help="run one checkpoint-backed native HIP prefill and DSpark decode step",
     )
     parser.add_argument(
-        "--execution-lock",
+        "--lease-directory",
         type=Path,
         default=Path(
             os.environ.get(
-                "DS4_EXECUTION_LOCK",
-                "/srv/ai/model-router/run/leases/global-execution",
+                "DS4_LEASE_DIRECTORY",
+                "/srv/ai/model-router/run/leases",
             )
-        ),
-        help="scheduler global-execution flock used to drain brokered model work",
+        ).expanduser(),
+        help="scheduler lease directory used to drain brokered model work",
     )
     options = parser.parse_args()
     if options.estimate_only:
         return _run(options)
 
-    lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-    execution_fd = os.open(options.execution_lock, lock_flags, 0o600)
-    operations_fd = None
+    adapter_source = Path(__file__).resolve().parents[2] / "adapters"
+    sys.path.insert(0, str(adapter_source))
     try:
-        print("waiting for scheduler execution lease", flush=True)
-        fcntl.flock(execution_fd, fcntl.LOCK_EX)
-        operations_lock = options.execution_lock.parent.parent / "operations.lock"
-        operations_fd = os.open(operations_lock, lock_flags, 0o600)
-        fcntl.flock(operations_fd, fcntl.LOCK_EX)
-        print(
-            "scheduler execution and operations leases acquired; running isolated checkpoint smoke",
-            flush=True,
-        )
-        return _run(options)
-    finally:
-        if operations_fd is not None:
-            os.close(operations_fd)
-        os.close(execution_fd)
+        from redqueen_adapters.scheduler_client import SerializedExecution
+    except ImportError as exc:
+        raise RuntimeError("host scheduler lease implementation is unavailable") from exc
+
+    async def run_under_host_leases() -> int:
+        execution = SerializedExecution(options.lease_directory)
+        async with execution.hold_maintenance():
+            run_directory = options.lease_directory.parent
+            for name in ("deployment.json", "maintenance.json"):
+                marker = run_directory / name
+                if marker.exists() or marker.is_symlink():
+                    raise RuntimeError(f"host maintenance marker is present: {marker}")
+            recovery_path = run_directory / "recovery.json"
+            if recovery_path.exists() or recovery_path.is_symlink():
+                try:
+                    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("host recovery state is unreadable") from exc
+                if not isinstance(recovery, dict) or recovery.get("state") in {
+                    "recovering",
+                    "quarantined",
+                }:
+                    raise RuntimeError("host recovery is pending or quarantined")
+            print(
+                "scheduler FIFO execution and host operations leases acquired; "
+                "running isolated checkpoint smoke",
+                flush=True,
+            )
+            return await asyncio.to_thread(_run, options)
+
+    return asyncio.run(run_under_host_leases())
 
 
 def _run(options: argparse.Namespace) -> int:

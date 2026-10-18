@@ -146,6 +146,37 @@ class SerializedExecution:
             os.close(ticket_fd)
             ticket.unlink(missing_ok=True)
 
+    @asynccontextmanager
+    async def hold_maintenance(self):
+        """Hold a FIFO execution window and the host operations lock.
+
+        Standalone GPU work must not bypass queued inference or overlap host
+        deployment/recovery. Operations-lock contention fails closed instead
+        of making later inference wait behind maintenance work.
+        """
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.queue.mkdir(mode=0o700, exist_ok=True)
+        ticket, ticket_fd = await self._new_ticket()
+        execution = ResourceLock(self.directory, "global-execution", exclusive=True)
+        operations = ResourceLock(self.directory.parent, "operations.lock", exclusive=True)
+        try:
+            while not self._is_head(ticket):
+                await asyncio.sleep(0.025)
+            while True:
+                if not operations.acquire():
+                    raise RuntimeError("host operations are busy; refusing standalone GPU work")
+                if execution.acquire():
+                    break
+                operations.close()
+                await asyncio.sleep(0.025)
+            ticket.unlink(missing_ok=True)
+            yield
+        finally:
+            execution.close()
+            operations.close()
+            os.close(ticket_fd)
+            ticket.unlink(missing_ok=True)
+
 
 class SchedulerClient:
     def __init__(self, socket_path: str = "", *, timeout: float | None = None):
