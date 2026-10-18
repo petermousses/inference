@@ -114,7 +114,7 @@ class EngramRowReader:
 
     def estimate_memory(self, indices_shape: tuple[int, ...] | list[int]) -> EngramLookupMemoryEstimate:
         """Estimate output and bounded scratch before request admission or materialization."""
-        if type(indices_shape) not in (tuple, list) or not indices_shape:
+        if not isinstance(indices_shape, (tuple, list)) or not indices_shape:
             raise ValueError("indices_shape must be a nonempty tuple or list of dimensions")
         if any(type(dimension) is not int or dimension < 0 for dimension in indices_shape):
             raise ValueError("indices_shape dimensions must be nonnegative integers")
@@ -129,7 +129,7 @@ class EngramRowReader:
         host_peak = batch * 96 + 2 * rows * row_bytes + _MAX_READ_HEADROOM
         device_peak = (
             output_bytes
-            + batch * (8 * self.embedding_dim + 3 * self.scale_blocks + 16)
+            + batch * (12 * self.embedding_dim + 6 * self.scale_blocks + 16)
             + rows * row_bytes
         )
         return EngramLookupMemoryEstimate(
@@ -235,7 +235,12 @@ class _ForwardPatch:
 
 
 class EngramRowInstallation:
-    """Reversible per-instance Engram.forward patches for one transformer."""
+    """Reversible per-instance Engram.forward patches for one transformer.
+
+    Before closing, the caller must drain complete transformer executions through its model-wide
+    execution lease and fence their GPU work. This object waits only for calls already inside an
+    installed Engram reader; it cannot see a forward that has not reached an Engram layer yet.
+    """
 
     def __init__(self, patches: list[_ForwardPatch]) -> None:
         self._patches = patches
@@ -274,6 +279,7 @@ class EngramRowInstallation:
                     self._condition.notify_all()
 
     def close(self) -> None:
+        """Restore original methods after the caller has drained model execution and GPU work."""
         with _INSTALLATION_LOCK:
             with self._condition:
                 if self._closed:
@@ -363,9 +369,20 @@ def install_engram_row_reads(
     installation = EngramRowInstallation(patches)
     try:
         with _INSTALLATION_LOCK:
-            for embed, reader in planned:
-                original = embed.forward
+            # Validate the complete patch set under the same lock used by close(). A concurrent
+            # installer may have passed the earlier metadata checks while this installer held
+            # the GIL, then patched these instances before reaching this critical section.
+            # Reject that state before taking original callables or mutating any instance.
+            for embed, _reader in planned:
+                if getattr(embed, _PATCH_MARKER, None) is not None:
+                    raise RuntimeError("Engram row reads are already installed")
 
+            originals = [(embed, reader, embed.forward) for embed, reader in planned]
+            for embed, _reader, original in originals:
+                if not callable(original):
+                    raise TypeError("Engram embedding forward must be callable")
+
+            for embed, reader, original in originals:
                 def installed(indices, *, _embed=embed, _reader=reader):
                     return installation._lookup(_reader, _embed, indices)
 

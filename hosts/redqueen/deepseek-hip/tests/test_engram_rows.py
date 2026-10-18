@@ -194,7 +194,14 @@ class EngramRowReaderTest(unittest.TestCase):
         )
         estimate = reader.estimate_memory((2, 3, 4))
         self.assertEqual(estimate.output_bytes, 2 * 3 * 4 * self.dim * 2)
-        self.assertGreater(estimate.device_peak_bytes, estimate.output_bytes)
+        row_bytes = reader._weight.row_bytes + reader._scale.row_bytes
+        self.assertEqual(
+            estimate.device_peak_bytes,
+            estimate.output_bytes
+            + 5 * (12 * self.dim + 6 * (self.dim // self.block_size) + 16)
+            + 3 * row_bytes,
+        )
+        self.assertEqual(reader.estimate_memory(torch.Size((2, 3, 4))), estimate)
         self.assertGreater(estimate.host_peak_bytes, 0)
 
     def test_rejects_invalid_table_metadata_before_reading(self):
@@ -289,6 +296,52 @@ class EngramRowReaderTest(unittest.TestCase):
             embed = block.engram.embed
             self.assertIs(embed.forward.__func__, MetaEmbedding.forward)
             self.assertFalse(hasattr(embed, "_redqueen_engram_row_reader"))
+
+    def test_concurrent_installers_serialize_and_leave_no_wrapper_behind(self):
+        transformer, MetaEmbedding = self._meta_transformer([1])
+        embed = transformer.layers[0].engram.embed
+
+        class FirstPairBarrierLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self._counter_lock = threading.Lock()
+                self._barrier = threading.Barrier(2)
+                self._entrants = 0
+
+            def __enter__(self):
+                with self._counter_lock:
+                    synchronize = self._entrants < 2
+                    self._entrants += 1
+                if synchronize:
+                    self._barrier.wait(timeout=5)
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self._lock.release()
+
+        synchronization_lock = FirstPairBarrierLock()
+        installations = []
+        failures = []
+        with patch.object(engram_rows, "_INSTALLATION_LOCK", synchronization_lock):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    pool.submit(install_engram_row_reads, transformer, self.reader)
+                    for _ in range(2)
+                ]
+                for future in futures:
+                    try:
+                        installations.append(future.result(timeout=10))
+                    except RuntimeError as exc:
+                        failures.append(exc)
+
+            self.assertEqual(len(installations), 1)
+            self.assertEqual(len(failures), 1)
+            self.assertRegex(str(failures[0]), "already installed")
+            installations[0].close()
+
+        self.assertIs(embed.forward.__func__, MetaEmbedding.forward)
+        self.assertFalse(hasattr(embed, "_redqueen_engram_row_reader"))
 
 
 if __name__ == "__main__":

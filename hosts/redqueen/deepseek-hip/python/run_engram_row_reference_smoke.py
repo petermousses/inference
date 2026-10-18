@@ -17,11 +17,12 @@ from engram_rows import install_engram_row_reads
 from torch_checkpoint import read_rows_to_device
 
 
-def _compare_with_checkpoint(checkpoint, reader, embed, torch) -> None:
+def _compare_with_checkpoint(checkpoint, reader, embed, torch, device) -> None:
     indices = torch.tensor(
         [[[-1, 0, 1, 2, reader.num_embeddings // 2, reader.num_embeddings - 1,
            reader.num_embeddings]]],
         dtype=torch.int64,
+        device=device,
     )
     actual = embed(indices)
     flat = indices.reshape(-1)
@@ -30,20 +31,22 @@ def _compare_with_checkpoint(checkpoint, reader, embed, torch) -> None:
     unique_rows, inverse = torch.unique(valid, sorted=True, return_inverse=True)
     rows = unique_rows.tolist()
     weights = read_rows_to_device(
-        checkpoint, reader.weight_name, rows, device="cpu"
+        checkpoint, reader.weight_name, rows, device=device
     )
     scales = read_rows_to_device(
-        checkpoint, reader.scale_name, rows, device="cpu"
+        checkpoint, reader.scale_name, rows, device=device
     )
     expected_values = (
         weights.index_select(0, inverse).float().unflatten(-1, (-1, 32))
         * scales.index_select(0, inverse).float().unsqueeze(-1)
     ).flatten(-2).to(torch.bfloat16)
     expected = torch.zeros(
-        (flat.numel(), reader.embedding_dim), dtype=torch.bfloat16
+        (flat.numel(), reader.embedding_dim), dtype=torch.bfloat16, device=device
     )
     expected[~mask] = expected_values
     expected = expected.reshape(*indices.shape, reader.embedding_dim)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -75,6 +78,7 @@ def main() -> int:
             import torch
         except ImportError as exc:
             raise RuntimeError("PyTorch is required for the Engram row smoke") from exc
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         with _pinned_inference_imports(source_bytes, inference_dir):
             reference = _execute_pinned_model(source_bytes["model.py"], model_path)
@@ -108,7 +112,9 @@ def main() -> int:
                         raise RuntimeError(f"unexpected pinned Engram layers: {sorted(readers)}")
                     for layer_id, reader in readers.items():
                         embed = transformer.layers[layer_id].engram.embed
-                        _compare_with_checkpoint(checkpoint, reader, embed.forward, torch)
+                        _compare_with_checkpoint(
+                            checkpoint, reader, embed.forward, torch, device
+                        )
                     if any(
                         not transformer.layers[layer_id].engram.embed.weight.is_meta
                         or not transformer.layers[layer_id].engram.embed.scale.is_meta
@@ -121,7 +127,11 @@ def main() -> int:
         if previous_kernel is not None:
             sys.modules["kernel"] = previous_kernel
 
-    print("pinned Engram row reference smoke: PASS; layers=1,14; table weights remained meta")
+    runtime = f"hip={torch.version.hip}" if device.type == "cuda" else "cpu fallback"
+    print(
+        "pinned Engram row reference smoke: PASS; "
+        f"layers=1,14; device={device}; {runtime}; table weights remained meta"
+    )
     return 0
 
 
