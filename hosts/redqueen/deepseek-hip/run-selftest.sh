@@ -6,5 +6,5 @@ build_dir="$(mktemp -d "${TMPDIR:-/tmp}/redqueen-ds4-hip.XXXXXX")"
 trap 'rm -rf "${build_dir}"' EXIT
 
 BUILD_DIR="${build_dir}" "${root}/build.sh"
-DS4_HIP_LIBRARY="${build_dir}/libredqueen_ds4_quantization.so" \
-  "${PYTHON:-python3}" "${root}/tests/test_quantization.py"
+DS4_HIP_LIBRARY="${build_dir}/libredqueen_ds4_hip.so" \
+  "${PYTHON:-python3}" -m unittest discover -s "${root}/tests" -p 'test_*.py' -v
