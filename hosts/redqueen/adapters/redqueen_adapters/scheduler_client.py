@@ -40,6 +40,19 @@ async def finish_shielded(task: asyncio.Task[T]) -> T:
             return result
 
 
+async def run_thread_shielded(operation: Callable[..., T], /, *args, **kwargs) -> T:
+    """Do not let caller cancellation outlive synchronous work in a thread."""
+    task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await finish_shielded(task)
+        except asyncio.CancelledError:
+            pass
+        raise
+
+
 class ResourceLock:
     def __init__(self, directory: Path, resource: str, *, exclusive: bool = False):
         if not resource or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789-._" for c in resource):

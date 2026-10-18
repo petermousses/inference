@@ -6,6 +6,7 @@ import math
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -22,7 +23,12 @@ from redqueen_adapters.memory_profile import MIB, build_profiles, file_signature
 from redqueen_adapters.ownership import OwnedRequest, records
 from redqueen_adapters import scheduler_api
 from redqueen_adapters.scheduler_api import Memory, Runtime, Scheduler, create_apps, footprint
-from redqueen_adapters.scheduler_client import ResourceLock, SchedulerClient, SerializedExecution
+from redqueen_adapters.scheduler_client import (
+    ResourceLock,
+    SchedulerClient,
+    SerializedExecution,
+    run_thread_shielded,
+)
 
 
 def resource(size: int, kind: str = "text") -> dict:
@@ -505,6 +511,46 @@ class ExecutionGateTest(unittest.IsolatedAsyncioTestCase):
             execution = ResourceLock(lease_directory, "global-execution", exclusive=True)
             self.assertTrue(execution.acquire())
             execution.close()
+
+    async def test_maintenance_window_stays_held_until_cancelled_thread_finishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lease_directory = root / "leases"
+            worker_started, release_worker = threading.Event(), threading.Event()
+
+            def worker():
+                worker_started.set()
+                if not release_worker.wait(2):
+                    raise TimeoutError("test worker was not released")
+
+            async def run_worker():
+                async with SerializedExecution(lease_directory).hold_maintenance():
+                    await run_thread_shielded(worker)
+
+            task = asyncio.create_task(run_worker())
+            self.assertTrue(await asyncio.to_thread(worker_started.wait, 2))
+            task.cancel()
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done())
+
+            execution_probe = ResourceLock(
+                lease_directory, "global-execution", exclusive=True
+            )
+            self.assertFalse(execution_probe.acquire())
+            execution_probe.close()
+            operations_probe = ResourceLock(root, "operations.lock", exclusive=True)
+            self.assertFalse(operations_probe.acquire())
+            operations_probe.close()
+
+            release_worker.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            execution = ResourceLock(lease_directory, "global-execution", exclusive=True)
+            self.assertTrue(execution.acquire())
+            execution.close()
+            operations = ResourceLock(root, "operations.lock", exclusive=True)
+            self.assertTrue(operations.acquire())
+            operations.close()
 
 
 class ProxyTest(unittest.IsolatedAsyncioTestCase):

@@ -232,7 +232,10 @@ def main() -> int:
     adapter_source = Path(__file__).resolve().parents[2] / "adapters"
     sys.path.insert(0, str(adapter_source))
     try:
-        from redqueen_adapters.scheduler_client import SerializedExecution
+        from redqueen_adapters.scheduler_client import (
+            SerializedExecution,
+            run_thread_shielded,
+        )
     except ImportError as exc:
         raise RuntimeError("host scheduler lease implementation is unavailable") from exc
 
@@ -260,7 +263,7 @@ def main() -> int:
                 "running isolated checkpoint smoke",
                 flush=True,
             )
-            return await asyncio.to_thread(_run, options)
+            return await run_thread_shielded(_run, options)
 
     return asyncio.run(run_under_host_leases())
 
