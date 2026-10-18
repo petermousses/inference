@@ -12,6 +12,7 @@ from typing import Any, TypeVar
 from expert_moe import execute_cached_moe
 
 _T = TypeVar("_T")
+_INSTALLATION_MARKER = "_redqueen_cached_moe_installation"
 
 
 @dataclass(frozen=True)
@@ -50,10 +51,13 @@ class CachedMoEInstallation:
         if self._execution_lock.locked():
             raise RuntimeError("cannot close cached MoE installation during model execution")
         for patch in self._patches:
+            if getattr(patch.moe, _INSTALLATION_MARKER, None) is not self:
+                raise RuntimeError("cached MoE installation ownership changed")
             if patch.moe.forward is not patch.installed:
                 raise RuntimeError("MoE.forward changed while the cache was installed")
         for patch in self._patches:
             patch.moe.forward = patch.original
+            delattr(patch.moe, _INSTALLATION_MARKER)
         self._closed = True
 
     async def run_reserved_sync(
@@ -202,6 +206,10 @@ def install_cached_moe(
             raise ValueError(f"{name} MoE layer id does not match its transformer index")
         targets.append((moe, mtp_index, True, name))
 
+    for moe, _, _, name in targets:
+        if hasattr(moe, _INSTALLATION_MARKER):
+            raise RuntimeError(f"{name} already belongs to a cached MoE installation")
+
     patches: list[_ForwardPatch] = []
     for moe, cache_layer_id, mtp_layer, name in targets:
         original = moe.forward
@@ -231,9 +239,25 @@ def install_cached_moe(
         cached_forward.__name__ = f"cached_{name.replace('[', '_').replace(']', '')}_forward"
         patches.append(_ForwardPatch(moe, original, cached_forward))
 
-    for patch in patches:
-        patch.moe.forward = patch.installed
-    return CachedMoEInstallation(patches, cache, fence)
+    installation = CachedMoEInstallation(patches, cache, fence)
+    marked: list[_ForwardPatch] = []
+    patched: list[_ForwardPatch] = []
+    try:
+        for patch in patches:
+            setattr(patch.moe, _INSTALLATION_MARKER, installation)
+            marked.append(patch)
+        for patch in patches:
+            patch.moe.forward = patch.installed
+            patched.append(patch)
+    except BaseException:
+        for patch in reversed(patched):
+            if patch.moe.forward is patch.installed:
+                patch.moe.forward = patch.original
+        for patch in reversed(marked):
+            if getattr(patch.moe, _INSTALLATION_MARKER, None) is installation:
+                delattr(patch.moe, _INSTALLATION_MARKER)
+        raise
+    return installation
 
 
 def _run_and_fence(

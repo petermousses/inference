@@ -135,6 +135,31 @@ class CachedMoEInstallationTest(unittest.TestCase):
             installation.close()
         self.assertFalse(installation._closed)
 
+    def test_rejects_duplicate_installation_and_allows_reinstall_after_close(self):
+        moe = _moe(0)
+        original = moe.forward
+        transformer = SimpleNamespace(layers=[SimpleNamespace(ffn=moe)], mtp=[])
+        first_cache = _Cache()
+        first = install_cached_moe(
+            transformer, first_cache, lambda values, weight: values
+        )
+        first_forward = moe.forward
+
+        with self.assertRaisesRegex(RuntimeError, "already belongs"):
+            install_cached_moe(
+                transformer, _Cache(), lambda values, weight: values
+            )
+        self.assertIs(moe.forward, first_forward)
+        first.close()
+        self.assertIs(moe.forward, original)
+
+        second = install_cached_moe(
+            transformer, _Cache(), lambda values, weight: values
+        )
+        self.assertIsNot(moe.forward, first_forward)
+        second.close()
+        self.assertIs(moe.forward, original)
+
 
 class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
     async def test_reservation_stays_held_through_final_gpu_fence(self):
