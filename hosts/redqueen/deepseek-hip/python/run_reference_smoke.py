@@ -68,11 +68,28 @@ def main() -> None:
     n_mtp_layers = model_config.get("n_mtp_layers")
     if type(n_mtp_layers) is not int or n_mtp_layers < 1:
         raise SystemExit("pinned 1017 config must declare a positive n_mtp_layers")
+    model_n_layers = model_config.get("n_layers")
+    if type(model_n_layers) is not int or model_n_layers < 1:
+        raise SystemExit("pinned 1017 config must declare a positive n_layers")
     compress_ratios = model_config.get("compress_ratios")
     if not isinstance(compress_ratios, list) or any(
         type(ratio) is not int or ratio < 0 for ratio in compress_ratios
     ):
         raise SystemExit("pinned 1017 config must declare nonnegative compress_ratios")
+    if len(compress_ratios) < model_n_layers + n_mtp_layers:
+        raise SystemExit("pinned 1017 compress_ratios do not cover all MTP layers")
+
+    def source_layers(name):
+        values = model_config.get(name)
+        if not isinstance(values, list) or any(
+            type(layer) is not int or not 0 <= layer < model_n_layers
+            for layer in values
+        ):
+            raise SystemExit(f"pinned 1017 config must declare valid {name}")
+        return tuple(values)
+
+    kv_source_layers = source_layers("kv_source_layers")
+    index_source_layers = source_layers("index_source_layers")
 
     adapter_dir = Path(__file__).resolve().parent
     checkpoint_root = inference_dir.parent
@@ -131,6 +148,8 @@ def main() -> None:
         swiglu_limit=swiglu_limit,
         n_mtp_layers=n_mtp_layers,
         compress_ratios=tuple(compress_ratios),
+        kv_source_layers=kv_source_layers,
+        index_source_layers=index_source_layers,
     )
     if len(args.compress_ratios) < args.n_layers + args.n_mtp_layers:
         raise SystemExit("pinned 1017 compress_ratios do not cover all MTP layers")
