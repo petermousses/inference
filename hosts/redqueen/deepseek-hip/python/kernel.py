@@ -220,13 +220,17 @@ def act_quant(
     if cols % block_size:
         raise ValueError("the last dimension must be divisible by block_size")
 
+    # Keep the original allocation alive on this stream while contiguous()
+    # may asynchronously copy from it. Recording only z is insufficient when
+    # x is noncontiguous and the caller releases its reference immediately.
+    stream = torch.cuda.current_stream(device)
+    x.record_stream(stream)
     z = _contiguous(x)
     rows = _c_int(z.numel() // cols, "row count")
     if rows == 0:
         raise ValueError("empty activation tensors are not supported")
     output = torch.empty(z.shape, dtype=torch.float8_e4m3fn, device=device)
     scales = torch.empty((*z.shape[:-1], cols // block_size), dtype=e8m0, device=device)
-    stream = torch.cuda.current_stream(device)
     z.record_stream(stream)
     _check(
         _library().redqueen_ds4_quantize_activation(
@@ -266,6 +270,10 @@ def fp4_act_quant(
     if cols % block_size:
         raise ValueError("the last dimension must be divisible by block_size")
 
+    # contiguous() can enqueue a read from x on this stream. Retain x even if
+    # the caller drops it after this wrapper returns.
+    stream = torch.cuda.current_stream(device)
+    x.record_stream(stream)
     z = _contiguous(x)
     rows = _c_int(z.numel() // cols, "row count")
     if rows == 0:
@@ -275,7 +283,6 @@ def fp4_act_quant(
     else:
         output = torch.empty((*z.shape[:-1], cols // 2), dtype=_fp4_dtype(), device=device)
     scales = torch.empty((*z.shape[:-1], cols // block_size), dtype=scale_dtype, device=device)
-    stream = torch.cuda.current_stream(device)
     z.record_stream(stream)
     scale_type = 0 if scale_dtype == e8m0 else 1
     _check(

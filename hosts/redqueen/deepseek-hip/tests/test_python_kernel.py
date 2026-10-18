@@ -40,6 +40,26 @@ class NativeKernelModuleTest(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             kernel.act_quant(values)
 
+    def test_act_quant_handles_noncontiguous_inputs_and_inplace_copyback(self):
+        values = torch.linspace(-24, 24, 64 * 4, dtype=torch.float32, device="cuda")
+        values = values.to(torch.bfloat16).reshape(64, 4).transpose(0, 1)
+        self.assertFalse(values.is_contiguous())
+        expected, expected_scales = kernel.act_quant(
+            values.contiguous(), 32, "ue8m0", self.e8m0
+        )
+        quantized, scales = kernel.act_quant(values, 32, "ue8m0", self.e8m0)
+        torch.testing.assert_close(quantized, expected, rtol=0, atol=0)
+        torch.testing.assert_close(scales.float(), expected_scales.float(), rtol=0, atol=0)
+
+        inplace = torch.linspace(-24, 24, 64 * 4, dtype=torch.float32, device="cuda")
+        inplace = inplace.to(torch.bfloat16).reshape(64, 4).transpose(0, 1)
+        self.assertFalse(inplace.is_contiguous())
+        expected_inplace = inplace.contiguous()
+        kernel.act_quant(expected_inplace, 32, "ue8m0", self.e8m0, inplace=True)
+        result = kernel.act_quant(inplace, 32, "ue8m0", self.e8m0, inplace=True)
+        self.assertIs(result, inplace)
+        torch.testing.assert_close(inplace, expected_inplace, rtol=0, atol=0)
+
     def test_fp4_activation_quantization_supports_packed_and_inplace_paths(self):
         values = torch.linspace(-12, 12, 4 * 64, dtype=torch.float32).reshape(4, 64).to(torch.bfloat16).cuda()
         packed, scales = kernel.fp4_act_quant(values, 16, scale_dtype=torch.float8_e4m3fn)
@@ -52,6 +72,70 @@ class NativeKernelModuleTest(unittest.TestCase):
         result = kernel.fp4_act_quant(inplace, 32, inplace=True)
         self.assertIs(result, inplace)
         self.assertTrue(torch.isfinite(inplace.float()).all().item())
+
+    def test_fp4_activation_quantization_handles_noncontiguous_inputs(self):
+        values = torch.linspace(-12, 12, 64 * 4, dtype=torch.float32, device="cuda")
+        values = values.to(torch.bfloat16).reshape(64, 4).transpose(0, 1)
+        self.assertFalse(values.is_contiguous())
+        expected, expected_scales = kernel.fp4_act_quant(
+            values.contiguous(), 16, scale_dtype=torch.float8_e4m3fn
+        )
+        packed, scales = kernel.fp4_act_quant(
+            values, 16, scale_dtype=torch.float8_e4m3fn
+        )
+        torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+        torch.testing.assert_close(scales.float(), expected_scales.float(), rtol=0, atol=0)
+
+        inplace = torch.linspace(-12, 12, 64 * 4, dtype=torch.float32, device="cuda")
+        inplace = inplace.to(torch.bfloat16).reshape(64, 4).transpose(0, 1)
+        self.assertFalse(inplace.is_contiguous())
+        expected_inplace = inplace.contiguous()
+        kernel.fp4_act_quant(expected_inplace, 32, inplace=True)
+        result = kernel.fp4_act_quant(inplace, 32, inplace=True)
+        self.assertIs(result, inplace)
+        torch.testing.assert_close(inplace, expected_inplace, rtol=0, atol=0)
+
+    def test_noncontiguous_activation_copy_keeps_source_alive_on_consumer_stream(self):
+        def exercise(operation):
+            producer = torch.cuda.Stream()
+            consumer = torch.cuda.Stream()
+            ready = torch.cuda.Event()
+            with torch.cuda.stream(producer):
+                backing = torch.full((64, 4), 3.0, dtype=torch.bfloat16, device="cuda")
+                values = backing.transpose(0, 1)
+                ready.record(producer)
+
+            consumer.wait_event(ready)
+            with torch.cuda.stream(consumer):
+                # Hold the consumer behind a long-running device operation so
+                # producer-side allocations can reuse freed source storage
+                # before contiguous() reads it if record_stream is missing.
+                torch.cuda._sleep(100_000_000)
+                result = operation(values)
+                del values, backing
+
+            with torch.cuda.stream(producer):
+                churn = [
+                    torch.full((64, 4), -17.0, dtype=torch.bfloat16, device="cuda")
+                    for _ in range(16)
+                ]
+            consumer.synchronize()
+            return result, churn
+
+        (quantized, scales), churn = exercise(
+            lambda x: kernel.act_quant(x, 32, "ue8m0", self.e8m0)
+        )
+        expected_x = torch.full((4, 64), 3.0, dtype=torch.bfloat16, device="cuda")
+        expected, expected_scales = kernel.act_quant(
+            expected_x, 32, "ue8m0", self.e8m0
+        )
+        torch.testing.assert_close(quantized, expected, rtol=0, atol=0)
+        torch.testing.assert_close(scales.float(), expected_scales.float(), rtol=0, atol=0)
+
+        (packed, fp4_scales), churn = exercise(lambda x: kernel.fp4_act_quant(x, 32))
+        expected_packed, expected_fp4_scales = kernel.fp4_act_quant(expected_x, 32)
+        torch.testing.assert_close(packed, expected_packed, rtol=0, atol=0)
+        torch.testing.assert_close(fp4_scales.float(), expected_fp4_scales.float(), rtol=0, atol=0)
 
     def test_fp8_gemm_dispatches_on_the_current_stream(self):
         previous_dtype = torch.get_default_dtype()
