@@ -105,7 +105,39 @@ def _installation(cache, fence):
     )
 
 
+def _controlled_worker_teardown():
+    hold_started = threading.Event()
+    release_hold = threading.Event()
+
+    def hold_worker(*_args):
+        hold_started.set()
+        if not release_hold.wait(3):
+            raise TimeoutError("test did not release the simulated worker teardown")
+
+    return hold_started, release_hold, hold_worker
+
+
+def _successful_worker_teardown(events=None):
+    async def teardown(_error):
+        if events is not None:
+            events.append("teardown")
+        return True
+
+    return teardown
+
+
 class CachedMoEInstallationTest(unittest.TestCase):
+    def test_missing_worker_teardown_aborts_the_process(self):
+        with patch("cached_model.os._exit", side_effect=SystemExit(70)) as exit_process:
+            with self.assertRaises(SystemExit) as caught:
+                cached_model._teardown_worker_on_owner_loop(
+                    None,
+                    None,
+                    TypeError("opaque callback result"),
+                )
+        self.assertEqual(caught.exception.code, 70)
+        exit_process.assert_called_once_with(70)
+
     def test_patches_backbone_and_mtp_with_local_checkpoint_keys(self):
         backbone = [_moe(0, 4), _moe(1, 4)]
         mtp = [_moe(2, 3), _moe(3, 3)]
@@ -242,6 +274,350 @@ class CachedMoEInstallationTest(unittest.TestCase):
 
 
 class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_unconfirmed_worker_teardown_aborts_the_process(self):
+        loop = asyncio.get_running_loop()
+        teardown_called = asyncio.Event()
+
+        async def teardown(_error):
+            teardown_called.set()
+            return False
+
+        def invoke_teardown():
+            try:
+                cached_model._teardown_worker_on_owner_loop(
+                    loop,
+                    teardown,
+                    RuntimeError("unsafe worker state"),
+                )
+            except SystemExit as error:
+                return error.code
+            return None
+
+        with patch("cached_model.os._exit", side_effect=SystemExit(70)):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                result = executor.submit(invoke_teardown)
+                self.assertEqual(await asyncio.to_thread(result.result, 2), 70)
+        self.assertTrue(teardown_called.is_set())
+
+    async def test_run_reserved_rejects_async_fence_before_operation_or_reservation(self):
+        events = []
+        reservation = _Reservation(events)
+        operation_calls = []
+        cache = _Cache(events)
+
+        async def fence():
+            events.append("async-fence")
+
+        with _installation(cache, fence) as installation:
+            with self.assertRaisesRegex(TypeError, "GPU fence must be synchronous"):
+                await installation.run_reserved_sync(
+                    lambda: operation_calls.append("operation"), reservation
+                )
+
+        self.assertEqual(events, [])
+        self.assertEqual(operation_calls, [])
+        self.assertFalse(reservation.active)
+
+    async def test_run_reserved_waits_for_and_rejects_fence_future(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache(events)
+        fence_started = threading.Event()
+        finish_fence = threading.Event()
+        future = Future()
+        self.assertTrue(future.set_running_or_notify_cancel())
+
+        def complete_fence():
+            fence_started.set()
+            if not finish_fence.wait(3):
+                future.set_exception(TimeoutError("test did not finish fence future"))
+            else:
+                future.set_result(None)
+
+        completer = threading.Thread(target=complete_fence, daemon=True)
+        completer.start()
+
+        with _installation(cache, lambda: future) as installation:
+            run = asyncio.create_task(
+                installation.run_reserved_sync(
+                    lambda: events.append("operation"),
+                    reservation,
+                    worker_teardown=_successful_worker_teardown(events),
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(fence_started.wait, 2))
+            await asyncio.sleep(0.05)
+            self.assertFalse(run.done())
+            self.assertTrue(reservation.active)
+            finish_fence.set()
+            with self.assertRaisesRegex(TypeError, "GPU fence returned a future"):
+                await run
+            self.assertTrue(installation._quarantined)
+
+        completer.join(timeout=2)
+        self.assertTrue(future.done())
+        self.assertTrue(cache.quarantined)
+        self.assertFalse(reservation.active)
+        self.assertEqual(events, ["enter", "operation", "teardown", "exit"])
+
+    async def test_run_reserved_keeps_lease_until_bare_future_resolves(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache(events)
+        background_started = asyncio.Event()
+        finish_background = asyncio.Event()
+        pending = asyncio.get_running_loop().create_future()
+
+        async def background_work():
+            background_started.set()
+            await finish_background.wait()
+            pending.set_result(None)
+
+        background = asyncio.create_task(background_work())
+        await background_started.wait()
+
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            run = asyncio.create_task(
+                installation.run_reserved_sync(
+                    lambda: (events.append("operation"), pending)[1], reservation
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(run.done())
+            self.assertTrue(reservation.active)
+            self.assertFalse(background.done())
+            finish_background.set()
+            await background
+            with self.assertRaisesRegex(TypeError, "natural completion was drained"):
+                await run
+            self.assertTrue(installation._quarantined)
+
+        self.assertFalse(reservation.active)
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(events, ["enter", "operation", "fence", "exit"])
+
+    async def test_run_reserved_waits_for_shielded_task_work_before_releasing_lease(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache(events)
+        background_started = asyncio.Event()
+        finish_background = asyncio.Event()
+
+        async def background_work():
+            background_started.set()
+            await finish_background.wait()
+
+        background = asyncio.create_task(background_work())
+        await background_started.wait()
+
+        async def wrapper_work():
+            await asyncio.shield(background)
+
+        task = asyncio.create_task(wrapper_work())
+        await asyncio.sleep(0)
+
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            run = asyncio.create_task(
+                installation.run_reserved_sync(
+                    lambda: (events.append("operation"), task)[1], reservation
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(run.done())
+            self.assertTrue(reservation.active)
+            self.assertFalse(background.done())
+            finish_background.set()
+            await background
+            with self.assertRaisesRegex(TypeError, "natural completion was drained"):
+                await run
+            self.assertTrue(installation._quarantined)
+
+        self.assertFalse(reservation.active)
+        self.assertTrue(task.done())
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(events, ["enter", "operation", "fence", "exit"])
+
+    async def test_run_reserved_holds_lease_for_opaque_awaitable_until_worker_teardown(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache(events)
+        background_started = asyncio.Event()
+        finish_background = asyncio.Event()
+        hold_started, release_hold, hold_worker = _controlled_worker_teardown()
+
+        async def background_work():
+            background_started.set()
+            await finish_background.wait()
+
+        background = asyncio.create_task(background_work())
+        await background_started.wait()
+
+        class ShieldedAwaitable:
+            def __await__(self):
+                return asyncio.shield(background).__await__()
+
+        with patch("cached_model._teardown_worker_on_owner_loop", hold_worker):
+            with _installation(cache, lambda: events.append("fence")) as installation:
+                run = asyncio.create_task(
+                    installation.run_reserved_sync(
+                        lambda: (events.append("operation"), ShieldedAwaitable())[1],
+                        reservation,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(hold_started.wait, 2))
+                await asyncio.sleep(0.05)
+                self.assertFalse(run.done())
+                self.assertTrue(reservation.active)
+                self.assertFalse(background.done())
+                finish_background.set()
+                await background
+                release_hold.set()
+                with self.assertRaisesRegex(TypeError, "opaque awaitable"):
+                    await run
+                self.assertTrue(installation._quarantined)
+
+        self.assertFalse(reservation.active)
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(events, ["enter", "operation", "fence", "exit"])
+
+    async def test_worker_teardown_runs_on_owner_loop_before_reservation_release(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache(events)
+        teardown_started = asyncio.Event()
+        finish_teardown = asyncio.Event()
+        installation = _installation(cache, lambda: events.append("fence"))
+
+        class OpaqueAwaitable:
+            def __await__(self):
+                yield object()
+
+        async def teardown(error):
+            self.assertIn("opaque awaitable", str(error))
+            self.assertTrue(reservation.active)
+            self.assertTrue(installation._execution_lock.locked())
+            events.append("teardown-start")
+            teardown_started.set()
+            await finish_teardown.wait()
+            events.append("teardown-finished")
+            return True
+
+        with installation:
+            request = asyncio.create_task(
+                installation.run_reserved_sync(
+                    lambda: (events.append("operation"), OpaqueAwaitable())[1],
+                    reservation,
+                    worker_teardown=teardown,
+                )
+            )
+            await asyncio.wait_for(teardown_started.wait(), timeout=2)
+            self.assertFalse(request.done())
+            self.assertTrue(reservation.active)
+            self.assertTrue(installation._execution_lock.locked())
+            finish_teardown.set()
+            with self.assertRaisesRegex(TypeError, "opaque awaitable"):
+                await request
+
+        self.assertFalse(reservation.active)
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(
+            events,
+            [
+                "enter",
+                "operation",
+                "fence",
+                "teardown-start",
+                "teardown-finished",
+                "exit",
+            ],
+        )
+
+    async def test_context_exit_failure_holds_request_reservation_until_teardown(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache(events)
+        teardown_started = asyncio.Event()
+        finish_teardown = asyncio.Event()
+        installation = _installation(cache, lambda: events.append("fence"))
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+                raise RuntimeError("device restore failed")
+
+        async def teardown(error):
+            self.assertIn("context cleanup failed", str(error))
+            self.assertTrue(reservation.active)
+            self.assertTrue(installation._execution_lock.locked())
+            events.append("teardown-start")
+            teardown_started.set()
+            await finish_teardown.wait()
+            events.append("teardown-finished")
+            return True
+
+        with installation:
+            request = asyncio.create_task(
+                installation.run_reserved_sync(
+                    lambda: events.append("operation"),
+                    reservation,
+                    worker_context=WorkerContext,
+                    worker_teardown=teardown,
+                )
+            )
+            await asyncio.wait_for(teardown_started.wait(), timeout=2)
+            self.assertFalse(request.done())
+            self.assertTrue(reservation.active)
+            finish_teardown.set()
+            with self.assertRaisesRegex(TypeError, "context cleanup failed"):
+                await request
+
+        self.assertFalse(reservation.active)
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(
+            events,
+            [
+                "enter",
+                "worker-enter",
+                "operation",
+                "worker-exit",
+                "fence",
+                "teardown-start",
+                "teardown-finished",
+                "exit",
+            ],
+        )
+
+    async def test_stalled_future_uses_bounded_drain_then_tears_down_worker(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache(events)
+        abandoned_loop = asyncio.new_event_loop()
+        pending = abandoned_loop.create_future()
+        abandoned_loop.close()
+        teardown_started = asyncio.Event()
+
+        async def teardown(error):
+            self.assertIn("did not finish before its deadline", str(error))
+            self.assertTrue(reservation.active)
+            teardown_started.set()
+            return True
+
+        with patch.object(cached_model, "_CALLBACK_DRAIN_TIMEOUT_SECONDS", 0.01):
+            with _installation(cache, lambda: events.append("fence")) as installation:
+                with self.assertRaisesRegex(TypeError, "did not finish before its deadline"):
+                    await installation.run_reserved_sync(
+                        lambda: pending,
+                        reservation,
+                        worker_teardown=teardown,
+                    )
+
+        self.assertTrue(teardown_started.is_set())
+        self.assertFalse(reservation.active)
+        self.assertTrue(cache.quarantined)
+
     async def test_cache_resize_rejects_async_allocator_callback_before_mutation(self):
         events = []
         cache = _Cache(events)
@@ -251,7 +627,11 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
 
         with _installation(cache, lambda: events.append("fence")) as installation:
             with self.assertRaisesRegex(TypeError, "release_allocator must be synchronous"):
-                await installation.resize_cache(0, release_allocator=release_allocator)
+                await installation.resize_cache(
+                    0,
+                    reservation=_Reservation([]),
+                    release_allocator=release_allocator,
+                )
 
         self.assertEqual(cache.resize_calls, [])
         self.assertEqual(cache.stats.capacity_bytes, 100)
@@ -268,7 +648,9 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         with _installation(cache, fence) as installation:
             with self.assertRaisesRegex(TypeError, "GPU fence must be synchronous"):
                 await installation.resize_cache(
-                    0, release_allocator=lambda: events.append("allocator-release")
+                    0,
+                    reservation=_Reservation([]),
+                    release_allocator=lambda: events.append("allocator-release"),
                 )
 
         self.assertEqual(cache.resize_calls, [])
@@ -280,6 +662,7 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         events = []
         cache = _Cache(events)
         release_body_calls = []
+        hold_started, release_hold, hold_worker = _controlled_worker_teardown()
 
         async def async_release_body():
             release_body_calls.append("released")
@@ -287,22 +670,66 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         def awaitable_release():
             return async_release_body()
 
-        with _installation(cache, lambda: events.append("fence")) as installation:
-            with self.assertRaisesRegex(TypeError, "returned an awaitable"):
-                await installation.resize_cache(0, release_allocator=awaitable_release)
+        with patch("cached_model._teardown_worker_on_owner_loop", hold_worker):
+            with _installation(cache, lambda: events.append("fence")) as installation:
+                resizing = asyncio.create_task(
+                    installation.resize_cache(
+                        0,
+                        reservation=_Reservation([]),
+                        release_allocator=awaitable_release,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(hold_started.wait, 2))
+                await asyncio.sleep(0.05)
+                self.assertFalse(resizing.done())
+                self.assertTrue(installation._execution_lock.locked())
+                self.assertEqual(release_body_calls, [])
+                release_hold.set()
+                with self.assertRaisesRegex(TypeError, "opaque awaitable"):
+                    await resizing
 
-            self.assertTrue(cache.stats.pending_backing_release)
-            self.assertEqual(cache.resize_calls, [0])
-            self.assertEqual(release_body_calls, [])
+                self.assertTrue(cache.stats.pending_backing_release)
+                self.assertEqual(cache.resize_calls, [0])
+                self.assertTrue(installation._quarantined)
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                await installation.resize_cache(
+                    0,
+                    reservation=_Reservation([]),
+                    release_allocator=lambda: events.append("allocator-release"),
+                )
 
-            result = await installation.resize_cache(
-                0, release_allocator=lambda: events.append("allocator-release")
-            )
+        self.assertTrue(cache.quarantined)
+        self.assertTrue(cache.stats.pending_backing_release)
+        self.assertEqual(cache.resize_calls, [0])
 
-        self.assertFalse(result.stats.pending_backing_release)
-        self.assertEqual(cache.resize_calls, [0, 0])
-        self.assertEqual(release_body_calls, [])
-        self.assertIn("allocator-release", events)
+    async def test_cache_resize_quarantines_completed_future_and_still_fences_release(self):
+        events = []
+        cache = _Cache(events)
+        completed_future = asyncio.get_running_loop().create_future()
+        completed_future.set_result(None)
+        fence_calls = 0
+
+        def fence():
+            nonlocal fence_calls
+            fence_calls += 1
+            events.append(f"fence-{fence_calls}")
+
+        with _installation(cache, fence) as installation:
+            with self.assertRaisesRegex(TypeError, "completed asyncio future"):
+                await installation.resize_cache(
+                    0,
+                    reservation=_Reservation([]),
+                    release_allocator=lambda: completed_future,
+                )
+
+            self.assertTrue(installation._quarantined)
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                await installation.run_reserved_sync(lambda: None, _Reservation(events))
+
+        self.assertTrue(cache.quarantined)
+        self.assertTrue(cache.stats.pending_backing_release)
+        self.assertEqual(cache.resize_calls, [0])
+        self.assertEqual(events, ["fence-1", "resize", "fence-2"])
 
     async def test_cache_resize_waits_for_concurrent_future_before_unlocking(self):
         events = []
@@ -324,7 +751,11 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         completer.start()
         with _installation(cache, lambda: events.append("fence")) as installation:
             resizing = asyncio.create_task(
-                installation.resize_cache(0, release_allocator=lambda: future)
+                installation.resize_cache(
+                    0,
+                    reservation=_Reservation([]),
+                    release_allocator=lambda: future,
+                )
             )
             self.assertTrue(await asyncio.to_thread(release_started.wait, 2))
             second = asyncio.create_task(
@@ -338,64 +769,141 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             finish_release.set()
             with self.assertRaisesRegex(TypeError, "returned a future"):
                 await resizing
-            await second
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                await second
+
+            self.assertTrue(installation._quarantined)
 
         completer.join(timeout=2)
         self.assertTrue(future.done())
+        self.assertTrue(cache.quarantined)
         self.assertTrue(cache.stats.pending_backing_release)
         self.assertEqual(cache.resize_calls, [0])
-        self.assertTrue(second_started.is_set())
+        self.assertFalse(second_started.is_set())
 
-    async def test_cache_resize_cancels_and_drains_task_cleanup_before_unlocking(self):
+    async def test_cache_resize_waits_for_task_completion_before_unlocking(self):
         events = []
         cache = _Cache(events)
+        task_started = asyncio.Event()
+        finish_task = asyncio.Event()
         cleanup_started = threading.Event()
         finish_cleanup = threading.Event()
 
         async def background_release():
+            task_started.set()
             try:
-                await asyncio.Event().wait()
+                await finish_task.wait()
             finally:
                 cleanup_started.set()
                 if not await asyncio.to_thread(finish_cleanup.wait, 3):
                     raise TimeoutError("test did not finish async cleanup")
 
         task = asyncio.create_task(background_release())
-        await asyncio.sleep(0)
+        await task_started.wait()
         with _installation(cache, lambda: events.append("fence")) as installation:
             resizing = asyncio.create_task(
-                installation.resize_cache(0, release_allocator=lambda: task)
+                installation.resize_cache(
+                    0,
+                    reservation=_Reservation([]),
+                    release_allocator=lambda: task,
+                )
             )
             try:
+                await asyncio.sleep(0.05)
+                self.assertFalse(resizing.done())
+                self.assertFalse(cleanup_started.is_set())
+                finish_task.set()
                 self.assertTrue(await asyncio.to_thread(cleanup_started.wait, 2))
                 await asyncio.sleep(0.05)
                 self.assertFalse(resizing.done())
             finally:
                 finish_cleanup.set()
-            with self.assertRaisesRegex(TypeError, "returned a future"):
+            with self.assertRaisesRegex(TypeError, "natural completion was drained"):
                 await resizing
 
         self.assertTrue(task.done())
+        self.assertFalse(task.cancelled())
+        self.assertTrue(cache.stats.pending_backing_release)
+        self.assertEqual(cache.resize_calls, [0])
+
+    async def test_cache_resize_waits_for_pending_bare_future_before_quarantining(self):
+        events = []
+        cache = _Cache(events)
+        background_started = asyncio.Event()
+        finish_background = asyncio.Event()
+        pending_background = asyncio.get_running_loop().create_future()
+
+        async def background_work():
+            background_started.set()
+            await finish_background.wait()
+            pending_background.set_result(None)
+
+        background = asyncio.create_task(background_work())
+        await background_started.wait()
+
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            resizing = asyncio.create_task(
+                installation.resize_cache(
+                    0,
+                    reservation=_Reservation([]),
+                    release_allocator=lambda: pending_background,
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(resizing.done())
+            self.assertFalse(pending_background.cancelled())
+            self.assertFalse(background.done())
+            finish_background.set()
+            await background
+            with self.assertRaisesRegex(TypeError, "natural completion was drained"):
+                await resizing
+
+            self.assertTrue(installation._quarantined)
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                await installation.run_reserved_sync(lambda: None, _Reservation(events))
+
+        self.assertTrue(cache.quarantined)
         self.assertTrue(cache.stats.pending_backing_release)
         self.assertEqual(cache.resize_calls, [0])
 
     async def test_cache_resize_quarantines_when_opaque_awaitable_cannot_be_drained(self):
         events = []
         cache = _Cache(events)
+        hold_started = threading.Event()
+        release_hold = threading.Event()
+
+        def retain_until_teardown(*_args):
+            hold_started.set()
+            if not release_hold.wait(2):
+                raise TimeoutError("test did not release the simulated worker teardown")
 
         class OpaqueAwaitable:
             def __await__(self):
-                yield
+                yield object()
 
-        with _installation(cache, lambda: events.append("fence")) as installation:
-            with self.assertRaisesRegex(TypeError, "worker restart is required"):
-                await installation.resize_cache(
-                    0, release_allocator=OpaqueAwaitable
+        with patch(
+            "cached_model._teardown_worker_on_owner_loop",
+            retain_until_teardown,
+        ):
+            with _installation(cache, lambda: events.append("fence")) as installation:
+                resizing = asyncio.create_task(
+                    installation.resize_cache(
+                        0,
+                        reservation=_Reservation([]),
+                        release_allocator=OpaqueAwaitable,
+                    )
                 )
+                self.assertTrue(await asyncio.to_thread(hold_started.wait, 2))
+                await asyncio.sleep(0.05)
+                self.assertFalse(resizing.done())
+                self.assertTrue(installation._execution_lock.locked())
+                release_hold.set()
+                with self.assertRaisesRegex(TypeError, "worker restart is required"):
+                    await resizing
 
-            self.assertTrue(cache.quarantined)
-            with self.assertRaisesRegex(RuntimeError, "worker restart is required"):
-                await installation.run_reserved_sync(lambda: None, _Reservation(events))
+                self.assertTrue(cache.quarantined)
+                with self.assertRaisesRegex(RuntimeError, "worker restart is required"):
+                    await installation.run_reserved_sync(lambda: None, _Reservation(events))
 
         self.assertTrue(cache.stats.pending_backing_release)
         self.assertEqual(cache.resize_calls, [0])
@@ -414,6 +922,7 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         with _installation(cache, lambda: events.append("fence")) as installation:
             result = await installation.resize_cache(
                 32,
+                reservation=_Reservation([]),
                 release_allocator=lambda: events.append("allocator-release"),
                 worker_context=WorkerContext,
             )
@@ -426,9 +935,96 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.evicted_logical_bytes, 64)
         self.assertEqual(result.stats.capacity_bytes, 32)
 
+    async def test_cache_resize_holds_broker_reservation_through_release_fence(self):
+        events = []
+        cache = _Cache(events)
+        reservation = _Reservation(events)
+
+        def fence():
+            self.assertTrue(reservation.active)
+            events.append("fence")
+
+        def release_allocator():
+            self.assertTrue(reservation.active)
+            events.append("allocator-release")
+
+        with _installation(cache, fence) as installation:
+            await installation.resize_cache(
+                32,
+                reservation=reservation,
+                release_allocator=release_allocator,
+            )
+
+        self.assertEqual(
+            events,
+            ["enter", "fence", "resize", "allocator-release", "fence", "exit"],
+        )
+
+    async def test_cache_context_exit_failure_holds_reservation_until_teardown(self):
+        events = []
+        cache = _Cache(events)
+        reservation = _Reservation(events)
+        teardown_started = asyncio.Event()
+        finish_teardown = asyncio.Event()
+        installation = _installation(cache, lambda: events.append("fence"))
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+                raise RuntimeError("device restore failed")
+
+        async def teardown(error):
+            self.assertIn("context cleanup failed", str(error))
+            self.assertTrue(reservation.active)
+            self.assertTrue(installation._execution_lock.locked())
+            events.append("teardown-start")
+            teardown_started.set()
+            await finish_teardown.wait()
+            events.append("teardown-finished")
+            return True
+
+        with installation:
+            resize = asyncio.create_task(
+                installation.resize_cache(
+                    32,
+                    reservation=reservation,
+                    release_allocator=lambda: events.append("allocator-release"),
+                    worker_context=WorkerContext,
+                    worker_teardown=teardown,
+                )
+            )
+            await asyncio.wait_for(teardown_started.wait(), timeout=2)
+            self.assertFalse(resize.done())
+            self.assertTrue(reservation.active)
+            finish_teardown.set()
+            with self.assertRaisesRegex(TypeError, "context cleanup failed"):
+                await resize
+
+        self.assertFalse(reservation.active)
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(
+            events,
+            [
+                "enter",
+                "worker-enter",
+                "fence",
+                "resize",
+                "allocator-release",
+                "fence",
+                "worker-exit",
+                "teardown-start",
+                "teardown-finished",
+                "exit",
+            ],
+        )
+
     async def test_cache_resize_fence_failure_quarantines_without_releasing(self):
         events = []
         cache = _Cache(events)
+        reservation = _Reservation(events)
         fence_calls = 0
 
         def fence():
@@ -438,10 +1034,18 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             if fence_calls == 1:
                 raise RuntimeError("GPU fence failed")
 
+        async def teardown(_error):
+            self.assertTrue(reservation.active)
+            events.append("teardown")
+            return True
+
         with _installation(cache, fence) as installation:
             with self.assertRaisesRegex(RuntimeError, "GPU fence failed"):
                 await installation.resize_cache(
-                    0, release_allocator=lambda: events.append("allocator-release")
+                    0,
+                    reservation=reservation,
+                    release_allocator=lambda: events.append("allocator-release"),
+                    worker_teardown=teardown,
                 )
             self.assertTrue(installation._quarantined)
             with self.assertRaisesRegex(RuntimeError, "quarantined"):
@@ -450,7 +1054,7 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
                 installation.close()
 
         self.assertTrue(cache.quarantined)
-        self.assertEqual(events, ["fence"])
+        self.assertEqual(events, ["enter", "fence", "teardown", "exit"])
         self.assertEqual(cache.resize_calls, [])
 
     async def test_cache_resize_post_release_fence_failure_quarantines_installation(self):
@@ -468,7 +1072,10 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         with _installation(cache, fence) as installation:
             with self.assertRaisesRegex(RuntimeError, "post-release GPU fence failed"):
                 await installation.resize_cache(
-                    0, release_allocator=lambda: events.append("allocator-release")
+                    0,
+                    reservation=_Reservation([]),
+                    release_allocator=lambda: events.append("allocator-release"),
+                    worker_teardown=_successful_worker_teardown(events),
                 )
             self.assertTrue(installation._quarantined)
             with self.assertRaisesRegex(RuntimeError, "quarantined"):
@@ -497,7 +1104,10 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         with _installation(cache, fence) as installation:
             resizing = asyncio.create_task(
                 installation.resize_cache(
-                    0, release_allocator=lambda: events.append("allocator-release")
+                    0,
+                    reservation=_Reservation([]),
+                    release_allocator=lambda: events.append("allocator-release"),
+                    worker_teardown=_successful_worker_teardown(events),
                 )
             )
             self.assertTrue(await asyncio.to_thread(fence_started.wait, 2))
@@ -542,7 +1152,9 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await asyncio.to_thread(operation_started.wait, 2))
             resizing = asyncio.create_task(
                 installation.resize_cache(
-                    32, release_allocator=lambda: events.append("allocator-release")
+                    32,
+                    reservation=_Reservation([]),
+                    release_allocator=lambda: events.append("allocator-release"),
                 )
             )
             await asyncio.sleep(0.05)
@@ -574,7 +1186,9 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         with _installation(cache, lambda: events.append("fence")) as installation:
             resize = asyncio.create_task(
                 installation.resize_cache(
-                    32, release_allocator=slow_allocator_release
+                    32,
+                    reservation=_Reservation([]),
+                    release_allocator=slow_allocator_release,
                 )
             )
             self.assertTrue(await asyncio.to_thread(allocator_started.wait, 2))
@@ -672,6 +1286,276 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             ["enter", "worker-enter", "operation", "worker-exit", "fence", "exit"],
         )
 
+    async def test_run_reserved_holds_lease_for_awaitable_context_enter_until_restart(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache()
+        hold_started, release_hold, hold_worker = _controlled_worker_teardown()
+
+        async def finish_enter():
+            events.append("async-enter-finished")
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+                return finish_enter()
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+
+        with patch("cached_model._teardown_worker_on_owner_loop", hold_worker):
+            with _installation(cache, lambda: events.append("fence")) as installation:
+                run = asyncio.create_task(
+                    installation.run_reserved_sync(
+                        lambda: events.append("operation"),
+                        reservation,
+                        worker_context=WorkerContext,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(hold_started.wait, 2))
+                await asyncio.sleep(0.05)
+                self.assertFalse(run.done())
+                self.assertTrue(reservation.active)
+                self.assertTrue(installation._execution_lock.locked())
+                self.assertNotIn("async-enter-finished", events)
+                release_hold.set()
+                with self.assertRaisesRegex(TypeError, "opaque awaitable"):
+                    await run
+
+            self.assertTrue(installation._quarantined)
+
+        self.assertTrue(cache.quarantined)
+        self.assertNotIn("operation", events)
+        self.assertEqual(
+            events,
+            ["enter", "worker-enter", "worker-exit", "fence", "exit"],
+        )
+
+    async def test_run_reserved_holds_lease_for_awaitable_context_exit_until_restart(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache()
+        hold_started, release_hold, hold_worker = _controlled_worker_teardown()
+
+        async def finish_exit():
+            events.append("async-exit-finished")
+            return True
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+                return finish_exit()
+
+        def operation():
+            events.append("operation")
+            raise LookupError("model failure")
+
+        with patch("cached_model._teardown_worker_on_owner_loop", hold_worker):
+            with _installation(cache, lambda: events.append("fence")) as installation:
+                run = asyncio.create_task(
+                    installation.run_reserved_sync(
+                        operation,
+                        reservation,
+                        worker_context=WorkerContext,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(hold_started.wait, 2))
+                await asyncio.sleep(0.05)
+                self.assertFalse(run.done())
+                self.assertTrue(reservation.active)
+                self.assertTrue(installation._execution_lock.locked())
+                self.assertNotIn("async-exit-finished", events)
+                release_hold.set()
+                with self.assertRaisesRegex(TypeError, "opaque awaitable"):
+                    await run
+
+            self.assertTrue(installation._quarantined)
+
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(
+            events,
+            ["enter", "worker-enter", "operation", "worker-exit", "fence", "exit"],
+        )
+
+    async def test_run_reserved_preserves_undrainable_error_when_context_exit_fails(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache()
+        background_started = asyncio.Event()
+        finish_background = asyncio.Event()
+        hold_started, release_hold, hold_worker = _controlled_worker_teardown()
+
+        async def background_work():
+            background_started.set()
+            await finish_background.wait()
+
+        background = asyncio.create_task(background_work())
+        await background_started.wait()
+
+        class ShieldedAwaitable:
+            def __await__(self):
+                return asyncio.shield(background).__await__()
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+                raise RuntimeError("context cleanup failed")
+
+        with patch("cached_model._teardown_worker_on_owner_loop", hold_worker):
+            with _installation(cache, lambda: events.append("fence")) as installation:
+                run = asyncio.create_task(
+                    installation.run_reserved_sync(
+                        lambda: (events.append("operation"), ShieldedAwaitable())[1],
+                        reservation,
+                        worker_context=WorkerContext,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(hold_started.wait, 2))
+                await asyncio.sleep(0.05)
+                self.assertFalse(run.done())
+                self.assertTrue(reservation.active)
+                self.assertFalse(background.done())
+                self.assertTrue(installation._quarantined)
+                finish_background.set()
+                await background
+                release_hold.set()
+                with self.assertRaisesRegex(TypeError, "opaque awaitable") as caught:
+                    await run
+                self.assertTrue(
+                    any("context cleanup failed" in note for note in caught.exception.__notes__)
+                )
+
+        self.assertTrue(cache.quarantined)
+        self.assertFalse(reservation.active)
+        self.assertEqual(
+            events,
+            ["enter", "worker-enter", "operation", "worker-exit", "fence", "exit"],
+        )
+
+    async def test_run_reserved_does_not_allow_context_to_suppress_model_error(self):
+        events = []
+        reservation = _Reservation(events)
+        cache = _Cache()
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+                return True
+
+        def operation():
+            events.append("operation")
+            raise LookupError("model failure")
+
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            with self.assertRaisesRegex(LookupError, "model failure"):
+                await installation.run_reserved_sync(
+                    operation,
+                    reservation,
+                    worker_context=WorkerContext,
+                )
+            self.assertFalse(installation._quarantined)
+
+        self.assertFalse(cache.quarantined)
+        self.assertEqual(
+            events,
+            ["enter", "worker-enter", "operation", "worker-exit", "fence", "exit"],
+        )
+
+    async def test_cache_resize_holds_lock_for_awaitable_context_enter_until_restart(self):
+        events = []
+        cache = _Cache(events)
+        hold_started, release_hold, hold_worker = _controlled_worker_teardown()
+
+        async def finish_enter():
+            events.append("async-enter-finished")
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+                return finish_enter()
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+
+        with patch("cached_model._teardown_worker_on_owner_loop", hold_worker):
+            with _installation(cache, lambda: events.append("fence")) as installation:
+                resizing = asyncio.create_task(
+                    installation.resize_cache(
+                        0,
+                        reservation=_Reservation([]),
+                        release_allocator=lambda: events.append("allocator-release"),
+                        worker_context=WorkerContext,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(hold_started.wait, 2))
+                await asyncio.sleep(0.05)
+                self.assertFalse(resizing.done())
+                self.assertTrue(installation._execution_lock.locked())
+                self.assertNotIn("async-enter-finished", events)
+                release_hold.set()
+                with self.assertRaisesRegex(TypeError, "opaque awaitable"):
+                    await resizing
+
+            self.assertTrue(installation._quarantined)
+
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(cache.resize_calls, [])
+        self.assertEqual(events, ["worker-enter", "worker-exit"])
+
+    async def test_cache_resize_holds_lock_for_awaitable_context_exit_until_restart(self):
+        events = []
+        cache = _Cache(events)
+        hold_started, release_hold, hold_worker = _controlled_worker_teardown()
+
+        async def finish_exit():
+            events.append("async-exit-finished")
+            return True
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+                return finish_exit()
+
+        with patch("cached_model._teardown_worker_on_owner_loop", hold_worker):
+            with _installation(cache, lambda: events.append("fence")) as installation:
+                resizing = asyncio.create_task(
+                    installation.resize_cache(
+                        0,
+                        reservation=_Reservation([]),
+                        release_allocator=lambda: events.append("allocator-release"),
+                        worker_context=WorkerContext,
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(hold_started.wait, 2))
+                await asyncio.sleep(0.05)
+                self.assertFalse(resizing.done())
+                self.assertTrue(installation._execution_lock.locked())
+                self.assertNotIn("async-exit-finished", events)
+                release_hold.set()
+                with self.assertRaisesRegex(TypeError, "opaque awaitable"):
+                    await resizing
+
+            self.assertTrue(installation._quarantined)
+
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(cache.resize_calls, [0])
+        self.assertEqual(
+            events,
+            ["worker-enter", "fence", "resize", "allocator-release", "fence", "worker-exit"],
+        )
+
     async def test_fence_failure_quarantines_before_reservation_release(self):
         events = []
         reservation = _Reservation(events)
@@ -685,7 +1569,9 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
         with _installation(cache, fence) as installation:
             with self.assertRaisesRegex(RuntimeError, "GPU fence failed"):
                 await installation.run_reserved_sync(
-                    lambda: events.append("operation"), reservation
+                    lambda: events.append("operation"),
+                    reservation,
+                    worker_teardown=_successful_worker_teardown(events),
                 )
             self.assertTrue(installation._quarantined)
             with self.assertRaisesRegex(RuntimeError, "quarantined"):
@@ -693,7 +1579,44 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "undrained callback"):
                 installation.close()
         self.assertTrue(cache.quarantined)
-        self.assertEqual(events, ["enter", "operation", "fence", "exit"])
+        self.assertEqual(
+            events,
+            ["enter", "operation", "fence", "teardown", "exit"],
+        )
+
+    async def test_fence_failure_keeps_installation_quarantined_if_cache_quarantine_fails(self):
+        events = []
+        reservation = _Reservation(events)
+
+        class FailingQuarantineCache(_Cache):
+            def quarantine(self):
+                raise RuntimeError("cache quarantine failed")
+
+        cache = FailingQuarantineCache(events)
+
+        def fence():
+            events.append("fence")
+            raise RuntimeError("GPU fence failed")
+
+        with _installation(cache, fence) as installation:
+            with self.assertRaisesRegex(RuntimeError, "GPU fence failed") as caught:
+                await installation.run_reserved_sync(
+                    lambda: events.append("operation"),
+                    reservation,
+                    worker_teardown=_successful_worker_teardown(events),
+                )
+            self.assertTrue(installation._quarantined)
+            self.assertTrue(any("cache quarantine failed" in note for note in caught.exception.__notes__))
+            with self.assertRaisesRegex(RuntimeError, "quarantined"):
+                await installation.run_reserved_sync(lambda: None, _Reservation(events))
+            with self.assertRaisesRegex(RuntimeError, "undrained callback"):
+                installation.close()
+
+        self.assertFalse(reservation.active)
+        self.assertEqual(
+            events,
+            ["enter", "operation", "fence", "teardown", "exit"],
+        )
 
     async def test_cancelled_waiter_keeps_reservation_until_worker_finishes(self):
         events = []
