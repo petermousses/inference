@@ -52,6 +52,12 @@ assert policy["host_budget_mib"] == 104 * 1024
 assert policy["minimum_host_available_mib"] == 8 * 1024
 assert policy["prefill_headroom_mib"] == 5 * 1024
 assert policy["public_request_limit"] == 4
+assert policy["model_root"] == "/srv/ai/models"
+assert policy["artifact_metadata_root"].endswith("/hosts/redqueen/models/metadata")
+assert policy["services"]["jevk5"]["supported_request_shapes"] == ["systemone.decision"]
+assert policy["services"]["jevk5"]["concurrency_limit"] == 4
+assert policy["services"]["clm"]["supported_request_shapes"] == ["systemone.decision"]
+assert policy["services"]["comfyui"]["supported_request_shapes"] == ["openai.image_generation", "openai.image_edit"]
 PY
 if grep -Fq 'deepseek-v4.1-flash-q2' "${router_config}"; then
   printf 'DeepSeek is not eligible for registration until its weights verify\n' >&2

@@ -232,17 +232,25 @@ class SchedulerClient:
             lock.close()
 
     async def run(self, resource: str, operation: Callable[[], Awaitable[T]], *, concurrency: int = 1) -> T:
-        slot = self.slots.setdefault(resource, asyncio.Semaphore(concurrency))
-        async with slot, self.lease(resource):
-            task = asyncio.create_task(operation())
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                # Operations now use cancellable async HTTP. Drain their owned
-                # cleanup before releasing the flock; record uncertain work.
-                task.cancel()
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("concurrency must be a positive integer")
+        async with self.lease(resource) as admission:
+            profile_limit = admission.get("concurrency_limit", concurrency)
+            if isinstance(profile_limit, bool) or not isinstance(profile_limit, int) or profile_limit < 1:
+                raise AdmissionError(503, "scheduler returned an invalid concurrency limit", "scheduler_unavailable")
+            slot = self.slots.setdefault(
+                resource, asyncio.Semaphore(min(concurrency, profile_limit))
+            )
+            async with slot:
+                task = asyncio.create_task(operation())
                 try:
-                    await finish_shielded(task)
+                    return await asyncio.shield(task)
                 except asyncio.CancelledError:
-                    pass
-                raise
+                    # Operations now use cancellable async HTTP. Drain their owned
+                    # cleanup before releasing the flock; record uncertain work.
+                    task.cancel()
+                    try:
+                        await finish_shielded(task)
+                    except asyncio.CancelledError:
+                        pass
+                    raise

@@ -279,8 +279,98 @@ def transient_directories(root: Path) -> None:
 def profile_errors(path: Path) -> list[str]:
     try:
         document = json.loads(path.read_text())
-        if document.get("version") != 1 or not document.get("resources") or not document.get("sources"):
+        if (
+            document.get("version") != 1
+            or document.get("worker_profile_version") != 1
+            or not document.get("resources")
+            or not document.get("sources")
+        ):
             return ["memory profiles are invalid; rebuild with deploy-scheduler.sh"]
+        for name, profile in document["resources"].items():
+            if not isinstance(name, str) or not name or not isinstance(profile, dict):
+                return ["memory profile resource is invalid; rebuild with deploy-scheduler.sh"]
+            memory = profile.get("memory")
+            if not isinstance(memory, dict):
+                return [f"memory profile is missing worker contract for {name}"]
+            totals = {"gpu_bytes": 0, "host_bytes": 0}
+            for component in ("mandatory", "reclaimable", "transient_peak"):
+                values = memory.get(component)
+                if not isinstance(values, dict):
+                    return [f"memory profile has invalid {component} memory for {name}"]
+                for field in totals:
+                    amount = values.get(field)
+                    if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
+                        return [f"memory profile has invalid {component} memory for {name}"]
+                    totals[field] += amount
+            if any(
+                isinstance(profile.get(field), bool)
+                or not isinstance(profile.get(field), int)
+                or profile.get(field) != amount
+                for field, amount in totals.items()
+            ):
+                return [f"memory profile footprint does not match its components for {name}"]
+            fingerprint = profile.get("artifact_fingerprint")
+            identities = profile.get("artifact_identity")
+            shapes = profile.get("supported_request_shapes")
+            concurrency = profile.get("concurrency_limit")
+            if (
+                not isinstance(identities, list)
+                or not identities
+                or not isinstance(fingerprint, str)
+                or len(fingerprint) != 64
+                or any(char not in "0123456789abcdef" for char in fingerprint)
+            ):
+                return [f"memory profile has invalid artifact identity for {name}"]
+            artifact_names = []
+            for identity in identities:
+                if not isinstance(identity, dict):
+                    return [f"memory profile has invalid artifact identity for {name}"]
+                model = identity.get("model")
+                repositories, revisions = identity.get("repositories"), identity.get("revisions")
+                manifest_hash = identity.get("manifest_sha256")
+                if (
+                    not isinstance(model, str) or not model
+                    or not isinstance(repositories, dict) or not repositories
+                    or not isinstance(revisions, dict) or not revisions
+                    or any(not isinstance(value, str) or not value for value in (*repositories.values(), *revisions.values()))
+                    or not isinstance(manifest_hash, str) or len(manifest_hash) != 64
+                    or any(char not in "0123456789abcdef" for char in manifest_hash)
+                ):
+                    return [f"memory profile has invalid artifact identity for {name}"]
+                artifact_names.append(model)
+            if artifact_names != sorted(set(artifact_names)):
+                return [f"memory profile has duplicate artifact identities for {name}"]
+            expected_fingerprint = hashlib.sha256(
+                json.dumps(identities, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if expected_fingerprint != fingerprint:
+                return [f"memory profile artifact fingerprint does not match for {name}"]
+            runtime_identity = profile.get("runtime_identity")
+            if not isinstance(runtime_identity, dict):
+                return [f"memory profile has no runtime identity for {name}"]
+            if "path" in runtime_identity:
+                if (
+                    not isinstance(runtime_identity.get("path"), str)
+                    or isinstance(runtime_identity.get("size"), bool)
+                    or not isinstance(runtime_identity.get("size"), int)
+                    or runtime_identity["size"] < 0
+                    or isinstance(runtime_identity.get("mtime_ns"), bool)
+                    or not isinstance(runtime_identity.get("mtime_ns"), int)
+                ):
+                    return [f"memory profile has invalid runtime identity for {name}"]
+            else:
+                units = runtime_identity.get("service_units")
+                if not isinstance(units, list) or not units or any(not isinstance(unit, str) or not unit for unit in units):
+                    return [f"memory profile has invalid service runtime identity for {name}"]
+            if (
+                not isinstance(shapes, list)
+                or not shapes
+                or any(not isinstance(shape, str) or not shape for shape in shapes)
+                or len(set(shapes)) != len(shapes)
+            ):
+                return [f"memory profile has invalid request shapes for {name}"]
+            if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+                return [f"memory profile has invalid concurrency for {name}"]
         for expected in document["sources"]:
             source = Path(expected["path"])
             stat = source.stat()

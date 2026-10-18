@@ -74,8 +74,27 @@ class HostFixture(unittest.TestCase):
         source = self.root / "models/weights"
         source.parent.mkdir()
         source.write_bytes(b"weights")
+        artifact_identity = [{
+            "model": "fixture", "repositories": {"repository": "test/fixture"},
+            "revisions": {"revision": "1"}, "manifest_sha256": "f" * 64,
+        }]
+        artifact_fingerprint = hashlib.sha256(
+            json.dumps(artifact_identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         self.profiles = {
-            "version": 1, "resources": {"fixture": {"gpu_bytes": 1}},
+            "version": 1, "worker_profile_version": 1, "resources": {"fixture": {
+                "gpu_bytes": 1, "host_bytes": 1,
+                "memory": {
+                    "mandatory": {"gpu_bytes": 1, "host_bytes": 1},
+                    "reclaimable": {"gpu_bytes": 0, "host_bytes": 0},
+                    "transient_peak": {"gpu_bytes": 0, "host_bytes": 0},
+                },
+                "artifact_identity": artifact_identity,
+                "artifact_fingerprint": artifact_fingerprint,
+                "runtime_identity": {"path": "/usr/bin/llama-server", "size": 1, "mtime_ns": 1},
+                "supported_request_shapes": ["openai.chat"],
+                "concurrency_limit": 1,
+            }},
             "sources": [{"path": str(source), "size": source.stat().st_size,
                          "mtime_ns": source.stat().st_mtime_ns}],
         }
@@ -259,6 +278,12 @@ class RecoveryTest(HostFixture):
         self.assertEqual(host.profile_errors(path), [])
         Path(self.profiles["sources"][0]["path"]).write_bytes(b"different weights")
         self.assertIn("stale", host.profile_errors(path)[0])
+
+    def test_invalid_worker_memory_contract_fails_preflight(self):
+        path = self.directory / "memory-profiles.json"
+        self.profiles["resources"]["fixture"]["memory"]["mandatory"]["gpu_bytes"] = 2
+        path.write_text(json.dumps(self.profiles))
+        self.assertIn("does not match", host.profile_errors(path)[0])
 
     def test_pending_journal_rolls_back_even_when_candidate_imports_and_linker_are_broken(self):
         repo = self.root / "inference"

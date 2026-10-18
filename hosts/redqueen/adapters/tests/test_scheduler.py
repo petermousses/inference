@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -17,10 +18,10 @@ from redqueen_adapters.common import AdmissionError, UpstreamError
 from redqueen_adapters import deploy_scheduler
 from redqueen_adapters.image_api import ImageSettings, create_image_app
 from redqueen_adapters.jev_api import JevSettings, create_jev_app
-from redqueen_adapters.memory_profile import MIB, build_profiles, file_signature, memory_rows, verify_profiles, weight_paths
+from redqueen_adapters.memory_profile import MIB, build_profiles, file_signature, fingerprint_artifacts, memory_contract, memory_rows, verify_profiles, weight_paths
 from redqueen_adapters.ownership import OwnedRequest, records
 from redqueen_adapters import scheduler_api
-from redqueen_adapters.scheduler_api import Memory, Runtime, Scheduler, create_apps
+from redqueen_adapters.scheduler_api import Memory, Runtime, Scheduler, create_apps, footprint
 from redqueen_adapters.scheduler_client import ResourceLock, SchedulerClient, SerializedExecution
 
 
@@ -577,6 +578,13 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, 1)
         self.assertTrue(backend_started.is_set())
 
+    async def test_service_admission_returns_its_profile_concurrency_limit(self):
+        self.resources["jevk5"] = resource(60, "service")
+        self.resources["jevk5"]["concurrency_limit"] = 3
+        adapter = SchedulerClient(self.policy["socket_path"])
+        async with adapter.lease("jevk5") as admission:
+            self.assertEqual(admission["concurrency_limit"], 3)
+
     async def test_existing_comfy_operator_job_blocks_other_models_until_idle(self):
         self.runtime.loaded = {"comfyui": "ready"}
         self.runtime.occupied.add("comfyui")
@@ -853,6 +861,16 @@ class ProfileTest(unittest.TestCase):
                 policy, gpu_total=96 * 1024**3, host_total=125 * 1024**3
             )
 
+    def test_worker_footprint_includes_each_memory_component(self):
+        spec = {
+            "gpu_bytes": 16, "host_bytes": 11,
+            "memory": memory_contract((10, 8), reclaimable=(5, 2), transient_peak=(1, 1)),
+        }
+        self.assertEqual(footprint(spec), Memory(16, 11))
+        spec["gpu_bytes"] += 1
+        with self.assertRaises(ValueError):
+            footprint(spec)
+
     def test_device_context_and_compute_are_included(self):
         rows = memory_rows("ROCm0 73486 1914 901\nHost 12620 429 47\n")
         self.assertGreater(sum(rows["ROCm0"]), (73486 + 1914 + 901) * MIB)
@@ -866,7 +884,17 @@ class ProfileTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config"
             path.write_text("context=65536")
-            document = {"version": 1, "resources": {"a": resource(1)}, "sources": [file_signature(path, content=True)]}
+            identity = [{"model": "a", "repositories": {"repository": "test/a"}, "revisions": {"revision": "1"}, "manifest_sha256": "0" * 64}]
+            profile = resource(1)
+            profile.update({
+                "memory": memory_contract((1, 1)),
+                "artifact_identity": identity,
+                "artifact_fingerprint": fingerprint_artifacts(identity),
+                "runtime_identity": {"path": "/bin/llama-server", "size": 1, "mtime_ns": 1},
+                "supported_request_shapes": ["openai.chat"],
+                "concurrency_limit": 1,
+            })
+            document = {"version": 1, "worker_profile_version": 1, "resources": {"a": profile}, "sources": [file_signature(path, content=True)]}
             verify_profiles(document)
             path.write_text("context=220000")
             with self.assertRaises(ValueError):
@@ -876,22 +904,68 @@ class ProfileTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "llama-server").write_text("runtime")
-            (root / "weights.gguf").write_bytes(b"weights")
-            (root / "projector.gguf").write_bytes(b"projector")
+            model_dir = root / "models/a"
+            model_dir.mkdir(parents=True)
+            (model_dir / "weights.gguf").write_bytes(b"weights")
+            (model_dir / "projector.gguf").write_bytes(b"projector")
+            metadata = root / "metadata/a"
+            metadata.mkdir(parents=True)
+            (metadata / "SOURCE_REVISION").write_text("gguf_repository=test/a\ngguf_revision=1234\n")
+            (metadata / "SHA256SUMS").write_text("0" * 64 + "  weights.gguf\n" + "1" * 64 + "  projector.gguf\n")
             estimator = root / "llama-fit-params"
             estimator.write_text(f"#!{sys.executable}\nimport sys\nassert '--pooling' not in sys.argv\nctx = int(sys.argv[sys.argv.index('--ctx-size') + 1])\nprint(f'ROCm0 100 {{ctx}} 10\\nHost 20 0 1')\n")
             estimator.chmod(0o700)
             router_path, policy_path = root / "router.json", root / "policy.json"
-            policy_path.write_text(json.dumps({"estimator": str(estimator), "estimate_margin": 1.08, "model_overhead_mib": 512, "services": {}}))
+            policy_path.write_text(json.dumps({"estimator": str(estimator), "model_root": str(root / "models"), "artifact_metadata_root": str(root / "metadata"), "estimate_margin": 1.08, "model_overhead_mib": 512, "services": {}}))
             def profile(context):
-                command = f"{root}/llama-server --model {root}/weights.gguf --mmproj {root}/projector.gguf --ctx-size {context} --pooling mean --parallel 1 --gpu-layers 999"
+                command = f"{root}/llama-server --model {model_dir}/weights.gguf --mmproj {model_dir}/projector.gguf --alias a --ctx-size {context} --pooling mean --parallel 1 --gpu-layers 999"
                 router_path.write_text(json.dumps({"models": {"a": {"cmd": command}}}))
                 return build_profiles(router_path, policy_path)
             smaller, larger = profile(2048), profile(8192)
             self.assertGreater(larger["resources"]["a"]["gpu_bytes"], smaller["resources"]["a"]["gpu_bytes"])
             self.assertEqual(larger["resources"]["a"]["context_tokens"], 8192)
             self.assertEqual(larger["resources"]["a"]["weights_bytes"], 16)
+            self.assertEqual(larger["version"], 1)
+            self.assertEqual(larger["worker_profile_version"], 1)
+            self.assertEqual(larger["resources"]["a"]["supported_request_shapes"], ["openai.chat", "openai.completion", "openai.responses", "openai.multimodal_chat"])
+            self.assertEqual(larger["resources"]["a"]["memory"]["mandatory"]["gpu_bytes"], larger["resources"]["a"]["gpu_bytes"])
+            self.assertEqual(larger["resources"]["a"]["concurrency_limit"], 1)
+            self.assertEqual(larger["resources"]["a"]["artifact_identity"][0]["revisions"]["gguf_revision"], "1234")
             verify_profiles(larger)
+
+    def test_comfy_profile_separates_resident_weights_from_peak_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_dir = root / "models/qwen-image"
+            (model_dir / "diffusion_models").mkdir(parents=True)
+            (model_dir / "text_encoders").mkdir()
+            files = [model_dir / "diffusion_models/model.gguf", model_dir / "text_encoders/encoder.safetensors"]
+            for path in files:
+                path.write_bytes(b"weights")
+            metadata = root / "metadata/qwen-image"
+            metadata.mkdir(parents=True)
+            (metadata / "SOURCE_REVISION").write_text("weights_repository=test/qwen-image\nweights_revision=abcd\n")
+            (metadata / "SHA256SUMS").write_text("0" * 64 + "  diffusion_models/model.gguf\n" + "1" * 64 + "  text_encoders/encoder.safetensors\n")
+            router_path, policy_path = root / "router.json", root / "policy.json"
+            router_path.write_text(json.dumps({"models": {}}))
+            policy_path.write_text(json.dumps({
+                "model_root": str(root / "models"),
+                "artifact_metadata_root": str(root / "metadata"),
+                "estimate_margin": 1.1,
+                "services": {"comfyui": {
+                    "weights": [str(path) for path in files], "workspace_mib": 2,
+                    "units": ["comfyui.service"],
+                    "supported_request_shapes": ["openai.image_generation", "openai.image_edit"],
+                    "concurrency_limit": 1,
+                }},
+            }))
+            profile = build_profiles(router_path, policy_path)
+            comfy = profile["resources"]["comfyui"]
+            self.assertEqual(comfy["memory"]["mandatory"]["gpu_bytes"], math.ceil(14 * 1.1))
+            self.assertEqual(comfy["memory"]["transient_peak"]["gpu_bytes"], 2 * MIB)
+            self.assertEqual(comfy["memory"]["reclaimable"], {"gpu_bytes": 0, "host_bytes": 0})
+            self.assertEqual(comfy["gpu_bytes"], comfy["memory"]["mandatory"]["gpu_bytes"] + 2 * MIB)
+            verify_profiles(profile)
 
 
 class DeploymentTest(unittest.TestCase):

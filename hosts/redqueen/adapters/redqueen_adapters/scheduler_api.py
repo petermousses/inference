@@ -46,7 +46,18 @@ class Memory:
 
 
 def footprint(spec: dict) -> Memory:
-    return Memory(spec["gpu_bytes"], spec["host_bytes"])
+    profile = spec.get("memory")
+    if not isinstance(profile, dict):
+        return Memory(spec["gpu_bytes"], spec["host_bytes"])
+    total = Memory(0, 0)
+    for component in ("mandatory", "reclaimable", "transient_peak"):
+        value = profile.get(component)
+        if not isinstance(value, dict):
+            raise ValueError(f"invalid {component} memory profile")
+        total += Memory(value["gpu_bytes"], value["host_bytes"])
+    if total != Memory(spec["gpu_bytes"], spec["host_bytes"]):
+        raise ValueError("worker memory components do not match its admission footprint")
+    return total
 
 
 def capacity_limits(policy: dict, *, gpu_total: int, host_total: int) -> Memory:
@@ -420,7 +431,9 @@ class Scheduler:
         if name not in self.resources or self.resources[name]["kind"] != "text":
             raise AdmissionError(404, "model is not configured", "model_not_found")
         async with self.execution.hold():
-            limit = self.resources[name].get("concurrency", 1)
+            limit = self.resources[name].get(
+                "concurrency_limit", self.resources[name].get("concurrency", 1)
+            )
             if self.active.get(name, 0) >= limit:
                 raise AdmissionError(429, "model is serving its maximum concurrent requests", "model_busy")
             lock = ResourceLock(self.lock_dir, name)
@@ -608,7 +621,7 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 diagnostics[filename.removesuffix(".json")] = {"state": "uninitialized"}
             except (OSError, ValueError):
                 diagnostics[filename.removesuffix(".json")] = {"state": "invalid", "ready": False}
-        return web.json_response({"models": {name: {"state": value, "active_requests": scheduler.active.get(name, 0), "last_request_age_s": scheduler.clock() - scheduler.last_used.get(name, scheduler.clock()), **{key: resources[name][key] for key in ("gpu_bytes", "host_bytes", "context_tokens")}} for name, value in scheduler.states.items()}, "recovery": {name: {**value, "retry_in_s": max(0, value.get("next_retry", 0) - scheduler.clock())} for name, value in scheduler.recovery.items()}, "ownership": [{key: record.get(key) for key in ("id", "resource", "pid", "phase", "boot_id")} for record in records(scheduler.lock_dir.parent / "requests")], "source": revision, "host": diagnostics})
+        return web.json_response({"models": {name: {"state": value, "active_requests": scheduler.active.get(name, 0), "last_request_age_s": scheduler.clock() - scheduler.last_used.get(name, scheduler.clock()), **{key: resources[name].get(key) for key in ("gpu_bytes", "host_bytes", "context_tokens", "memory", "artifact_identity", "artifact_fingerprint", "runtime_identity", "supported_request_shapes", "concurrency_limit")}} for name, value in scheduler.states.items()}, "recovery": {name: {**value, "retry_in_s": max(0, value.get("next_retry", 0) - scheduler.clock())} for name, value in scheduler.recovery.items()}, "ownership": [{key: record.get(key) for key in ("id", "resource", "pid", "phase", "boot_id")} for record in records(scheduler.lock_dir.parent / "requests")], "source": revision, "host": diagnostics})
 
     async def admit(request: web.Request):
         body = await read_json(request)
@@ -637,7 +650,11 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 pass
             raise
         generation = await state["runtime"].generation(name) if hasattr(state["runtime"], "generation") else None
-        return web.json_response({"ok": True, "generation": generation})
+        return web.json_response({
+            "ok": True,
+            "generation": generation,
+            "concurrency_limit": resources[name].get("concurrency_limit", 1),
+        })
 
     async def proxy(request: web.Request):
         path, model, body = request.path, None, None
