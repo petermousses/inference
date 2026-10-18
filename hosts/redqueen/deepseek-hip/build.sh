@@ -6,6 +6,7 @@ rocm_path="${ROCM_PATH:-/opt/rocm}"
 build_dir="${BUILD_DIR:-${root}/build}"
 sources=(
   "${root}/src/quantization.hip"
+  "${root}/src/fp4_gemm.hip"
   "${root}/src/fp8_gemm.hip"
   "${root}/src/rmsnorm.hip"
   "${root}/src/sparse_attn.hip"
