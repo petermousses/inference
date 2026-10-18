@@ -493,6 +493,10 @@ def _run(options: argparse.Namespace) -> int:
 
         with _pinned_inference_imports(source_bytes, inference_dir):
             reference = _execute_pinned_model(source_bytes["model.py"], model_path)
+            image_processor_path = inference_dir / "image_processor.py"
+            image_processor = _execute_pinned_model(
+                source_bytes["image_processor.py"], image_processor_path
+            )
             model_config = json.loads(source_bytes["config.json"].decode("utf-8"))
             if not isinstance(model_config, dict):
                 raise RuntimeError("pinned model config must be an object")
@@ -696,6 +700,7 @@ def _run(options: argparse.Namespace) -> int:
                         run_checkpoint_forward_smoke(
                             kernel=kernel,
                             reference=reference,
+                            image_processor=image_processor,
                             model=model,
                             args=args,
                             tokenizer=tokenizer,
