@@ -19,6 +19,7 @@ def _args():
     return SimpleNamespace(
         max_batch_size=1,
         max_seq_len=16,
+        vocab_size=129280,
         window_size=4,
         head_dim=8,
         index_head_dim=4,
@@ -49,6 +50,17 @@ class Indexer(torch.nn.Module):
         self.compress_ratio = 2
         self.owns_k = True
         self.register_buffer("k_cache", torch.zeros((1, 8, 4), dtype=torch.bfloat16, device="meta"))
+
+
+class NgramHashState(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layout = SimpleNamespace(max_ngram_size=4, layer_ids=(0, 1), n_heads=8)
+        self.register_buffer("primes", torch.empty((2, 3, 8), dtype=torch.int64, device="meta"))
+        self.register_buffer("offsets", torch.empty((2, 24), dtype=torch.int64, device="meta"))
+        self.register_buffer("multipliers", torch.empty((2, 4), dtype=torch.int64, device="meta"))
+        self.register_buffer("token_map", torch.empty((129280,), dtype=torch.int64, device="meta"))
+        self.register_buffer("cache", torch.empty((1, 16), dtype=torch.int64, device="meta"))
 
 
 class Attention(torch.nn.Module):
@@ -85,6 +97,7 @@ class TinyModel(torch.nn.Module):
                 Attention(2, 2, compressed_frequency),
             ]
         )
+        self.engram_hash = NgramHashState()
         self.shared = SimpleNamespace(compress_kv=None, index_k=None, topk_idxs=None, candidates=None)
 
 
@@ -113,6 +126,23 @@ class SessionStateTest(unittest.TestCase):
         self.model = TinyModel()
         self.args = _args()
         self.events = []
+        self.engram_factory_calls = 0
+
+    def _engram_hash_factory(self, module, args, device):
+        self.engram_factory_calls += 1
+        self.assertIs(module, self.model.engram_hash)
+        self.assertIs(args, self.args)
+        return SimpleNamespace(
+            _buffers={
+                name: torch.full(
+                    tuple(tensor.shape),
+                    index + 1,
+                    dtype=tensor.dtype,
+                    device=device,
+                )
+                for index, (name, tensor) in enumerate(module._buffers.items())
+            }
+        )
 
     def _reset(self):
         self.events.append("reset")
@@ -134,6 +164,7 @@ class SessionStateTest(unittest.TestCase):
             self.args,
             device="cpu",
             frequency_factory=factory,
+            engram_hash_factory=self._engram_hash_factory,
             admission=admission,
             fence=fence or (lambda: self.events.append("fence")),
             reset_runtime_references=self._reset,
@@ -151,6 +182,8 @@ class SessionStateTest(unittest.TestCase):
                     shape[1] = self.args.max_seq_len // 2
                 elif name == "freqs_cis":
                     shape[0] = self.args.max_seq_len
+                elif name == "cache":
+                    shape[1] = self.args.max_seq_len
                 module._buffers[name] = torch.empty(shape, dtype=value.dtype, device="meta")
         plan = plan_session_state(self.model, self.args)
         self.assertEqual(plan.max_seq_len, 220000)
@@ -159,6 +192,11 @@ class SessionStateTest(unittest.TestCase):
         self.assertEqual(plan.estimate.index_cache_bytes, 1 * 110000 * 4 * 2)
         self.assertEqual(plan.estimate.compressor_tail_bytes, 2 * 1 * 2 * 8 * 4)
         self.assertEqual(plan.estimate.rotary_bytes, 2 * 220000 * 2 * 8)
+        self.assertEqual(
+            plan.estimate.engram_hash_bytes,
+            (2 * 3 * 8 + 2 * 24 + 2 * 4 + 129280 + 220000) * 8,
+        )
+        self.assertEqual(plan.estimate.engram_hash_bytes, 2_795_072)
         self.assertEqual(plan.estimate.physical_peak_bytes, plan.estimate.device_peak_bytes)
 
     def test_materializes_official_buffers_and_close_restores_meta(self):
@@ -168,6 +206,10 @@ class SessionStateTest(unittest.TestCase):
         self.assertFalse(self.model.layers[0].window_kv_cache.is_meta)
         self.assertTrue(torch.equal(self.model.layers[0].window_kv_cache, torch.zeros_like(self.model.layers[0].window_kv_cache)))
         self.assertTrue(torch.isneginf(self.model.layers[1].compressor.score_state).all())
+        self.assertEqual(self.engram_factory_calls, 1)
+        for index, (name, tensor) in enumerate(self.model.engram_hash._buffers.items()):
+            self.assertFalse(tensor.is_meta)
+            self.assertTrue(torch.equal(tensor, torch.full_like(tensor, index + 1)))
         self.assertEqual(
             self.model.layers[1].freqs_cis.data_ptr(),
             self.model.layers[2].freqs_cis.data_ptr(),
@@ -205,6 +247,20 @@ class SessionStateTest(unittest.TestCase):
         self.assertIn(("exit", RuntimeError), self.events)
         recovered = self._state()
         recovered.close()
+
+    def test_missing_engram_hash_factory_fails_before_admission(self):
+        with self.assertRaisesRegex(ValueError, "pinned Engram hash factory"):
+            load_session_state(
+                self.model,
+                self.args,
+                device="cpu",
+                frequency_factory=_factory,
+                admission=lambda _estimate: self.fail("admission ran before Engram factory validation"),
+                fence=lambda: None,
+                reset_runtime_references=self._reset,
+                release_allocator=lambda: None,
+            )
+        self.assertFalse(any(isinstance(event, tuple) and event[0] == "admission" for event in self.events))
 
     def test_concurrent_load_is_rejected_until_active_state_closes(self):
         factory_entered = threading.Event()

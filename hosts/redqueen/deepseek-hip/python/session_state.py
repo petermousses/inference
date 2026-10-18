@@ -53,6 +53,7 @@ class SessionStateMemoryEstimate:
     compressor_tail_bytes: int
     rotary_bytes: int
     rotary_workspace_bytes: int
+    engram_hash_bytes: int
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,8 @@ class SessionBufferAllocation:
     nbytes: int
     frequency_key: tuple[int | float, ...] | None
     locations: tuple[tuple[dict, str, object], ...]
+    runtime_module: object | None = None
+    runtime_attribute: str | None = None
 
 
 @dataclass(frozen=True)
@@ -155,6 +158,25 @@ def _expected_shape(kind: str, module, args, batch: int, seq_len: int) -> tuple[
         if not hasattr(module, "layer_id") or not hasattr(module, "compress_ratio"):
             raise ValueError("freqs_cis is registered outside an attention layer")
         return (seq_len, args.rope_head_dim // 2)
+    if kind.startswith("engram_hash_"):
+        if module.__class__.__name__ != "NgramHashState" or not hasattr(module, "layout"):
+            raise ValueError(f"{kind} is registered outside the pinned NgramHashState")
+        layout = module.layout
+        layer_count = len(layout.layer_ids)
+        if layer_count <= 0 or layout.max_ngram_size < 2 or layout.n_heads <= 0:
+            raise ValueError("NgramHashState layout dimensions are invalid")
+        attribute = kind.removeprefix("engram_hash_")
+        if attribute == "primes":
+            return (layer_count, layout.max_ngram_size - 1, layout.n_heads)
+        if attribute == "offsets":
+            return (layer_count, (layout.max_ngram_size - 1) * layout.n_heads)
+        if attribute == "multipliers":
+            return (layer_count, layout.max_ngram_size)
+        if attribute == "token_map":
+            return (_positive_int(getattr(args, "vocab_size", None), "vocab_size"),)
+        if attribute == "cache":
+            return (batch, seq_len)
+        raise ValueError(f"unrecognized NgramHashState buffer: {attribute}")
     raise AssertionError(f"unknown session buffer kind: {kind}")
 
 
@@ -196,16 +218,22 @@ def plan_session_state(model: object, args: object) -> SessionStatePlan:
         "score_state",
         "freqs_cis",
     }
+    engram_hash_buffers = {"primes", "offsets", "multipliers", "token_map", "cache"}
     for name, module, attribute, buffers, tensor in _walk_registered_buffers(model):
-        if attribute not in recognized:
+        if attribute in recognized:
+            kind = attribute
+        elif module.__class__.__name__ == "NgramHashState" and attribute in engram_hash_buffers:
+            kind = f"engram_hash_{attribute}"
+        else:
             continue
         if not getattr(tensor, "is_meta", False):
             raise ValueError(f"session buffer is already materialized: {name}")
-        kind = attribute
         shape = tuple(tensor.shape)
         expected = _expected_shape(kind, module, args, batch, seq_len)
         if shape != expected:
             raise ValueError(f"unexpected {kind} shape at {name}: {shape} != {expected}")
+        if kind.startswith("engram_hash_") and _dtype_name(tensor.dtype) != "int64":
+            raise ValueError(f"NgramHashState buffer must be int64 at {name}")
         if kind == "freqs_cis" and _dtype_name(tensor.dtype) != "complex64":
             raise ValueError(f"official freqs_cis must be complex64 at {name}")
         if kind == "freqs_cis":
@@ -223,10 +251,14 @@ def plan_session_state(model: object, args: object) -> SessionStatePlan:
                 "frequency_key": key if kind == "freqs_cis" else None,
                 "names": [],
                 "locations": [],
+                "runtime_module": module if kind.startswith("engram_hash_") else None,
+                "runtime_attribute": attribute if kind.startswith("engram_hash_") else None,
             },
         )
         if group["shape"] != shape or group["dtype"] != tensor.dtype:
             raise ValueError(f"inconsistent aliases for session buffer: {name}")
+        if kind.startswith("engram_hash_") and group["runtime_module"] is not module:
+            raise ValueError(f"NgramHashState aliases do not share one module at {name}")
         location_key = (id(buffers), attribute)
         if location_key not in location_keys:
             group["names"].append(name)
@@ -263,6 +295,8 @@ def plan_session_state(model: object, args: object) -> SessionStatePlan:
             nbytes=group["nbytes"],
             frequency_key=group["frequency_key"],
             locations=tuple(group["locations"]),
+            runtime_module=group["runtime_module"],
+            runtime_attribute=group["runtime_attribute"],
         )
         for group in sorted(
             groups.values(),
@@ -276,9 +310,11 @@ def plan_session_state(model: object, args: object) -> SessionStatePlan:
         "kv_state": 0,
         "score_state": 0,
         "freqs_cis": 0,
+        "engram_hash": 0,
     }
     for allocation in allocations:
-        totals[allocation.kind] += allocation.nbytes
+        bucket = "engram_hash" if allocation.kind.startswith("engram_hash_") else allocation.kind
+        totals[bucket] += allocation.nbytes
     workspace = max(
         (
             _frequency_workspace_bytes(allocation.shape)
@@ -300,6 +336,7 @@ def plan_session_state(model: object, args: object) -> SessionStatePlan:
         compressor_tail_bytes=totals["kv_state"] + totals["score_state"],
         rotary_bytes=totals["freqs_cis"],
         rotary_workspace_bytes=workspace,
+        engram_hash_bytes=totals["engram_hash"],
     )
     return SessionStatePlan(allocations, estimate, batch, seq_len)
 
@@ -433,6 +470,7 @@ def load_session_state(
     *,
     device,
     frequency_factory: Callable[..., object],
+    engram_hash_factory: Callable[[object, object, object], object] | None = None,
     admission: Callable[[SessionStateMemoryEstimate], ContextManager[object]],
     fence: Callable[[], object],
     reset_runtime_references: Callable[[], object],
@@ -447,6 +485,8 @@ def load_session_state(
     """
     if not callable(frequency_factory) or not callable(admission):
         raise TypeError("frequency_factory and admission must be callable")
+    if engram_hash_factory is not None and not callable(engram_hash_factory):
+        raise TypeError("engram_hash_factory must be callable")
     if not all(callable(callback) for callback in (fence, reset_runtime_references, release_allocator)):
         raise TypeError("fence, reset_runtime_references, and release_allocator must be callable")
     lifecycle_lock = _acquire_model_lifecycle_lock(model)
@@ -455,6 +495,12 @@ def load_session_state(
     except BaseException:
         lifecycle_lock.release()
         raise
+    if (
+        any(allocation.kind.startswith("engram_hash_") for allocation in plan.allocations)
+        and engram_hash_factory is None
+    ):
+        lifecycle_lock.release()
+        raise ValueError("NgramHashState buffers require the pinned Engram hash factory")
     try:
         import torch
     except ImportError as exc:
@@ -476,6 +522,7 @@ def load_session_state(
 
     assigned = []
     loaded = {}
+    materialized_engram_states = {}
     target = None
     replacement = None
     allocation = None
@@ -494,6 +541,33 @@ def load_session_state(
                         f"official rotary shape mismatch for {allocation.names[0]}: "
                         f"{tuple(replacement.shape)} != {allocation.shape}"
                     )
+            elif allocation.kind.startswith("engram_hash_"):
+                module = allocation.runtime_module
+                attribute = allocation.runtime_attribute
+                if module is None or attribute is None or engram_hash_factory is None:
+                    raise RuntimeError("NgramHashState allocation has no pinned runtime factory")
+                module_key = id(module)
+                candidate = materialized_engram_states.get(module_key)
+                if candidate is None:
+                    candidate = _call_sync_result(
+                        lambda: engram_hash_factory(module, args, target_device),
+                        "Engram hash state factory",
+                    )
+                    candidate_buffers = getattr(candidate, "_buffers", None)
+                    if not isinstance(candidate_buffers, dict):
+                        raise TypeError("Engram hash state factory must return a module with registered buffers")
+                    materialized_engram_states[module_key] = candidate
+                value = candidate._buffers.get(attribute)
+                if not isinstance(value, torch.Tensor):
+                    raise RuntimeError(f"Engram hash factory omitted buffer {attribute}")
+                if (
+                    value.is_meta
+                    or value.device != target_device
+                    or tuple(value.shape) != allocation.shape
+                    or value.dtype != allocation.dtype
+                ):
+                    raise RuntimeError(f"Engram hash factory returned incompatible buffer {attribute}")
+                replacement = value
             elif allocation.kind == "score_state":
                 replacement = torch.full(
                     allocation.shape,
@@ -517,6 +591,7 @@ def load_session_state(
                 value = container[attribute]
                 if value.is_meta or value.device != target_device:
                     raise RuntimeError(f"session buffer was not materialized: {allocation.names[0]}")
+        materialized_engram_states.clear()
         return SessionState(
             model,
             plan,
@@ -535,6 +610,7 @@ def load_session_state(
             _call_sync(reset_runtime_references, "failed-load runtime reference reset")
             for container, attribute, original in reversed(assigned):
                 container[attribute] = original
+            materialized_engram_states.clear()
             replacement = None
             target = None
             allocation = None
