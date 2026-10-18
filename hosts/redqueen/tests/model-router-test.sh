@@ -51,6 +51,7 @@ assert policy["gpu_budget_mib"] == 88 * 1024
 assert policy["host_budget_mib"] == 104 * 1024
 assert policy["minimum_host_available_mib"] == 8 * 1024
 assert policy["prefill_headroom_mib"] == 5 * 1024
+assert policy["public_request_limit"] == 4
 PY
 if grep -Fq 'deepseek-v4.1-flash-q2' "${router_config}"; then
   printf 'DeepSeek is not eligible for registration until its weights verify\n' >&2

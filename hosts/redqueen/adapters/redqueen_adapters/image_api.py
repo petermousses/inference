@@ -767,7 +767,9 @@ def create_image_app(
 
     async def recover() -> None:
         if isinstance(actual_backend, ComfyBackend) and actual_backend.has_abandoned():
-            async with scheduler.lease("comfyui", exclusive=True) as admission:
+            async with scheduler.lease(
+                "comfyui", exclusive=True, wait_for_idle=False
+            ) as admission:
                 await actual_backend.reconcile(admission.get("generation"))
 
     async def maintenance(_: web.Application):

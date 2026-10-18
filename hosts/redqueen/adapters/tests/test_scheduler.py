@@ -21,7 +21,7 @@ from redqueen_adapters.memory_profile import MIB, build_profiles, file_signature
 from redqueen_adapters.ownership import OwnedRequest, records
 from redqueen_adapters import scheduler_api
 from redqueen_adapters.scheduler_api import Memory, Runtime, Scheduler, create_apps
-from redqueen_adapters.scheduler_client import ResourceLock, SchedulerClient
+from redqueen_adapters.scheduler_client import ResourceLock, SchedulerClient, SerializedExecution
 
 
 def resource(size: int, kind: str = "text") -> dict:
@@ -193,6 +193,32 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.scheduler.active["large"], 0)
         self.assertEqual(self.runtime.loaded, {})
 
+    async def test_cancelled_request_holds_global_execution_until_backend_goes_idle(self):
+        started = asyncio.Event()
+
+        async def first():
+            async with self.scheduler.request("a"):
+                started.set()
+                await asyncio.Event().wait()
+
+        async def second():
+            async with self.scheduler.request("b"):
+                return "started"
+
+        request = asyncio.create_task(first())
+        await started.wait()
+        self.runtime.occupied.add("a")
+        request.cancel()
+        await asyncio.sleep(0.05)
+
+        queued = asyncio.create_task(second())
+        await asyncio.sleep(0.05)
+        self.assertFalse(queued.done())
+        self.runtime.occupied.clear()
+        with self.assertRaises(asyncio.CancelledError):
+            await request
+        self.assertEqual(await asyncio.wait_for(queued, 1), "started")
+
     async def test_failed_load_cleans_up_and_failed_cleanup_does_not_release_memory(self):
         self.runtime.load_failure = self.runtime.stop_failure = True
         with self.assertRaises(AdmissionError):
@@ -333,6 +359,82 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.stops, ["b"])
 
 
+class ExecutionGateTest(unittest.IsolatedAsyncioTestCase):
+    async def test_gate_serializes_distinct_workers_and_releases_after_cancellation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = SerializedExecution(Path(directory)), SerializedExecution(Path(directory))
+            started, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+            async def operation():
+                started.set()
+                await release.wait()
+
+            async def run_first():
+                async with first.hold():
+                    await operation()
+
+            async def run_second():
+                async with second.hold():
+                    second_started.set()
+
+            current = asyncio.create_task(run_first())
+            await started.wait()
+            queued = asyncio.create_task(run_second())
+            await asyncio.sleep(0.05)
+            self.assertFalse(second_started.is_set())
+            queued.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await queued
+            release.set()
+            await current
+
+            async with second.hold():
+                self.assertFalse(second_started.is_set())
+
+    async def test_gate_admits_waiters_in_ticket_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gates = [SerializedExecution(Path(directory)) for _ in range(3)]
+            queue = Path(directory) / "execution-queue"
+            first_started, release_first = asyncio.Event(), asyncio.Event()
+            second_started, release_second = asyncio.Event(), asyncio.Event()
+            third_started = asyncio.Event()
+
+            async def hold_first():
+                async with gates[0].hold():
+                    first_started.set()
+                    await release_first.wait()
+
+            async def hold_second():
+                async with gates[1].hold():
+                    second_started.set()
+                    await release_second.wait()
+
+            async def hold_third():
+                async with gates[2].hold():
+                    third_started.set()
+
+            async def wait_for_tickets(count):
+                for _ in range(100):
+                    if len(list(queue.glob("*.ticket"))) >= count:
+                        return
+                    await asyncio.sleep(0.01)
+                self.fail("execution ticket was not queued")
+
+            first = asyncio.create_task(hold_first())
+            await first_started.wait()
+            second = asyncio.create_task(hold_second())
+            await wait_for_tickets(1)
+            third = asyncio.create_task(hold_third())
+            await wait_for_tickets(2)
+
+            release_first.set()
+            await second_started.wait()
+            self.assertFalse(third_started.is_set())
+            release_second.set()
+            await asyncio.gather(first, second, third)
+            self.assertTrue(third_started.is_set())
+
+
 class ProxyTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -419,27 +521,85 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         frames = [line[6:] for line in raw.splitlines() if line.startswith(b"data: ")]
         self.assertEqual([json.loads(frame) for frame in frames], [{"content": "hello"}])
 
-    async def test_active_stream_survives_new_model_rejection_then_idle_model_is_evicted(self):
+    async def test_new_model_waits_for_active_stream_then_evicts_it(self):
         stream = await self.post("a", stream=True)
         self.assertIn(b"hello", await stream.content.readany())
-        rejected = await asyncio.wait_for(self.post("b"), 0.2)
-        self.assertEqual(rejected.status, 503)
-        self.assertEqual(rejected.headers["Retry-After"], "1")
-        self.assertEqual((await rejected.json())["error"]["code"], "capacity_unavailable")
+        queued = asyncio.create_task(self.post("b"))
+        await asyncio.sleep(0.05)
+        self.assertFalse(queued.done())
         self.assertEqual(self.runtime.stops, [])
         self.release.set()
         self.assertIn(b"[DONE]", await stream.read())
-        admitted = await self.post("b")
+        admitted = await asyncio.wait_for(queued, 1)
         self.assertEqual(admitted.status, 200)
         self.assertEqual(self.runtime.stops, ["a"])
 
-    async def test_same_model_returns_429_while_stream_is_active(self):
+    async def test_same_model_waits_for_active_stream_before_next_request(self):
         stream = await self.post("a", stream=True)
-        await stream.content.readany()
-        rejected = await asyncio.wait_for(self.post("a"), 0.2)
-        self.assertEqual(rejected.status, 429)
+        self.assertIn(b"hello", await stream.content.readany())
+        queued = asyncio.create_task(self.post("a"))
+        await asyncio.sleep(0.05)
+        self.assertFalse(queued.done())
         self.release.set()
         await stream.read()
+        response = await asyncio.wait_for(queued, 1)
+        self.assertEqual(response.status, 200)
+
+    async def test_public_gateway_bounds_serialized_work_to_four_requests(self):
+        stream = await self.post("a", stream=True)
+        self.assertIn(b"hello", await stream.content.readany())
+        queued = [asyncio.create_task(self.post("a")) for _ in range(3)]
+        await asyncio.sleep(0.05)
+
+        rejected = await self.post("b")
+        self.assertEqual(rejected.status, 429)
+        self.assertEqual((await rejected.json())["error"]["code"], "frontend_busy")
+        self.release.set()
+        await stream.read()
+        responses = await asyncio.wait_for(asyncio.gather(*queued), 1)
+        self.assertEqual([response.status for response in responses], [200, 200, 200])
+
+    async def test_adapter_execution_waits_for_the_shared_gateway_lease(self):
+        self.resources["jevk5"] = resource(60, "service")
+        stream = await self.post("a", stream=True)
+        self.assertIn(b"hello", await stream.content.readany())
+        adapter = SchedulerClient(self.policy["socket_path"])
+        backend_started = asyncio.Event()
+
+        async def score():
+            backend_started.set()
+
+        task = asyncio.create_task(adapter.run("jevk5", score))
+        await asyncio.sleep(0.05)
+        self.assertFalse(backend_started.is_set())
+        self.release.set()
+        await stream.read()
+        await asyncio.wait_for(task, 1)
+        self.assertTrue(backend_started.is_set())
+
+    async def test_existing_comfy_operator_job_blocks_other_models_until_idle(self):
+        self.runtime.loaded = {"comfyui": "ready"}
+        self.runtime.occupied.add("comfyui")
+        task = asyncio.create_task(self.post("a"))
+        await asyncio.sleep(0.05)
+        self.assertFalse(task.done())
+        self.assertEqual(self.runtime.starts, [])
+        self.runtime.occupied.clear()
+
+        response = await asyncio.wait_for(task, 1)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.runtime.stops, ["comfyui"])
+
+    async def test_recovery_lease_can_reconcile_a_busy_comfy_queue(self):
+        self.runtime.loaded = {"comfyui": "ready"}
+        self.runtime.occupied.add("comfyui")
+        adapter = SchedulerClient(self.policy["socket_path"])
+
+        async with asyncio.timeout(1):
+            async with adapter.lease(
+                "comfyui", exclusive=True, wait_for_idle=False
+            ):
+                self.assertTrue(await self.runtime.busy("comfyui"))
 
     async def test_auth_and_management_routes_cannot_bypass_admission(self):
         response = await self.client.post("/v1/chat/completions", json={"model": "a"})
@@ -485,10 +645,11 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
     async def test_adapter_lease_protects_model_across_http_calls_and_releases_afterwards(self):
         adapter = SchedulerClient(self.policy["socket_path"])
         async with adapter.lease("comfyui"):
-            response = await self.post("b")
-            self.assertEqual(response.status, 503)
+            queued = asyncio.create_task(self.post("b"))
+            await asyncio.sleep(0.05)
+            self.assertFalse(queued.done())
             self.assertEqual(self.runtime.stops, [])
-        response = await self.post("b")
+        response = await asyncio.wait_for(queued, 1)
         self.assertEqual(response.status, 200)
         self.assertEqual(self.runtime.stops, ["comfyui"])
 
@@ -508,14 +669,15 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_image_and_both_decision_adapters_preserve_capacity_errors(self):
         self.resources.update(jevk5=resource(60, "service"), clm=resource(60, "service"))
+        self.runtime.loaded = {"a": "ready"}
+        active_model = ResourceLock(Path(self.policy["socket_path"]).parent / "leases", "a")
+        self.assertTrue(active_model.acquire())
         backend = Mock()
         backend.close = AsyncMock()
         backend.generate = AsyncMock(side_effect=AssertionError("image backend ran without admission"))
         backend.decide = AsyncMock(side_effect=AssertionError("Jev backend ran without admission"))
         backend.evaluate = AsyncMock(side_effect=AssertionError("CLM backend ran without admission"))
         clients = []
-        stream = await self.post("a", stream=True)
-        await stream.content.readany()
         try:
             image = TestClient(TestServer(create_image_app(ImageSettings(api_key="secret", scheduler_socket=self.policy["socket_path"]), backend)))
             decision = TestClient(TestServer(create_jev_app(JevSettings(api_key="secret", clm_api_key="secret", scheduler_socket=self.policy["socket_path"]), backend, clm_backend=backend)))
@@ -535,8 +697,7 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             backend.decide.assert_not_awaited()
             backend.evaluate.assert_not_awaited()
         finally:
-            self.release.set()
-            await stream.read()
+            active_model.close()
             for client in reversed(clients):
                 await client.close()
 
@@ -557,12 +718,13 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         await asyncio.sleep(0)
         self.assertFalse(task.done())
-        response = await self.post("b")
-        self.assertEqual(response.status, 503)
+        queued = asyncio.create_task(self.post("b"))
+        await asyncio.sleep(0.05)
+        self.assertFalse(queued.done())
         self.release.set()
         with self.assertRaises(asyncio.CancelledError):
             await task
-        response = await self.post("b")
+        response = await asyncio.wait_for(queued, 1)
         self.assertEqual(response.status, 200)
 
     async def test_quiet_prefill_survives_former_response_deadline(self):
@@ -583,15 +745,16 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         response = await self.post("a", stream=True)
         first = await response.content.readany()
         self.assertIn(b"hello", first)
+        queued = asyncio.create_task(self.post("b"))
         try:
             heartbeat = await asyncio.wait_for(response.content.readany(), 1)
             self.assertIn(b": ping", heartbeat)
-            self.assertEqual((await self.post("b")).status, 503)
         finally:
             self.release.set()
         rest = await asyncio.wait_for(response.read(), 1)
         self.assertIn(b"[DONE]", rest)
         self.assertNotIn(b"upstream_timeout", first + heartbeat + rest)
+        self.assertEqual((await asyncio.wait_for(queued, 1)).status, 200)
 
     async def test_backpressure_does_not_expire_a_live_request(self):
         self.policy.update(request_timeout_s=0.01, response_timeout_s=0.01)
@@ -607,10 +770,13 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
                 response = await self.post("a", stream=True)
                 await asyncio.wait_for(write_started.wait(), 1)
                 await asyncio.sleep(0.03)
-                self.assertEqual((await self.post("b")).status, 503)
+                queued = asyncio.create_task(self.post("b"))
+                await asyncio.sleep(0.03)
+                self.assertFalse(queued.done())
                 write_release.set()
                 self.release.set()
                 self.assertIn(b"[DONE]", await asyncio.wait_for(response.read(), 1))
+                self.assertEqual((await asyncio.wait_for(queued, 1)).status, 200)
         finally:
             write_release.set()
             self.release.set()
