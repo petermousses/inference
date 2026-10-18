@@ -22,6 +22,7 @@ def run_checkpoint_forward_smoke(
     *,
     kernel,
     reference,
+    image_processor,
     model,
     args,
     tokenizer,
@@ -43,10 +44,38 @@ def run_checkpoint_forward_smoke(
     )
     if len(encoded) < 4:
         raise RuntimeError("the pinned tokenizer produced too few tokens to exercise Engram")
-    input_token_ids = [int(value) for value in encoded[:4]]
-    if any(not 0 <= token_id < args.vocab_size for token_id in input_token_ids):
+    text_token_ids = [int(value) for value in encoded[:4]]
+    if any(not 0 <= token_id < args.vocab_size for token_id in text_token_ids):
         raise RuntimeError("the pinned tokenizer produced an invalid smoke token")
-    input_token_count = len(input_token_ids)
+    if model.vision is None or model.aligner is None or not args.vision_enabled:
+        raise RuntimeError("the pinned checkpoint graph has no enabled vision tower")
+
+    image = image_processor["Image"].new("RGB", (544, 544), color=(37, 113, 197))
+    with image_processor["io"].BytesIO() as image_file:
+        image.save(image_file, format="PNG")
+        image_bytes = image_file.getvalue()
+    patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = image_processor["load_image"](
+        {"data": image_bytes}, args
+    )
+    image_types = image_processor["image_token_types"](n_llm_h, n_llm_w)
+    image_prefix = [
+        int(value)
+        for value in tokenizer.encode("Describe this image:", add_special_tokens=False)
+    ]
+    image_token_ids = [int(args.image_token_id)] * int(image_types.numel())
+    image_token_ids = image_prefix + image_token_ids
+    image_token_types = [int(image_processor["TEXT"])] * len(image_prefix) + [
+        int(value) for value in image_types.tolist()
+    ]
+    image_input = image_processor["ImageInput"](
+        start=len(image_prefix),
+        patches=patches,
+        n_vit_h=n_vit_h,
+        n_vit_w=n_vit_w,
+        types=image_types,
+    )
+    if len(image_token_ids) != len(image_token_types) or not image_token_ids:
+        raise RuntimeError("pinned image preprocessing returned mismatched token metadata")
 
     model.temperature = 0
     model.eval()
@@ -84,6 +113,9 @@ def run_checkpoint_forward_smoke(
     request_active = threading.Event()
 
     class RequestReservation:
+        def __init__(self, name: str):
+            self.name = name
+
         async def __aenter__(self):
             free_gtt, host_available, gtt_total = admission_check(request_estimate)
             torch.cuda.synchronize(device)
@@ -93,7 +125,7 @@ def run_checkpoint_forward_smoke(
             memory["active_leases"] += 1
             request_active.set()
             print(
-                "single-request forward admission: "
+                f"single-request {self.name} forward admission: "
                 f"GTT peak budget={_FORWARD_PEAK_BUDGET / _GIB:.1f} GiB "
                 f"(free={free_gtt / _GIB:.2f}/{gtt_total / _GIB:.2f} GiB); "
                 f"host available={host_available / _GIB:.2f} GiB; "
@@ -152,11 +184,22 @@ def run_checkpoint_forward_smoke(
         native_usage["rope"] += 1
         return kernel.apply_rotary_emb(values, freqs_cis, inverse)
 
-    def run_one_request():
+    def run_one_request(name, token_ids, *, token_types=None, images=None, image_token_count=0):
+        input_token_count = len(token_ids)
         try:
+            # The prior request drops its experts and shrinks the logical cap to
+            # zero. Restore the admitted cache budget before this request loads
+            # any routed experts.
+            cache.resize_when_idle(_EXPERT_CACHE_CAPACITY)
             with torch.inference_mode():
-                input_ids = torch.tensor([input_token_ids], dtype=torch.long, device=device)
-                output_ids, logits, main_hidden = model(input_ids, start_pos=0)
+                input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+                model_kwargs = {}
+                if token_types is not None:
+                    model_kwargs["token_types"] = torch.tensor(
+                        [token_types], dtype=torch.long, device=device
+                    )
+                    model_kwargs["images"] = images
+                output_ids, logits, main_hidden = model(input_ids, start_pos=0, **model_kwargs)
                 if output_ids.shape != (1,):
                     raise RuntimeError(
                         f"pinned prefill returned output_ids shape {tuple(output_ids.shape)}; expected (1,)"
@@ -193,14 +236,35 @@ def run_checkpoint_forward_smoke(
                         raise RuntimeError("pinned DSpark graph returned non-finite confidence")
 
                 result = {
+                    "name": name,
                     "input_token_count": input_token_count,
                     "main_token_id": int(output_ids[0].item()),
                     "speculative_token_id": int(spec_ids[0, -1].item()),
+                    "image_token_count": image_token_count,
                     "native_usage": dict(native_usage),
                 }
             request_fence()
             cache.resize_when_idle(0, after_drop=request_release_allocator)
             request_fence()
+            torch.cuda.synchronize(device)
+            result["allocated_peak"] = (
+                torch.cuda.max_memory_allocated(device)
+                - memory["forward_allocated_before"]
+            )
+            result["reserved_peak"] = (
+                torch.cuda.max_memory_reserved(device)
+                - memory["forward_reserved_before"]
+            )
+            if result["allocated_peak"] > _FORWARD_PEAK_BUDGET:
+                raise RuntimeError(
+                    f"single-request {name} allocated peak {result['allocated_peak']} exceeds its "
+                    f"{_FORWARD_PEAK_BUDGET}-byte admission budget"
+                )
+            if result["reserved_peak"] > _FORWARD_PEAK_BUDGET:
+                raise RuntimeError(
+                    f"single-request {name} allocator peak {result['reserved_peak']} exceeds its "
+                    f"{_FORWARD_PEAK_BUDGET}-byte admission budget"
+                )
             return result
         except BaseException:
             if not cache.stats.quarantined:
@@ -211,6 +275,7 @@ def run_checkpoint_forward_smoke(
 
     rmsnorm_class.forward = native_rmsnorm
     model_globals["apply_rotary_emb"] = native_rope
+    text_result = image_result = None
     try:
         with install_engram_row_reads(model, checkpoint) as engram_installation:
             original_lookups = {}
@@ -228,33 +293,33 @@ def run_checkpoint_forward_smoke(
                 with install_cached_moe(
                     model, cache, reference["linear"], fence=request_fence
                 ) as installation:
-                    result = asyncio.run(
-                        installation.run_reserved_sync(
-                            run_one_request,
-                            RequestReservation(),
+                    async def run_cases():
+                        text = await installation.run_reserved_sync(
+                            lambda: run_one_request("text", text_token_ids),
+                            RequestReservation("text"),
                             worker_context=gpu_worker_context,
                         )
-                    )
+                        image = await installation.run_reserved_sync(
+                            lambda: run_one_request(
+                                "image",
+                                image_token_ids,
+                                token_types=image_token_types,
+                                images=[[image_input]],
+                                image_token_count=len(image_types),
+                            ),
+                            RequestReservation("image"),
+                            worker_context=gpu_worker_context,
+                        )
+                        return text, image
+
+                    text_result, image_result = asyncio.run(run_cases())
             finally:
                 for layer_id, reader in engram_installation.readers.items():
                     reader.lookup = original_lookups[layer_id]
-        allocated_before = memory.get("forward_allocated_before")
-        reserved_before = memory.get("forward_reserved_before")
-        if allocated_before is None or reserved_before is None:
+        if text_result is None or image_result is None:
             raise RuntimeError("forward memory baselines were not captured")
-        torch.cuda.synchronize(device)
-        allocated_peak = torch.cuda.max_memory_allocated(device) - allocated_before
-        reserved_peak = torch.cuda.max_memory_reserved(device) - reserved_before
-        if allocated_peak > _FORWARD_PEAK_BUDGET:
-            raise RuntimeError(
-                f"single-request forward allocated peak {allocated_peak} exceeds its "
-                f"{_FORWARD_PEAK_BUDGET}-byte admission budget"
-            )
-        if reserved_peak > _FORWARD_PEAK_BUDGET:
-            raise RuntimeError(
-                f"single-request forward allocator peak {reserved_peak} exceeds its "
-                f"{_FORWARD_PEAK_BUDGET}-byte admission budget"
-            )
+        allocated_peak = max(text_result["allocated_peak"], image_result["allocated_peak"])
+        reserved_peak = max(text_result["reserved_peak"], image_result["reserved_peak"])
         stats = cache.stats
         if stats.resident_bytes or stats.leased_bytes or stats.loading_bytes or stats.entries:
             raise RuntimeError("forward smoke retained routed expert allocations")
@@ -266,18 +331,25 @@ def run_checkpoint_forward_smoke(
             raise RuntimeError(f"forward missed MTP expert layers: {sorted(mtp_layers)}")
         if any(count == 0 for count in engram_lookups.values()):
             raise RuntimeError(f"checkpoint-backed Engram readers were not exercised: {engram_lookups}")
-        if not result["native_usage"]["rmsnorm"] or not result["native_usage"]["rope"]:
-            raise RuntimeError(f"native RMSNorm/RoPE were not exercised: {result['native_usage']}")
+        if not all(image_result["native_usage"].values()):
+            raise RuntimeError(
+                f"native RMSNorm/RoPE were not exercised: {image_result['native_usage']}"
+            )
         print(
-            "pinned 1017 checkpoint-backed native HIP forward: PASS; "
-            f"input_tokens={result['input_token_count']}; "
-            f"main_token={result['main_token_id']}; "
-            f"dspark_token={result['speculative_token_id']}; "
+            "pinned 1017 checkpoint-backed native HIP text and image forward: PASS; "
+            f"text_tokens={text_result['input_token_count']}; "
+            f"text_main_token={text_result['main_token_id']}; "
+            f"text_dspark_token={text_result['speculative_token_id']}; "
+            f"image_tokens={image_result['input_token_count']}; "
+            f"image_span_tokens={image_result['image_token_count']}; "
+            f"image_grid={n_vit_h}x{n_vit_w} ViT / {n_llm_h}x{n_llm_w} LLM; "
+            f"image_main_token={image_result['main_token_id']}; "
+            f"image_dspark_token={image_result['speculative_token_id']}; "
             f"expert_cache_misses={len(loaded_experts)}; "
             f"allocated_peak={allocated_peak / _GIB:.3f} GiB; "
             f"allocator_peak={reserved_peak / _GIB:.3f} GiB; "
-            f"RMSNorm={result['native_usage']['rmsnorm']}; "
-            f"RoPE={result['native_usage']['rope']}; "
+            f"RMSNorm={image_result['native_usage']['rmsnorm']}; "
+            f"RoPE={image_result['native_usage']['rope']}; "
             f"Engram_layer_lookups={engram_lookups}; "
             "routed/MTP experts used checkpoint-backed readers",
             flush=True,
