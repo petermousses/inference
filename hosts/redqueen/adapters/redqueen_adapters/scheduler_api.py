@@ -20,7 +20,7 @@ from aiohttp import web
 
 from .common import AdmissionError, IngressGate, UpstreamError, admission_response, auth_middleware, body_timeout, decode_json, read_json, read_limited, safe_errors
 from .memory_profile import MIB, verify_profiles
-from .scheduler_client import ResourceLock, finish_shielded
+from .scheduler_client import ResourceLock, SerializedExecution, finish_shielded
 from .ownership import OwnedRequest, abandoned, boot_id, records, remove_record
 
 LOG = logging.getLogger("redqueen.scheduler")
@@ -46,7 +46,18 @@ class Memory:
 
 
 def footprint(spec: dict) -> Memory:
-    return Memory(spec["gpu_bytes"], spec["host_bytes"])
+    profile = spec.get("memory")
+    if not isinstance(profile, dict):
+        return Memory(spec["gpu_bytes"], spec["host_bytes"])
+    total = Memory(0, 0)
+    for component in ("mandatory", "reclaimable", "transient_peak"):
+        value = profile.get(component)
+        if not isinstance(value, dict):
+            raise ValueError(f"invalid {component} memory profile")
+        total += Memory(value["gpu_bytes"], value["host_bytes"])
+    if total != Memory(spec["gpu_bytes"], spec["host_bytes"]):
+        raise ValueError("worker memory components do not match its admission footprint")
+    return total
 
 
 def capacity_limits(policy: dict, *, gpu_total: int, host_total: int) -> Memory:
@@ -262,6 +273,7 @@ class Scheduler:
         self.last_used: dict[str, float] = {}
         self.active: dict[str, int] = {}
         self.transition = asyncio.Lock()
+        self.execution = SerializedExecution(lock_dir)
         self.recovery: dict[str, dict] = {}
         self.lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -273,7 +285,7 @@ class Scheduler:
     def reserved(self) -> Memory:
         return sum((footprint(self.resources[name]) for name in self.states), Memory(0, 0))
 
-    async def admit(self, name: str) -> None:
+    async def admit(self, name: str, *, wait_for_idle: bool = False) -> None:
         if name not in self.resources:
             raise AdmissionError(404, "model is not configured", "model_not_found")
         operation = ResourceLock(self.lock_dir.parent, "operations.lock")
@@ -288,14 +300,32 @@ class Scheduler:
                     self.runtime.verify_configuration()
                 except (OSError, ValueError, KeyError) as error:
                     raise AdmissionError(503, "memory profiles require deployment validation", "configuration_unready", retry_after=None) from error
-            await self._admit(name)
+            await self._admit(name, wait_for_idle=wait_for_idle)
         finally:
             operation.close()
 
-    async def _admit(self, name: str) -> None:
+    async def _wait_for_idle_workers(self) -> None:
+        """Do not overlap brokered work with active unmanaged backend jobs."""
+        while True:
+            await self.refresh()
+            active = False
+            for other in self.states:
+                if self.states[other] != "ready":
+                    raise AdmissionError(503, "backend activity is changing", "model_transition")
+                busy = await self.runtime.busy(other)
+                if busy is None:
+                    raise AdmissionError(503, "backend activity is unknown", "backend_health_uncertain")
+                active = active or busy
+            if not active:
+                return
+            await asyncio.sleep(0.1)
+
+    async def _admit(self, name: str, *, wait_for_idle: bool = False) -> None:
         recovery = self.recovery.get(name, {})
         if recovery.get("next_retry", 0) > self.clock():
             raise AdmissionError(503, "backend recovery is cooling down", "backend_recovering", retry_after=max(1, int(recovery["next_retry"] - self.clock())))
+        if wait_for_idle:
+            await self._wait_for_idle_workers()
         if self.transition.locked():
             # Existing warm work can proceed while another model loads. Probe
             # directly so a crashed warm model cannot autoload around the budget.
@@ -312,6 +342,8 @@ class Scheduler:
             loading = False
             try:
                 await self.refresh()
+                if wait_for_idle:
+                    await self._wait_for_idle_workers()
                 if name in self.states and self.states[name] != "ready":
                     raise AdmissionError(503, "model is changing state; retry shortly", "model_transition")
                 if name in self.states and not await self.runtime.ready(name):
@@ -398,47 +430,65 @@ class Scheduler:
     async def request(self, name: str):
         if name not in self.resources or self.resources[name]["kind"] != "text":
             raise AdmissionError(404, "model is not configured", "model_not_found")
-        limit = self.resources[name].get("concurrency", 1)
-        if self.active.get(name, 0) >= limit:
-            raise AdmissionError(429, "model is serving its maximum concurrent requests", "model_busy")
-        lock = ResourceLock(self.lock_dir, name)
-        if not lock.acquire():
-            raise AdmissionError(503, "model is being evicted; retry shortly", "model_transition")
-        self.active[name] = self.active.get(name, 0) + 1
-        owned = None
-        admitted = False
-        try:
-            owned = OwnedRequest(self.lock_dir.parent / "requests", name).begin()
-            # Finish admission cleanup even if its client disappears during a
-            # slow load; otherwise an unaccounted process could keep loading.
-            task = asyncio.create_task(self.admit(name))
+        async with self.execution.hold():
+            limit = self.resources[name].get(
+                "concurrency_limit", self.resources[name].get("concurrency", 1)
+            )
+            if self.active.get(name, 0) >= limit:
+                raise AdmissionError(429, "model is serving its maximum concurrent requests", "model_busy")
+            lock = ResourceLock(self.lock_dir, name)
+            if not lock.acquire():
+                raise AdmissionError(503, "model is being evicted; retry shortly", "model_transition")
+            self.active[name] = self.active.get(name, 0) + 1
+            owned = None
+            admitted = False
             try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                task.cancel()
+                owned = OwnedRequest(self.lock_dir.parent / "requests", name).begin()
+                # Finish admission cleanup even if its client disappears during a
+                # slow load; otherwise an unaccounted process could keep loading.
+                task = asyncio.create_task(self.admit(name, wait_for_idle=True))
                 try:
-                    await finish_shielded(task)
+                    await asyncio.shield(task)
                 except asyncio.CancelledError:
-                    pass
+                    task.cancel()
+                    try:
+                        await finish_shielded(task)
+                    except asyncio.CancelledError:
+                        pass
+                    raise
+                admitted = True
+                yield
+            except BaseException as error:
+                if owned is not None:
+                    if admitted:
+                        owned.detach()
+                        if isinstance(error, asyncio.CancelledError):
+                            await finish_shielded(
+                                asyncio.create_task(self._wait_until_idle(name))
+                            )
+                    else:
+                        # Rejected admission never transferred work to this
+                        # request. Keeping its record would grow diagnostics and
+                        # disk use during ordinary capacity pressure.
+                        owned.close()
                 raise
-            admitted = True
-            yield
-        except BaseException:
-            if owned is not None:
-                if admitted:
-                    owned.detach()
-                else:
-                    # Rejected admission never transferred work to this
-                    # request. Keeping its record would grow diagnostics and
-                    # disk use during ordinary capacity pressure.
+            else:
+                if owned is not None:
                     owned.close()
-            raise
-        else:
-            if owned is not None:
-                owned.close()
-        finally:
-            self.active[name] -= 1
-            lock.close()
+            finally:
+                self.active[name] -= 1
+                lock.close()
+
+    async def _wait_until_idle(self, name: str) -> None:
+        """Keep the global execution lease while cancelled GPU work drains."""
+        while True:
+            try:
+                busy = await self.runtime.busy(name)
+            except Exception:
+                busy = None
+            if busy is False:
+                return
+            await asyncio.sleep(0.1)
 
     async def reap(self) -> None:
         if self.transition.locked():
@@ -509,7 +559,10 @@ class Scheduler:
 
 
 def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=Runtime) -> tuple[web.Application, web.Application]:
-    public = web.Application(client_max_size=32 * MIB, middlewares=[safe_errors, auth_middleware(api_key), IngressGate(2).middleware])
+    request_limit = policy.get("public_request_limit", 4)
+    if not isinstance(request_limit, int) or isinstance(request_limit, bool) or request_limit < 1:
+        raise ValueError("public request limit must be a positive integer")
+    public = web.Application(client_max_size=32 * MIB, middlewares=[safe_errors, auth_middleware(api_key), IngressGate(request_limit).middleware])
     local = web.Application(client_max_size=4096, middlewares=[safe_errors])
     state = {}
 
@@ -568,13 +621,16 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 diagnostics[filename.removesuffix(".json")] = {"state": "uninitialized"}
             except (OSError, ValueError):
                 diagnostics[filename.removesuffix(".json")] = {"state": "invalid", "ready": False}
-        return web.json_response({"models": {name: {"state": value, "active_requests": scheduler.active.get(name, 0), "last_request_age_s": scheduler.clock() - scheduler.last_used.get(name, scheduler.clock()), **{key: resources[name][key] for key in ("gpu_bytes", "host_bytes", "context_tokens")}} for name, value in scheduler.states.items()}, "recovery": {name: {**value, "retry_in_s": max(0, value.get("next_retry", 0) - scheduler.clock())} for name, value in scheduler.recovery.items()}, "ownership": [{key: record.get(key) for key in ("id", "resource", "pid", "phase", "boot_id")} for record in records(scheduler.lock_dir.parent / "requests")], "source": revision, "host": diagnostics})
+        return web.json_response({"models": {name: {"state": value, "active_requests": scheduler.active.get(name, 0), "last_request_age_s": scheduler.clock() - scheduler.last_used.get(name, scheduler.clock()), **{key: resources[name].get(key) for key in ("gpu_bytes", "host_bytes", "context_tokens", "memory", "artifact_identity", "artifact_fingerprint", "runtime_identity", "supported_request_shapes", "concurrency_limit")}} for name, value in scheduler.states.items()}, "recovery": {name: {**value, "retry_in_s": max(0, value.get("next_retry", 0) - scheduler.clock())} for name, value in scheduler.recovery.items()}, "ownership": [{key: record.get(key) for key in ("id", "resource", "pid", "phase", "boot_id")} for record in records(scheduler.lock_dir.parent / "requests")], "source": revision, "host": diagnostics})
 
     async def admit(request: web.Request):
         body = await read_json(request)
         name = body.get("resource") if isinstance(body, dict) else None
+        wait_for_idle = body.get("wait_for_idle", True) if isinstance(body, dict) else None
         if not isinstance(name, str) or name not in resources or resources[name]["kind"] != "service":
             raise AdmissionError(404, "resource is not configured", "model_not_found")
+        if not isinstance(wait_for_idle, bool):
+            raise ValueError("wait_for_idle must be a boolean")
         # The adapter holds a shared flock before requesting admission. It
         # remains the active-work signal even if this process restarts.
         lock = ResourceLock(state["scheduler"].lock_dir, name, exclusive=True)
@@ -583,7 +639,7 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 raise AdmissionError(400, "an active resource lease is required", "lease_required")
         finally:
             lock.close()
-        task = asyncio.create_task(state["scheduler"].admit(name))
+        task = asyncio.create_task(state["scheduler"].admit(name, wait_for_idle=wait_for_idle))
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
@@ -594,7 +650,11 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 pass
             raise
         generation = await state["runtime"].generation(name) if hasattr(state["runtime"], "generation") else None
-        return web.json_response({"ok": True, "generation": generation})
+        return web.json_response({
+            "ok": True,
+            "generation": generation,
+            "concurrency_limit": resources[name].get("concurrency_limit", 1),
+        })
 
     async def proxy(request: web.Request):
         path, model, body = request.path, None, None

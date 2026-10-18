@@ -6,6 +6,7 @@ import asyncio
 import fcntl
 import json
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -68,6 +69,84 @@ class ResourceLock:
             self.fd = None
 
 
+class SerializedExecution:
+    """FIFO serialize GPU work across broker and adapter processes on this host."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.queue = directory / "execution-queue"
+
+    async def _new_ticket(self) -> tuple[Path, int]:
+        lock = ResourceLock(self.queue, "tickets", exclusive=True)
+        while not lock.acquire():
+            await asyncio.sleep(0.025)
+        path: Path | None = None
+        fd: int | None = None
+        try:
+            sequence_path = self.queue / "sequence"
+            sequence_fd = os.open(
+                sequence_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+            )
+            try:
+                raw = os.read(sequence_fd, 64).decode("ascii").strip()
+                sequence = int(raw or "0") + 1
+                os.lseek(sequence_fd, 0, os.SEEK_SET)
+                os.ftruncate(sequence_fd, 0)
+                os.write(sequence_fd, str(sequence).encode("ascii"))
+                os.fsync(sequence_fd)
+            finally:
+                os.close(sequence_fd)
+            path = self.queue / f"{sequence:020d}-{uuid.uuid4().hex}.ticket"
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return path, fd
+        except BaseException:
+            if fd is not None:
+                os.close(fd)
+            if path is not None:
+                path.unlink(missing_ok=True)
+            raise
+        finally:
+            lock.close()
+
+    def _is_head(self, ticket: Path) -> bool:
+        queue_lock = ResourceLock(self.queue, "tickets", exclusive=True)
+        if not queue_lock.acquire():
+            return False
+        try:
+            for entry in sorted(self.queue.glob("*.ticket")):
+                if entry == ticket:
+                    return True
+                fd = os.open(entry, os.O_RDWR | os.O_NOFOLLOW)
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        return False
+                    entry.unlink(missing_ok=True)
+                finally:
+                    os.close(fd)
+            return False
+        finally:
+            queue_lock.close()
+
+    @asynccontextmanager
+    async def hold(self):
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.queue.mkdir(mode=0o700, exist_ok=True)
+        ticket, ticket_fd = await self._new_ticket()
+        execution = ResourceLock(self.directory, "global-execution", exclusive=True)
+        try:
+            while not self._is_head(ticket) or not execution.acquire():
+                await asyncio.sleep(0.025)
+            ticket.unlink(missing_ok=True)
+            yield
+        finally:
+            execution.close()
+            os.close(ticket_fd)
+            ticket.unlink(missing_ok=True)
+
+
 class SchedulerClient:
     def __init__(self, socket_path: str = "", *, timeout: float | None = None):
         self.socket_path = socket_path
@@ -76,6 +155,11 @@ class SchedulerClient:
         self.timeout = None
         self.slots: dict[str, asyncio.Semaphore] = {}
         self.generations: dict[str, str | None] = {}
+        self.execution = (
+            SerializedExecution(Path(socket_path).parent / "leases")
+            if socket_path
+            else None
+        )
 
     async def ready(self) -> bool:
         if not self.socket_path:
@@ -88,10 +172,21 @@ class SchedulerClient:
             return False
 
     @asynccontextmanager
-    async def lease(self, resource: str, *, exclusive: bool = False):
+    async def lease(self, resource: str, *, exclusive: bool = False, wait_for_idle: bool = True):
         if not self.socket_path:
             yield {}
             return
+        assert self.execution is not None
+        async with self.execution.hold():
+            async with self._lease(
+                resource, exclusive=exclusive, wait_for_idle=wait_for_idle
+            ) as admission:
+                yield admission
+
+    @asynccontextmanager
+    async def _lease(
+        self, resource: str, *, exclusive: bool = False, wait_for_idle: bool = True
+    ):
         directory = Path(self.socket_path).parent
         (directory / "leases").mkdir(mode=0o700, parents=True, exist_ok=True)
         lock = ResourceLock(directory / "leases", resource, exclusive=exclusive)
@@ -104,7 +199,10 @@ class SchedulerClient:
                 owned = OwnedRequest(directory / "requests", resource).begin()
                 connector = aiohttp.UnixConnector(path=self.socket_path)
                 async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=None, sock_read=None, connect=10)) as session:
-                    async with session.post("http://scheduler/admit", json={"resource": resource}) as response:
+                    async with session.post(
+                        "http://scheduler/admit",
+                        json={"resource": resource, "wait_for_idle": wait_for_idle},
+                    ) as response:
                         body = decode_json(await read_limited(response, 64 * 1024, check_status=False))
                         if not isinstance(body, dict):
                             raise AdmissionError(503, "invalid scheduler admission response", "scheduler_unavailable")
@@ -134,19 +232,25 @@ class SchedulerClient:
             lock.close()
 
     async def run(self, resource: str, operation: Callable[[], Awaitable[T]], *, concurrency: int = 1) -> T:
-        slot = self.slots.setdefault(resource, asyncio.Semaphore(concurrency))
-        if slot.locked():
-            raise AdmissionError(429, "model is serving its maximum concurrent requests", "model_busy")
-        async with slot, self.lease(resource):
-            task = asyncio.create_task(operation())
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                # Operations now use cancellable async HTTP. Drain their owned
-                # cleanup before releasing the flock; record uncertain work.
-                task.cancel()
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("concurrency must be a positive integer")
+        async with self.lease(resource) as admission:
+            profile_limit = admission.get("concurrency_limit", concurrency)
+            if isinstance(profile_limit, bool) or not isinstance(profile_limit, int) or profile_limit < 1:
+                raise AdmissionError(503, "scheduler returned an invalid concurrency limit", "scheduler_unavailable")
+            slot = self.slots.setdefault(
+                resource, asyncio.Semaphore(min(concurrency, profile_limit))
+            )
+            async with slot:
+                task = asyncio.create_task(operation())
                 try:
-                    await finish_shielded(task)
+                    return await asyncio.shield(task)
                 except asyncio.CancelledError:
-                    pass
-                raise
+                    # Operations now use cancellable async HTTP. Drain their owned
+                    # cleanup before releasing the flock; record uncertain work.
+                    task.cancel()
+                    try:
+                        await finish_shielded(task)
+                    except asyncio.CancelledError:
+                        pass
+                    raise
