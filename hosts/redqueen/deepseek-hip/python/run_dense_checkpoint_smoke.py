@@ -358,7 +358,7 @@ def _buffer_at(model, name: str):
     return module._buffers[attribute]
 
 
-def _verify_session_state(model, state, frequency_factory, device, torch) -> None:
+def _verify_session_state(model, state, frequency_factory, engram_hash_states, device, torch) -> None:
     factory_cache_clear = getattr(frequency_factory, "cache_clear", None)
     if callable(factory_cache_clear):
         factory_cache_clear()
@@ -375,6 +375,13 @@ def _verify_session_state(model, state, frequency_factory, device, torch) -> Non
                 if expected.device != device or not torch.equal(values[0], expected):
                     raise AssertionError(f"official rotary values differ: {allocation.names[0]}")
                 del expected
+            elif allocation.kind.startswith("engram_hash_"):
+                module = allocation.runtime_module
+                attribute = allocation.runtime_attribute
+                runtime = engram_hash_states.get(id(module)) if module is not None else None
+                expected = getattr(runtime, "_buffers", {}).get(attribute) if runtime is not None else None
+                if not values or values[0] is not expected:
+                    raise AssertionError(f"pinned Engram hash initialization differs: {allocation.names[0]}")
             elif allocation.kind == "score_state":
                 if not torch.isneginf(values[0]).all().item():
                     raise AssertionError(f"compressor score state was not initialized to -inf: {allocation.names[0]}")
@@ -531,7 +538,8 @@ def _run(options: argparse.Namespace) -> int:
                             f"buffers={estimate.buffer_count}; rotary={estimate.rotary_bytes / _GIB:.3f} GiB; "
                             f"windows={estimate.window_kv_bytes / _GIB:.3f} GiB; "
                             f"compressed KV={estimate.compressed_kv_bytes / _GIB:.3f} GiB; "
-                            f"index cache={estimate.index_cache_bytes / _GIB:.3f} GiB"
+                            f"index cache={estimate.index_cache_bytes / _GIB:.3f} GiB; "
+                            f"Engram hash state={estimate.engram_hash_bytes / (1024 * 1024):.2f} MiB"
                         )
                         prefix = "220k session"
                     else:
@@ -624,11 +632,22 @@ def _run(options: argparse.Namespace) -> int:
                             if module.__class__.__name__ == "Indexer":
                                 module.freqs_cis = None
 
+                    engram_hash_states = {}
+
+                    def engram_hash_factory(module, model_args, target_device):
+                        if module.__class__.__name__ != "NgramHashState":
+                            raise TypeError("session plan requested a non-pinned Engram hash module")
+                        with torch.device(target_device):
+                            materialized = type(module)(model_args, module.layout, tokenizer)
+                        engram_hash_states[id(module)] = materialized
+                        return materialized
+
                     session_state = load_session_state(
                         model,
                         args,
                         device=device,
                         frequency_factory=reference["precompute_freqs_cis"],
+                        engram_hash_factory=engram_hash_factory,
                         admission=admission,
                         fence=fence,
                         reset_runtime_references=reset_runtime_references,
@@ -667,9 +686,11 @@ def _run(options: argparse.Namespace) -> int:
                         model,
                         session_state,
                         reference["precompute_freqs_cis"],
+                        engram_hash_states,
                         device,
                         torch,
                     )
+                    engram_hash_states.clear()
                     if options.forward_smoke:
                         run_checkpoint_forward_smoke(
                             kernel=kernel,
@@ -710,6 +731,7 @@ def _run(options: argparse.Namespace) -> int:
                             f"before={free_gtt_before}, after={free_gtt_after}"
                         )
                 finally:
+                    engram_hash_states.clear()
                     if session_state is not None and not session_state._closed and not session_state._quarantined:
                         session_state.close()
                     if dense_state is not None and not dense_state._closed and not dense_state._quarantined:
@@ -724,7 +746,8 @@ def _run(options: argparse.Namespace) -> int:
                     f"session peak={session_peak_bytes / _GIB:.3f} GiB; "
                     f"allocator-reserved peak={session_reserved_peak_bytes / _GIB:.3f} GiB; "
                     f"direct={direct_name}; wo_a={wo_a_name}; "
-                    "routed experts and Engram tables remained meta; all 220k session buffers matched "
+                    "routed experts and Engram tables remained meta; Engram hash buffers came from the "
+                    "pinned constructor; all 220k session buffers matched "
                     "official initialization; close restored checkpoint/session state and returned GTT backing"
                 )
     finally:
