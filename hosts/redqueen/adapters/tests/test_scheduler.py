@@ -1027,6 +1027,16 @@ class ProfileTest(unittest.TestCase):
             profile["gateway_url"] = "http://example.com:8085"
             with self.assertRaisesRegex(ValueError, "direct OpenAI service contract"):
                 verify_profiles(document)
+            for field, suffix in (
+                ("gateway_url", ""),
+                ("slots_url", "/slots"),
+                ("health_url", "/health"),
+            ):
+                original = profile[field]
+                profile[field] = f"http://127.0.0.1:0{suffix}"
+                with self.assertRaisesRegex(ValueError, "direct OpenAI service contract"):
+                    verify_profiles(document)
+                profile[field] = original
             path.write_text("context=220000")
             with self.assertRaises(ValueError):
                 verify_profiles(document)

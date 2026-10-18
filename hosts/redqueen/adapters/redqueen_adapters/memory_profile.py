@@ -36,6 +36,7 @@ def _loopback_http_url(value: object, *, path: str | None) -> bool:
         parsed.scheme != "http"
         or hostname is None
         or port is None
+        or port == 0
         or (
             path == "" and parsed.path not in {"", "/"}
         )
