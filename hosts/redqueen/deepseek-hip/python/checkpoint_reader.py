@@ -19,6 +19,7 @@ from typing import Iterator, Mapping, Sequence
 _INDEX_FILE = "model.safetensors.index.json"
 _REVISION_FILE = "SOURCE_REVISION"
 _CHUNK_DIGESTS_FILE = "deepseek-v4.1-flash-1017.chunks.bin"
+_HEADER_DIGESTS_FILE = "deepseek-v4.1-flash-1017.headers.tsv"
 _CHUNK_SIZE = 1024 * 1024
 _CHUNK_DIGEST_BYTES = 32
 _MAX_INDEX_BYTES = 64 * 1024 * 1024
@@ -36,6 +37,7 @@ _DEFAULT_HEADER_LOCK = threading.Lock()
 _DEFAULT_CHUNK_DIGEST_LOCK = threading.Lock()
 _DEFAULT_CHUNK_DIGEST_BYTES: bytes | None = None
 _DEFAULT_CHUNK_DIGESTS_SHA256 = "0fcd23effcbdd2688f54170ed934fd226fd4714f499b91374b25cd898a5b9c6b"
+_DEFAULT_HEADER_DIGESTS_SHA256 = "2f9a260e70ac175304b61ecc5498733b30cb576cbb3f99abd15e1596be7fcbc6"
 _DTYPE_BYTES = {
     "BOOL": 1,
     "U8": 1,
@@ -241,6 +243,9 @@ class SafeTensorCheckpoint:
     Read-memory reservations cover transient buffers; callers must separately account for returned
     bytes they retain.
 
+    ``metadata_only=True`` authenticates each safetensors prefix and header against the pinned
+    header inventory without reading any payload bytes. Payload reads are disabled in that mode.
+
     ``expected_file_inventory`` defaults to the version-controlled model inventory beside this
     module. Its chunk digests default to the versioned binary chunk inventory beside it. Overrides
     must come from another trusted, pinned inventory.
@@ -254,13 +259,19 @@ class SafeTensorCheckpoint:
         index_filename: str = _INDEX_FILE,
         expected_file_inventory: Mapping[str, tuple[int, str]] | None = None,
         expected_chunk_digest_bytes: bytes | None = None,
+        expected_header_inventory: Mapping[str, tuple[int, str]] | None = None,
         read_memory_budget: ReadMemoryBudget | None = None,
         verify_shard_digests: bool = False,
+        metadata_only: bool = False,
     ) -> None:
         if not isinstance(expected_revision, str) or not expected_revision:
             raise ValueError("expected_revision must be a nonempty string")
         if type(verify_shard_digests) is not bool:
             raise ValueError("verify_shard_digests must be a boolean")
+        if type(metadata_only) is not bool:
+            raise ValueError("metadata_only must be a boolean")
+        if metadata_only and verify_shard_digests:
+            raise ValueError("metadata-only checkpoint readers cannot verify full shard digests")
         self.root = Path(root).resolve(strict=True)
         self._lock = threading.Lock()
         self._closed = False
@@ -277,7 +288,6 @@ class SafeTensorCheckpoint:
         self._chunk_digest_offsets: dict[str, int] = {}
         self._read_memory_budget = read_memory_budget or _DEFAULT_READ_MEMORY_BUDGET
         inventory = self._load_default_file_inventory() if expected_file_inventory is None else {}
-        use_default_chunk_digests = expected_file_inventory is None and expected_chunk_digest_bytes is None
         if expected_file_inventory is not None:
             try:
                 inventory = dict(expected_file_inventory)
@@ -293,6 +303,46 @@ class SafeTensorCheckpoint:
                     raise CheckpointError(f"invalid pinned file inventory entry: {filename!r}")
                 normalized_inventory[filename] = (identity[0], identity[1])
             inventory = normalized_inventory
+        if expected_header_inventory is not None:
+            try:
+                header_inventory = dict(expected_header_inventory)
+            except (TypeError, ValueError) as exc:
+                raise CheckpointError("pinned header inventory must be a mapping") from exc
+        elif metadata_only and expected_file_inventory is None:
+            header_inventory = self._load_default_header_inventory(inventory)
+        else:
+            header_inventory = {}
+        normalized_header_inventory: dict[str, tuple[int, str]] = {}
+        for filename, identity in header_inventory.items():
+            if (
+                not self._valid_child_name(filename)
+                or not isinstance(identity, (tuple, list))
+                or len(identity) != 2
+            ):
+                raise CheckpointError(f"invalid pinned header inventory entry: {filename!r}")
+            size, digest = identity
+            if (
+                filename not in inventory
+                or not filename.endswith(".safetensors")
+                or isinstance(size, bool)
+                or not isinstance(size, int)
+                or size != inventory[filename][0]
+                or not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise CheckpointError(f"invalid pinned header identity: {filename!r}")
+            normalized_header_inventory[filename] = (size, digest)
+        expected_shards = {filename for filename in inventory if filename.endswith(".safetensors")}
+        if metadata_only and set(normalized_header_inventory) != expected_shards:
+            raise CheckpointError("pinned header inventory does not cover every safetensors shard")
+        self._expected_header_inventory = MappingProxyType(normalized_header_inventory)
+        self._metadata_only = metadata_only
+        use_default_chunk_digests = (
+            not metadata_only
+            and expected_file_inventory is None
+            and expected_chunk_digest_bytes is None
+        )
         self._expected_file_inventory = MappingProxyType(inventory)
         if expected_chunk_digest_bytes is not None and type(expected_chunk_digest_bytes) is not bytes:
             raise CheckpointError("pinned chunk digests must be bytes")
@@ -350,6 +400,47 @@ class SafeTensorCheckpoint:
             result[filename] = (size, digest)
         if not result:
             raise CheckpointError("pinned file inventory contains no safetensors shards")
+        return result
+
+    @staticmethod
+    def _load_default_header_inventory(
+        inventory: Mapping[str, tuple[int, str]],
+    ) -> dict[str, tuple[int, str]]:
+        manifest_path = Path(__file__).resolve().parents[2] / "models" / _HEADER_DIGESTS_FILE
+        try:
+            raw = _read_regular_path(
+                manifest_path, limit=16 * 1024, description="pinned safetensors header inventory"
+            )
+        except CheckpointError as exc:
+            raise CheckpointError(f"cannot read pinned safetensors header inventory: {manifest_path}") from exc
+        if hashlib.sha256(raw).hexdigest() != _DEFAULT_HEADER_DIGESTS_SHA256:
+            raise CheckpointError("pinned safetensors header inventory does not match its SHA-256")
+        result: dict[str, tuple[int, str]] = {}
+        try:
+            lines = raw.decode("ascii").splitlines()
+        except UnicodeDecodeError as exc:
+            raise CheckpointError("pinned safetensors header inventory is not ASCII") from exc
+        for line_number, line in enumerate(lines, 1):
+            fields = line.split("\t")
+            if len(fields) != 3:
+                raise CheckpointError(f"invalid pinned safetensors header row {line_number}")
+            filename, size_text, digest = fields
+            if filename in result or filename not in inventory:
+                raise CheckpointError(f"invalid or duplicate pinned header name at row {line_number}")
+            try:
+                size = int(size_text)
+            except ValueError as exc:
+                raise CheckpointError(f"invalid pinned header size at row {line_number}") from exc
+            if (
+                size != inventory[filename][0]
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise CheckpointError(f"invalid pinned header identity at row {line_number}")
+            result[filename] = (size, digest)
+        expected_shards = {filename for filename in inventory if filename.endswith(".safetensors")}
+        if set(result) != expected_shards:
+            raise CheckpointError("pinned safetensors header inventory does not cover every shard")
         return result
 
     def _load_default_chunk_digests(
@@ -518,7 +609,7 @@ class SafeTensorCheckpoint:
                     f"pinned chunk digest size is {len(self._chunk_digest_bytes)} bytes; "
                     f"expected {expected_digest_bytes}"
                 )
-        elif not self._verify_shard_digests:
+        elif not self._verify_shard_digests and not self._metadata_only:
             raise CheckpointError(
                 "pinned chunk digests are required unless full shard SHA-256 verification is enabled"
             )
@@ -686,12 +777,20 @@ class SafeTensorCheckpoint:
                 else _file_identity(shard_stat)
             )
             file_size = os.fstat(fd).st_size
-            first_chunk = self._read_verified_chunk(fd, filename, 0, file_identity)
-            prefix = first_chunk[:8]
+            if self._metadata_only:
+                prefix = self._pread_exact(fd, 8, 0)
+            else:
+                first_chunk = self._read_verified_chunk(fd, filename, 0, file_identity)
+                prefix = first_chunk[:8]
             header_size = struct.unpack("<Q", prefix)[0]
             if header_size == 0 or header_size > _MAX_HEADER_BYTES or header_size + 8 > file_size:
                 raise CheckpointError(f"invalid safetensors header size in {filename}")
-            if header_size + 8 <= len(first_chunk):
+            if self._metadata_only:
+                raw_header = self._pread_exact(fd, header_size, 8)
+                expected_header = self._expected_header_inventory[filename][1]
+                if hashlib.sha256(prefix + raw_header).hexdigest() != expected_header:
+                    raise CheckpointError(f"header does not match pinned SHA-256: {filename}")
+            elif header_size + 8 <= len(first_chunk):
                 raw_header = first_chunk[8 : 8 + header_size]
             else:
                 raw_header = self._read_verified_range(
@@ -831,6 +930,8 @@ class SafeTensorCheckpoint:
             done += len(chunk)
 
     def _open_verified(self, info: TensorInfo) -> int:
+        if self._metadata_only:
+            raise CheckpointError("checkpoint payload reads are disabled in metadata-only mode")
         filename = info.filename
         fd, file_stat = self._open_child(filename, "checkpoint shard")
         try:

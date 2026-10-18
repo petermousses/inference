@@ -58,6 +58,18 @@ def chunk_digest_bytes(root: Path, inventory: dict[str, tuple[int, str]]) -> byt
     return b"".join(digests)
 
 
+def header_inventory(root: Path, inventory: dict[str, tuple[int, str]]) -> dict[str, tuple[int, str]]:
+    result = {}
+    for filename, (size, _) in inventory.items():
+        if not filename.endswith(".safetensors"):
+            continue
+        raw = (root / filename).read_bytes()
+        prefix = raw[:8]
+        header_size = struct.unpack("<Q", prefix)[0]
+        result[filename] = (size, hashlib.sha256(prefix + raw[8 : 8 + header_size]).hexdigest())
+    return result
+
+
 class SafeTensorCheckpointTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -176,6 +188,74 @@ class SafeTensorCheckpointTest(unittest.TestCase):
             with source:
                 self.assertEqual(source.read_tensor_bytes("scalar"), b"xyz")
                 self.assertEqual(source.read_tensor_bytes("other"), b"\x00\x00")
+
+    def test_metadata_only_reads_pinned_headers_and_rejects_payload_reads(self):
+        ranges = []
+        pread = os.pread
+        shard_names = {
+            (path.stat().st_dev, path.stat().st_ino): path.name
+            for path in self.root.glob("*.safetensors")
+        }
+
+        def record_pread(fd, size, offset):
+            result = pread(fd, size, offset)
+            identity = os.fstat(fd)
+            ranges.append((shard_names[(identity.st_dev, identity.st_ino)], offset, len(result)))
+            return result
+
+        with patch.object(checkpoint_reader.os, "pread", side_effect=record_pread):
+            with SafeTensorCheckpoint(
+                self.root,
+                expected_revision="abc123",
+                expected_file_inventory=self.inventory,
+                expected_header_inventory=header_inventory(self.root, self.inventory),
+                metadata_only=True,
+            ) as source:
+                self.assertEqual(source.tensor_count, 3)
+                self.assertEqual(set(source.tensors), {"table", "scalar", "other"})
+                for name in source.tensors:
+                    source.tensors[name]
+                self.assertEqual(source.tensors["table"].shape, (5, 2))
+                ranges_before_payload_attempt = len(ranges)
+                with self.assertRaisesRegex(CheckpointError, "payload reads are disabled"):
+                    source.read_tensor_bytes("scalar")
+
+        self.assertGreater(ranges_before_payload_attempt, 0)
+        for filename, (_size, _) in self.inventory.items():
+            if not filename.endswith(".safetensors"):
+                continue
+            raw = (self.root / filename).read_bytes()
+            header_end = 8 + struct.unpack("<Q", raw[:8])[0]
+            file_ranges = [(offset, amount) for name, offset, amount in ranges if name == filename]
+            self.assertTrue(any(offset == 0 and amount == 8 for offset, amount in file_ranges))
+            self.assertTrue(any(offset == 8 and amount == header_end - 8 for offset, amount in file_ranges))
+            self.assertTrue(all(offset + amount <= header_end for offset, amount in file_ranges))
+
+    def test_metadata_only_rejects_unpinned_header(self):
+        expected_headers = header_inventory(self.root, self.inventory)
+        filename, (size, digest) = next(iter(expected_headers.items()))
+        expected_headers[filename] = (size, "0" * 64 if digest != "0" * 64 else "1" * 64)
+        with SafeTensorCheckpoint(
+            self.root,
+            expected_revision="abc123",
+            expected_file_inventory=self.inventory,
+            expected_header_inventory=expected_headers,
+            metadata_only=True,
+        ) as source:
+            with self.assertRaisesRegex(CheckpointError, "header does not match pinned SHA-256"):
+                source.tensors[next(iter(source.tensors))]
+
+    def test_metadata_only_requires_header_inventory_for_every_shard(self):
+        expected_headers = header_inventory(self.root, self.inventory)
+        expected_headers.pop(next(iter(expected_headers)))
+        with self.assertRaisesRegex(CheckpointError, "does not cover every safetensors shard"):
+            SafeTensorCheckpoint(
+                self.root,
+                expected_revision="abc123",
+                expected_file_inventory=self.inventory,
+                expected_header_inventory=expected_headers,
+                metadata_only=True,
+            )
 
     def test_chunk_hash_rejects_same_size_payload_tampering(self):
         expected_chunks = chunk_digest_bytes(self.root, self.inventory)
@@ -381,6 +461,17 @@ class SafeTensorCheckpointTest(unittest.TestCase):
         self.assertEqual(
             hashlib.sha256(digests).hexdigest(),
             checkpoint_reader._DEFAULT_CHUNK_DIGESTS_SHA256,
+        )
+
+    def test_loads_pinned_header_digest_manifest(self):
+        inventory = SafeTensorCheckpoint._load_default_file_inventory()
+        headers = SafeTensorCheckpoint._load_default_header_inventory(inventory)
+        self.assertEqual(len(headers), 48)
+        self.assertEqual(
+            hashlib.sha256(
+                (Path(__file__).resolve().parents[2] / "models" / "deepseek-v4.1-flash-1017.headers.tsv").read_bytes()
+            ).hexdigest(),
+            checkpoint_reader._DEFAULT_HEADER_DIGESTS_SHA256,
         )
 
     def test_support_file_reader_rejects_symlinks_and_fifos(self):
