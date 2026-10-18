@@ -44,11 +44,22 @@ class _Cache:
     def resize_when_idle(self, capacity_bytes, *, after_drop=None):
         self.events.append("resize")
         self.resize_calls.append(capacity_bytes)
-        self._stats = SimpleNamespace(
-            **{**vars(self._stats), "capacity_bytes": capacity_bytes}
+        pending_release = (
+            self._stats.pending_backing_release
+            or capacity_bytes < self._stats.capacity_bytes
         )
-        if after_drop is not None:
+        self._stats = SimpleNamespace(
+            **{
+                **vars(self._stats),
+                "capacity_bytes": capacity_bytes,
+                "pending_backing_release": pending_release,
+            }
+        )
+        if after_drop is not None and pending_release:
             after_drop()
+            self._stats = SimpleNamespace(
+                **{**vars(self._stats), "pending_backing_release": False}
+            )
         return ExpertCacheResize(self._stats, evicted_logical_bytes=64)
 
 
@@ -230,6 +241,68 @@ class CachedMoEInstallationTest(unittest.TestCase):
 
 
 class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_cache_resize_rejects_async_allocator_callback_before_mutation(self):
+        events = []
+        cache = _Cache(events)
+
+        async def release_allocator():
+            events.append("async-allocator-release")
+
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            with self.assertRaisesRegex(TypeError, "release_allocator must be synchronous"):
+                await installation.resize_cache(0, release_allocator=release_allocator)
+
+        self.assertEqual(cache.resize_calls, [])
+        self.assertEqual(cache.stats.capacity_bytes, 100)
+        self.assertFalse(cache.stats.pending_backing_release)
+        self.assertEqual(events, [])
+
+    async def test_cache_resize_rejects_async_fence_before_mutation(self):
+        events = []
+        cache = _Cache(events)
+
+        async def fence():
+            events.append("async-fence")
+
+        with _installation(cache, fence) as installation:
+            with self.assertRaisesRegex(TypeError, "GPU fence must be synchronous"):
+                await installation.resize_cache(
+                    0, release_allocator=lambda: events.append("allocator-release")
+                )
+
+        self.assertEqual(cache.resize_calls, [])
+        self.assertEqual(cache.stats.capacity_bytes, 100)
+        self.assertFalse(cache.stats.pending_backing_release)
+        self.assertEqual(events, [])
+
+    async def test_cache_resize_keeps_release_pending_for_awaitable_result(self):
+        events = []
+        cache = _Cache(events)
+        release_body_calls = []
+
+        async def async_release_body():
+            release_body_calls.append("released")
+
+        def awaitable_release():
+            return async_release_body()
+
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            with self.assertRaisesRegex(TypeError, "returned an awaitable"):
+                await installation.resize_cache(0, release_allocator=awaitable_release)
+
+            self.assertTrue(cache.stats.pending_backing_release)
+            self.assertEqual(cache.resize_calls, [0])
+            self.assertEqual(release_body_calls, [])
+
+            result = await installation.resize_cache(
+                0, release_allocator=lambda: events.append("allocator-release")
+            )
+
+        self.assertFalse(result.stats.pending_backing_release)
+        self.assertEqual(cache.resize_calls, [0, 0])
+        self.assertEqual(release_body_calls, [])
+        self.assertIn("allocator-release", events)
+
     async def test_cache_resize_fences_and_releases_allocator_at_worker_boundary(self):
         events = []
         cache = _Cache(events)

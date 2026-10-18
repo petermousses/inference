@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import threading
 from collections.abc import Callable
@@ -144,17 +145,17 @@ class CachedMoEInstallation:
         confirm actual host/GTT availability after this operation before
         admitting another worker. The host broker must serialize this control
         call with requests across workers; this lock protects only this model
-        graph. Allocator release runs only when capacity shrinks or entries are
-        evicted, so cache growth preserves reusable allocator blocks.
+        graph. Allocator release runs only while backing release is pending,
+        including after a shrink, eviction, or failed release callback.
         """
         if isinstance(capacity_bytes, bool) or type(capacity_bytes) is not int or capacity_bytes < 0:
             raise ValueError("cache capacity must be a nonnegative integer")
         if not callable(self._fence):
             raise ValueError("cached MoE installation requires a final GPU fence")
-        if not callable(release_allocator):
-            raise TypeError("release_allocator must be callable")
-        if worker_context is not None and not callable(worker_context):
-            raise TypeError("worker_context must be callable")
+        _validate_sync_callable(self._fence, "GPU fence")
+        _validate_sync_callable(release_allocator, "release_allocator")
+        if worker_context is not None:
+            _validate_sync_callable(worker_context, "worker_context")
         if not callable(getattr(self._cache, "resize_when_idle", None)):
             raise TypeError("cache must support resize_when_idle")
         if not callable(getattr(self._cache, "quarantine", None)):
@@ -374,18 +375,22 @@ def _resize_cache_sync(
     release_allocator: Callable[[], None],
     worker_context: Callable[[], object] | None,
 ) -> ExpertCacheResize:
-    context = worker_context() if worker_context is not None else nullcontext()
+    context = (
+        _call_sync(worker_context, "worker_context")
+        if worker_context is not None
+        else nullcontext()
+    )
     with context:
         try:
-            fence()
+            _call_sync(fence, "GPU fence")
         except BaseException as fence_error:
             _quarantine_after_fence_failure(cache, fence_error)
             raise
 
         def release_and_fence() -> None:
-            release_allocator()
+            _call_sync(release_allocator, "release_allocator")
             try:
-                fence()
+                _call_sync(fence, "GPU fence")
             except BaseException as fence_error:
                 _quarantine_after_fence_failure(cache, fence_error)
                 raise
@@ -418,3 +423,31 @@ def _quarantine_after_fence_failure(cache: object, fence_error: BaseException) -
     except BaseException as quarantine_error:
         if hasattr(fence_error, "add_note"):
             fence_error.add_note(f"cache quarantine also failed: {quarantine_error!r}")
+
+
+def _validate_sync_callable(callback: Callable[..., object], name: str) -> None:
+    if not callable(callback):
+        raise TypeError(f"{name} must be callable")
+    if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
+        getattr(callback, "__call__", None)
+    ):
+        raise TypeError(f"{name} must be synchronous")
+
+
+def _call_sync(callback: Callable[..., _T], name: str) -> _T:
+    result = callback()
+    if inspect.isawaitable(result):
+        close = getattr(result, "close", None)
+        cancel = getattr(result, "cancel", None)
+        try:
+            if callable(close):
+                close()
+            elif callable(cancel):
+                cancel()
+        except BaseException as cleanup_error:
+            error = TypeError(f"{name} returned an awaitable; callbacks must be synchronous")
+            if hasattr(error, "add_note"):
+                error.add_note(f"awaitable cleanup also failed: {cleanup_error!r}")
+            raise error from cleanup_error
+        raise TypeError(f"{name} returned an awaitable; callbacks must be synchronous")
+    return result
