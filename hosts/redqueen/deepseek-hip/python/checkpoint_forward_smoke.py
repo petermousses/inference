@@ -11,11 +11,13 @@ from cached_model import install_cached_moe
 from engram_rows import install_engram_row_reads
 from expert_cache import FP4ExpertCache, FP4ExpertKey
 from expert_weights import estimate_fp4_expert_memory, load_fp4_expert
+from tiled_indexer import install_tiled_indexer
 
 
 _GIB = 1024**3
 _FORWARD_PEAK_BUDGET = 8 * _GIB
 _EXPERT_CACHE_CAPACITY = 1 * _GIB
+_INDEXER_QUERY_TILE_ROWS = 64
 
 
 def run_checkpoint_forward_smoke(
@@ -235,6 +237,9 @@ def run_checkpoint_forward_smoke(
                     if not torch.isfinite(confidence).all().item():
                         raise RuntimeError("pinned DSpark graph returned non-finite confidence")
 
+                # Candidate masks are per-prefill scratch, not session state.
+                model_globals["shared_attn"].candidates = None
+
                 result = {
                     "name": name,
                     "input_token_count": input_token_count,
@@ -267,6 +272,7 @@ def run_checkpoint_forward_smoke(
                 )
             return result
         except BaseException:
+            model_globals["shared_attn"].candidates = None
             if not cache.stats.quarantined:
                 request_fence()
                 cache.resize_when_idle(0, after_drop=request_release_allocator)
@@ -277,7 +283,9 @@ def run_checkpoint_forward_smoke(
     model_globals["apply_rotary_emb"] = native_rope
     text_result = image_result = None
     try:
-        with install_engram_row_reads(model, checkpoint) as engram_installation:
+        with install_tiled_indexer(
+            reference, query_tile_rows=_INDEXER_QUERY_TILE_ROWS
+        ), install_engram_row_reads(model, checkpoint) as engram_installation:
             original_lookups = {}
             for layer_id, reader in engram_installation.readers.items():
                 engram_lookups[layer_id] = 0
