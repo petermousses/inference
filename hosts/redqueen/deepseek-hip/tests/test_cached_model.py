@@ -9,17 +9,47 @@ from unittest.mock import patch
 
 import cached_model
 from cached_model import install_cached_moe
+from expert_cache import ExpertCacheResize
 
 
 class _Cache:
-    def __init__(self):
+    def __init__(self, events=None):
         self.quarantined = False
+        self.events = events if events is not None else []
+        self.resize_calls = []
+        self._stats = SimpleNamespace(
+            capacity_bytes=100,
+            resident_bytes=0,
+            loading_bytes=0,
+            releasing_bytes=0,
+            leased_bytes=0,
+            idle_bytes=0,
+            entries=0,
+            pending_loads=0,
+            pending_backing_release=False,
+            quarantined=False,
+            within_capacity=True,
+        )
 
     def acquire(self, key):
         raise AssertionError("the patched-forward tests replace execute_cached_moe")
 
     def quarantine(self):
         self.quarantined = True
+
+    @property
+    def stats(self):
+        return self._stats
+
+    def resize_when_idle(self, capacity_bytes, *, after_drop=None):
+        self.events.append("resize")
+        self.resize_calls.append(capacity_bytes)
+        self._stats = SimpleNamespace(
+            **{**vars(self._stats), "capacity_bytes": capacity_bytes}
+        )
+        if after_drop is not None:
+            after_drop()
+        return ExpertCacheResize(self._stats, evicted_logical_bytes=64)
 
 
 class _Reservation:
@@ -200,6 +230,152 @@ class CachedMoEInstallationTest(unittest.TestCase):
 
 
 class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_cache_resize_fences_and_releases_allocator_at_worker_boundary(self):
+        events = []
+        cache = _Cache(events)
+
+        class WorkerContext:
+            def __enter__(self):
+                events.append("worker-enter")
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("worker-exit")
+
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            result = await installation.resize_cache(
+                32,
+                release_allocator=lambda: events.append("allocator-release"),
+                worker_context=WorkerContext,
+            )
+
+        self.assertEqual(
+            events,
+            ["worker-enter", "fence", "resize", "allocator-release", "fence", "worker-exit"],
+        )
+        self.assertEqual(cache.resize_calls, [32])
+        self.assertEqual(result.evicted_logical_bytes, 64)
+        self.assertEqual(result.stats.capacity_bytes, 32)
+
+    async def test_cache_resize_fence_failure_quarantines_without_releasing(self):
+        events = []
+        cache = _Cache(events)
+        fence_calls = 0
+
+        def fence():
+            nonlocal fence_calls
+            fence_calls += 1
+            events.append("fence")
+            if fence_calls == 1:
+                raise RuntimeError("GPU fence failed")
+
+        with _installation(cache, fence) as installation:
+            with self.assertRaisesRegex(RuntimeError, "GPU fence failed"):
+                await installation.resize_cache(
+                    0, release_allocator=lambda: events.append("allocator-release")
+                )
+
+        self.assertTrue(cache.quarantined)
+        self.assertEqual(events, ["fence"])
+        self.assertEqual(cache.resize_calls, [])
+
+    async def test_cache_resize_waits_until_model_execution_is_fenced(self):
+        events = []
+        cache = _Cache(events)
+        reservation = _Reservation(events)
+        operation_started = threading.Event()
+        release_operation = threading.Event()
+        resize_started = threading.Event()
+
+        def operation():
+            operation_started.set()
+            if not release_operation.wait(3):
+                raise TimeoutError("test did not release model operation")
+            events.append("operation-finished")
+
+        real_resize = cache.resize_when_idle
+
+        def resize(capacity_bytes, *, after_drop=None):
+            resize_started.set()
+            return real_resize(capacity_bytes, after_drop=after_drop)
+
+        cache.resize_when_idle = resize
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            execution = asyncio.create_task(
+                installation.run_reserved_sync(operation, reservation)
+            )
+            self.assertTrue(await asyncio.to_thread(operation_started.wait, 2))
+            resizing = asyncio.create_task(
+                installation.resize_cache(
+                    32, release_allocator=lambda: events.append("allocator-release")
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(resize_started.is_set())
+            self.assertFalse(resizing.done())
+            release_operation.set()
+            await execution
+            await resizing
+
+        self.assertTrue(resize_started.is_set())
+        self.assertLess(events.index("fence"), events.index("resize"))
+        self.assertLess(events.index("allocator-release"), len(events))
+
+    async def test_cancelled_resize_keeps_execution_lock_until_allocator_returns(self):
+        events = []
+        cache = _Cache(events)
+        reservation = _Reservation(events)
+        allocator_started = threading.Event()
+        release_allocator = threading.Event()
+        second_started = threading.Event()
+
+        def slow_allocator_release():
+            events.append("allocator-start")
+            allocator_started.set()
+            if not release_allocator.wait(3):
+                raise TimeoutError("test did not release allocator")
+            events.append("allocator-finished")
+
+        with _installation(cache, lambda: events.append("fence")) as installation:
+            resize = asyncio.create_task(
+                installation.resize_cache(
+                    32, release_allocator=slow_allocator_release
+                )
+            )
+            self.assertTrue(await asyncio.to_thread(allocator_started.wait, 2))
+            resize.cancel()
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(resize), timeout=0.05)
+
+            second = asyncio.create_task(
+                installation.run_reserved_sync(
+                    lambda: (second_started.set(), events.append("second-finished")),
+                    reservation,
+                )
+            )
+            await asyncio.sleep(0.05)
+            self.assertFalse(second_started.is_set())
+            self.assertFalse(reservation.active)
+            release_allocator.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await resize
+            await second
+
+        self.assertTrue(second_started.is_set())
+        self.assertEqual(
+            events,
+            [
+                "fence",
+                "resize",
+                "allocator-start",
+                "allocator-finished",
+                "fence",
+                "enter",
+                "second-finished",
+                "fence",
+                "exit",
+            ],
+        )
+
     async def test_reservation_stays_held_through_final_gpu_fence(self):
         events = []
         reservation = _Reservation(events)
@@ -384,7 +560,7 @@ class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             self.assertFalse(second_started.is_set())
             self.assertFalse(second_reservation.active)
-            with self.assertRaisesRegex(RuntimeError, "during model execution"):
+            with self.assertRaisesRegex(RuntimeError, "during model work"):
                 installation.close()
 
             release_first.set()

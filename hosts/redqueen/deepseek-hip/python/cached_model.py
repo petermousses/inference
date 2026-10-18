@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
+from expert_cache import ExpertCacheResize
 from expert_moe import execute_cached_moe
 
 _T = TypeVar("_T")
@@ -52,7 +53,7 @@ class CachedMoEInstallation:
             if self._closed:
                 return
             if self._execution_lock.locked():
-                raise RuntimeError("cannot close cached MoE installation during model execution")
+                raise RuntimeError("cannot close cached MoE installation during model work")
             for patch in self._patches:
                 if getattr(patch.moe, _INSTALLATION_MARKER, None) is not self:
                     raise RuntimeError("cached MoE installation ownership changed")
@@ -127,6 +128,72 @@ class CachedMoEInstallation:
                                 f"{worker_error!r} while cancellation drained"
                             )
                     raise cancellation
+
+    async def resize_cache(
+        self,
+        capacity_bytes: int,
+        *,
+        release_allocator: Callable[[], None],
+        worker_context: Callable[[], object] | None = None,
+    ) -> ExpertCacheResize:
+        """Shrink or grow the expert cache at a fenced, idle model boundary.
+
+        The installation lock excludes model execution while the cache drops
+        tensor references and the worker returns unused allocator blocks. The
+        returned byte count is logical cache payload only; the caller must
+        confirm actual host/GTT availability after this operation before
+        admitting another worker. The host broker must serialize this control
+        call with requests across workers; this lock protects only this model
+        graph. Allocator release runs only when capacity shrinks or entries are
+        evicted, so cache growth preserves reusable allocator blocks.
+        """
+        if isinstance(capacity_bytes, bool) or type(capacity_bytes) is not int or capacity_bytes < 0:
+            raise ValueError("cache capacity must be a nonnegative integer")
+        if not callable(self._fence):
+            raise ValueError("cached MoE installation requires a final GPU fence")
+        if not callable(release_allocator):
+            raise TypeError("release_allocator must be callable")
+        if worker_context is not None and not callable(worker_context):
+            raise TypeError("worker_context must be callable")
+        if not callable(getattr(self._cache, "resize_when_idle", None)):
+            raise TypeError("cache must support resize_when_idle")
+        if not callable(getattr(self._cache, "quarantine", None)):
+            raise TypeError("cache must support quarantine")
+
+        async with self._execution_lock:
+            if self._closed:
+                raise RuntimeError("cached MoE installation is already closed")
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    _resize_cache_sync,
+                    self._cache,
+                    capacity_bytes,
+                    self._fence,
+                    release_allocator,
+                    worker_context,
+                )
+            )
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError as cancellation:
+                # A cancelled control request must not release the execution
+                # lock while the worker is dropping live tensor references.
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+                try:
+                    task.result()
+                except BaseException as worker_error:
+                    if hasattr(cancellation, "add_note"):
+                        cancellation.add_note(
+                            "cache resize worker finished with "
+                            f"{worker_error!r} while cancellation drained"
+                        )
+                raise cancellation
 
 
 def _blocks(value: object, name: str) -> list[object]:
@@ -298,3 +365,56 @@ def _run_and_fence(
     if operation_error is not None:
         raise operation_error
     return result  # type: ignore[return-value]
+
+
+def _resize_cache_sync(
+    cache: object,
+    capacity_bytes: int,
+    fence: Callable[[], None],
+    release_allocator: Callable[[], None],
+    worker_context: Callable[[], object] | None,
+) -> ExpertCacheResize:
+    context = worker_context() if worker_context is not None else nullcontext()
+    with context:
+        try:
+            fence()
+        except BaseException as fence_error:
+            _quarantine_after_fence_failure(cache, fence_error)
+            raise
+
+        def release_and_fence() -> None:
+            release_allocator()
+            try:
+                fence()
+            except BaseException as fence_error:
+                _quarantine_after_fence_failure(cache, fence_error)
+                raise
+
+        resized = cache.resize_when_idle(
+            capacity_bytes,
+            after_drop=release_and_fence,
+        )
+        if not isinstance(resized, ExpertCacheResize):
+            raise TypeError("cache resize_when_idle must return ExpertCacheResize")
+
+        stats = cache.stats
+        if not isinstance(stats, type(resized.stats)) or not stats.within_capacity:
+            raise RuntimeError("cache did not reach the requested capacity")
+        if stats.pending_backing_release:
+            raise RuntimeError("cache allocator backing release is still pending")
+        if stats.quarantined:
+            raise RuntimeError("cache was quarantined while resizing")
+        if stats.leased_bytes or stats.loading_bytes or stats.releasing_bytes or stats.pending_loads:
+            raise RuntimeError("cache resize completed before all expert activity stopped")
+        return ExpertCacheResize(
+            stats=stats,
+            evicted_logical_bytes=resized.evicted_logical_bytes,
+        )
+
+
+def _quarantine_after_fence_failure(cache: object, fence_error: BaseException) -> None:
+    try:
+        cache.quarantine()
+    except BaseException as quarantine_error:
+        if hasattr(fence_error, "add_note"):
+            fence_error.add_note(f"cache quarantine also failed: {quarantine_error!r}")
