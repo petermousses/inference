@@ -266,6 +266,8 @@ def apply_rotary_emb(
     device, stream = _validate_same_device(x, freqs_cis=freqs_cis)
     if x.dtype not in (torch.float32, torch.bfloat16):
         raise NotImplementedError("native RoPE supports float32 and bfloat16 input")
+    if x.stride(-1) != 1:
+        raise ValueError("native RoPE requires a contiguous rotary dimension")
     if freqs_cis.dtype != torch.complex64:
         raise TypeError("RoPE frequencies must be complex64")
     if not isinstance(inverse, bool):

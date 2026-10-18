@@ -58,6 +58,17 @@ class NativeKernelModuleTest(unittest.TestCase):
         kernel.apply_rotary_emb(tail, frequencies, inverse=True)
         torch.testing.assert_close(tail.float(), inverse_reference.float(), rtol=1e-2, atol=1e-2)
 
+    def test_rope_rejects_nonunit_rotary_stride_without_mutating_storage(self):
+        backing = torch.full((1, 2, 1, 8), 3.0, dtype=torch.bfloat16, device="cuda")
+        original = backing.clone()
+        sliced = backing[..., ::2]
+        frequencies = torch.ones((2, 2), dtype=torch.complex64, device="cuda")
+        self.assertEqual(sliced.stride(-1), 2)
+        with self.assertRaisesRegex(ValueError, "contiguous rotary dimension"):
+            kernel.apply_rotary_emb(sliced, frequencies)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(backing, original))
+
     def test_act_quant_returns_reference_shapes_and_inplace_dequantization(self):
         values = torch.linspace(-24, 24, 3 * 64, dtype=torch.float32).reshape(1, 3, 64).to(torch.bfloat16).cuda()
         quantized, scales = kernel.act_quant(values, 32, "ue8m0", self.e8m0)

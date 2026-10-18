@@ -40,7 +40,10 @@ def main() -> None:
     sys.modules["kernel"] = kernel
     reference = runpy.run_path(str(model_path), run_name="redqueen_deepseek_reference")
     usage = {"rmsnorm": 0, "rope": 0}
-    rmsnorm_class = reference["RMSNorm"]
+    # run_path returns a shallow globals copy; function objects still resolve
+    # names through their original module dictionary.
+    model_globals = reference["Transformer"].forward.__globals__
+    rmsnorm_class = model_globals["RMSNorm"]
 
     def native_rmsnorm(self, x):
         usage["rmsnorm"] += 1
@@ -51,7 +54,7 @@ def main() -> None:
         return kernel.apply_rotary_emb(x, freqs_cis, inverse)
 
     rmsnorm_class.forward = native_rmsnorm
-    reference["apply_rotary_emb"] = native_rope
+    model_globals["apply_rotary_emb"] = native_rope
 
     # Run the same small random graph exercise as the pinned model.py main
     # block, after swapping only RMSNorm and RoPE for their native HIP paths.
