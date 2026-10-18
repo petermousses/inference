@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -14,6 +15,7 @@ from checkpoint_mapping_audit import (
     _pinned_inference_imports,
     verify_pinned_inference_sources,
 )
+from checkpoint_forward_smoke import run_checkpoint_forward_smoke
 from checkpoint_reader import SafeTensorCheckpoint
 from dense_checkpoint import (
     DenseLoadMemoryEstimate,
@@ -207,7 +209,48 @@ def main() -> int:
         description="Load dense DeepSeek 1017 weights and a 220k-token session on Redqueen."
     )
     parser.add_argument("--estimate-only", action="store_true")
+    parser.add_argument(
+        "--forward-smoke",
+        action="store_true",
+        help="run one checkpoint-backed native HIP prefill and DSpark decode step",
+    )
+    parser.add_argument(
+        "--execution-lock",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "DS4_EXECUTION_LOCK",
+                "/srv/ai/model-router/run/leases/global-execution",
+            )
+        ),
+        help="scheduler global-execution flock used to drain brokered model work",
+    )
     options = parser.parse_args()
+    if options.estimate_only:
+        return _run(options)
+
+    lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    execution_fd = os.open(options.execution_lock, lock_flags, 0o600)
+    operations_fd = None
+    try:
+        print("waiting for scheduler execution lease", flush=True)
+        fcntl.flock(execution_fd, fcntl.LOCK_EX)
+        operations_lock = options.execution_lock.parent.parent / "operations.lock"
+        operations_fd = os.open(operations_lock, lock_flags, 0o600)
+        fcntl.flock(operations_fd, fcntl.LOCK_EX)
+        print(
+            "scheduler execution and operations leases acquired; running isolated checkpoint smoke",
+            flush=True,
+        )
+        return _run(options)
+    finally:
+        if operations_fd is not None:
+            os.close(operations_fd)
+        os.close(execution_fd)
+
+
+def _run(options: argparse.Namespace) -> int:
+    """Load, execute, and tear down the checkpoint smoke under its host leases."""
 
     inference_dir = Path(
         os.environ.get(
@@ -426,6 +469,21 @@ def main() -> int:
                         device,
                         torch,
                     )
+                    if options.forward_smoke:
+                        run_checkpoint_forward_smoke(
+                            kernel=kernel,
+                            reference=reference,
+                            model=model,
+                            args=args,
+                            tokenizer=tokenizer,
+                            checkpoint=checkpoint,
+                            device=device,
+                            torch=torch,
+                            memory=memory,
+                            admission_check=_check_admission,
+                            fence=fence,
+                            release_allocator=release_allocator,
+                        )
                     session_state.close()
                     session_allocated_after_close = torch.cuda.memory_allocated(device)
                     if abs(session_allocated_after_close - session_allocated_before) > _SESSION_ACCOUNTING_TOLERANCE:
