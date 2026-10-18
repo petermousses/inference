@@ -172,7 +172,13 @@ class NativeFp4QuantizationTest(unittest.TestCase):
                 _, expected_scales, expected_values = reference_fp4_quantize(values, block_size, scale_type)
                 actual_values, actual_scales = self.quantize(values, block_size, scale_type, inplace=True)
                 self.assertTrue(torch.equal(actual_scales, expected_scales))
-                self.assertTrue(torch.equal(actual_values, expected_values))
+                self.assertTrue(
+                    torch.equal(
+                        actual_values.contiguous().view(torch.uint16),
+                        expected_values.contiguous().view(torch.uint16),
+                    ),
+                    "in-place BF16 values differ at the bit level",
+                )
 
     def test_all_fp4_rounding_boundaries_and_signed_codes(self):
         boundaries = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
@@ -199,6 +205,14 @@ class NativeFp4QuantizationTest(unittest.TestCase):
         actual_low_high = packed[:, 0]
         expected_bytes = torch.tensor([low | (high << 4) for low, high in expected], dtype=torch.uint8)
         self.assertTrue(torch.equal(actual_low_high, expected_bytes))
+
+        signed_zero_row = torch.zeros((1, 16), dtype=torch.bfloat16)
+        signed_zero_row[0, 0] = 0.0
+        signed_zero_row[0, 1] = -0.0
+        signed_zero_row[0, 15] = 6.0  # fixes the E8M0 scale at one
+        signed_zero_packed, signed_zero_scales = self.quantize(signed_zero_row, 16, SCALE_E8M0)
+        self.assertEqual(signed_zero_scales[0, 0].item(), 127)
+        self.assertEqual(signed_zero_packed[0, 0].item(), 0x80)
 
     def test_zero_groups_use_nonzero_minimum_scales(self):
         values = torch.zeros((2, 64), dtype=torch.bfloat16)
