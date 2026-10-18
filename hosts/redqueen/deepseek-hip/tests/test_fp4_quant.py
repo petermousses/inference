@@ -62,7 +62,9 @@ def reference_fp4_quantize(values: torch.Tensor, block_size: int, scale_type: in
         scale_values = scale_bits.view(torch.float32)
     else:
         amax = amax.clamp(min=6.0 * (2.0**-9))
-        scale_fp8 = (amax / 6.0).to(torch.float8_e4m3fn)
+        # TileLang's finite E4M3 cast saturates overflow to 448; torch.to
+        # instead emits NaN for values above the format's finite range.
+        scale_fp8 = (amax / 6.0).clamp(max=448.0).to(torch.float8_e4m3fn)
         scale_bytes = scale_fp8.contiguous().view(torch.uint8)
         scale_values = scale_fp8.float()
 
@@ -150,8 +152,13 @@ class NativeFp4QuantizationTest(unittest.TestCase):
                 with self.subTest(block_size=block_size, scale_type=scale_type):
                     expected_packed, expected_scales, _ = reference_fp4_quantize(values, block_size, scale_type)
                     actual_packed, actual_scales = self.quantize(values, block_size, scale_type, guarded=True)
-                    self.assertTrue(torch.equal(actual_packed, expected_packed))
-                    self.assertTrue(torch.equal(actual_scales, expected_scales))
+                    self.assertTrue(torch.equal(actual_scales, expected_scales), "scale bytes differ from reference")
+                    mismatch = torch.nonzero(actual_packed != expected_packed, as_tuple=False)
+                    self.assertEqual(
+                        mismatch.shape[0],
+                        0,
+                        f"packed bytes differ at {tuple(mismatch[0].tolist()) if mismatch.numel() else None}",
+                    )
 
     def test_inplace_dequantization_matches_reference_for_model_paths(self):
         generator = torch.Generator(device="cpu").manual_seed(41017)
