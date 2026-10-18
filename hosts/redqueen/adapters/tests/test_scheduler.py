@@ -650,6 +650,126 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.forwarded[-1][1], "application/json")
         self.assertEqual(self.runtime.starts, ["a"])
 
+    async def test_direct_openai_service_is_routed_after_shared_admission(self):
+        self.resources["native"] = resource(30, "service")
+        direct_requests = []
+
+        async def handle_direct(request):
+            body = await request.json()
+            direct_requests.append((request.path, request.headers.get("Authorization"), body))
+            return web.json_response({"model": body["model"], "direct": True})
+
+        direct_app = web.Application()
+        direct_app.router.add_post("/v1/chat/completions", handle_direct)
+        direct_server = TestServer(direct_app)
+        await direct_server.start_server()
+        self.addAsyncCleanup(direct_server.close)
+        self.resources["native"].update(
+            aliases=["native-alias"],
+            gateway_url=str(direct_server.make_url("")).rstrip("/"),
+            slots_url=str(direct_server.make_url("/slots")),
+            health_url=str(direct_server.make_url("/health")),
+            supported_request_shapes=["openai.chat", "openai.multimodal_chat"],
+        )
+
+        response = await self.post("native-alias", max_tokens=4)
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {"model": "native", "direct": True})
+        self.assertEqual(direct_requests, [("/v1/chat/completions", "Bearer secret", {"model": "native", "max_tokens": 4})])
+        self.assertEqual(self.forwarded, [])
+        self.assertEqual(self.runtime.starts, ["native"])
+
+        image_response = await self.post(
+            "native",
+            messages=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}],
+        )
+        self.assertEqual(image_response.status, 200)
+        self.assertEqual(len(direct_requests), 2)
+
+    async def test_direct_openai_service_rejects_unadvertised_request_shape(self):
+        self.resources["native"] = resource(30, "service")
+        self.resources["native"].update(
+            gateway_url="http://127.0.0.1:8801",
+            slots_url="http://127.0.0.1:8801/slots",
+            health_url="http://127.0.0.1:8801/health",
+            supported_request_shapes=["openai.chat", "openai.responses"],
+        )
+
+        response = await self.client.post(
+            "/v1/embeddings",
+            headers={"Authorization": "Bearer secret"},
+            json={"model": "native", "input": "hello"},
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"]["code"], "unsupported_request_shape")
+
+        image_response = await self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer secret"},
+            json={
+                "model": "native",
+                "input": [{"role": "user", "content": [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]}],
+            },
+        )
+        self.assertEqual(image_response.status, 400)
+        self.assertEqual((await image_response.json())["error"]["code"], "unsupported_request_shape")
+        self.assertEqual(self.runtime.starts, [])
+
+    async def test_direct_openai_service_does_not_accept_llama_swap_control_routes(self):
+        self.resources["native"] = resource(30, "service")
+        self.resources["native"].update(gateway_url="http://127.0.0.1:8801")
+
+        response = await self.client.get(
+            "/upstream/native/health",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+        self.assertEqual(response.status, 404)
+        self.assertEqual((await response.json())["error"]["code"], "not_found")
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
+
+    async def test_direct_openai_stream_holds_its_lease_until_the_worker_finishes(self):
+        self.resources["native"] = resource(60, "service")
+        self.resources["native"].update(
+            gateway_url="http://127.0.0.1:8801",
+            slots_url="http://127.0.0.1:8801/slots",
+            health_url="http://127.0.0.1:8801/health",
+            supported_request_shapes=["openai.chat"],
+        )
+
+        async def handle_direct(request):
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            await response.write(b'data: {"content":"started"}\n\n')
+            self.started.set()
+            await self.release.wait()
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        direct_app = web.Application()
+        direct_app.router.add_post("/v1/chat/completions", handle_direct)
+        direct_server = TestServer(direct_app)
+        await direct_server.start_server()
+        self.addAsyncCleanup(direct_server.close)
+        self.resources["native"]["gateway_url"] = str(direct_server.make_url(""))
+
+        stream = await self.post("native", stream=True)
+        await self.started.wait()
+        queued = asyncio.create_task(self.post("b"))
+        await asyncio.sleep(0.05)
+        self.assertFalse(queued.done())
+        self.assertEqual(self.runtime.stops, [])
+
+        self.release.set()
+        self.assertIn(b"[DONE]", await stream.read())
+        admitted = await asyncio.wait_for(queued, 1)
+
+        self.assertEqual(admitted.status, 200)
+        self.assertEqual(self.runtime.stops, ["native"])
+
     async def test_adapter_lease_protects_model_across_http_calls_and_releases_afterwards(self):
         adapter = SchedulerClient(self.policy["socket_path"])
         async with adapter.lease("comfyui"):
@@ -896,6 +1016,17 @@ class ProfileTest(unittest.TestCase):
             })
             document = {"version": 1, "worker_profile_version": 1, "resources": {"a": profile}, "sources": [file_signature(path, content=True)]}
             verify_profiles(document)
+            profile.update({
+                "kind": "service",
+                "gateway_url": "http://127.0.0.1:8085",
+                "slots_url": "http://127.0.0.1:8085/slots",
+                "health_url": "http://127.0.0.1:8085/health",
+                "runtime_identity": {"service_units": ["native.service"]},
+            })
+            verify_profiles(document)
+            profile["gateway_url"] = "http://example.com:8085"
+            with self.assertRaisesRegex(ValueError, "direct OpenAI service contract"):
+                verify_profiles(document)
             path.write_text("context=220000")
             with self.assertRaises(ValueError):
                 verify_profiles(document)

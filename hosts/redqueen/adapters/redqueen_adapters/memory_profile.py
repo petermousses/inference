@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import re
 import shlex
 import subprocess
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -19,6 +21,36 @@ MEMORY_FLAGS = {
     "--model", "--ctx-size", "--cache-type-k", "--cache-type-v", "--gpu-layers",
     "--parallel", "--batch-size", "--ubatch-size", "--flash-attn",
 }
+
+
+def _loopback_http_url(value: object, *, path: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "http"
+        or hostname is None
+        or port is None
+        or (
+            path == "" and parsed.path not in {"", "/"}
+        )
+        or (path not in {None, ""} and parsed.path != path)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    try:
+        loopback = ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        loopback = hostname.lower() == "localhost"
+    return loopback
 
 
 def file_signature(path: Path, *, content: bool = False) -> dict:
@@ -111,6 +143,20 @@ def verify_profiles(document: dict) -> None:
             or len(set(shapes)) != len(shapes)
         ):
             raise ValueError(f"{name} has invalid supported request shapes")
+        if "gateway_url" in profile:
+            openai_shapes = {
+                "openai.chat", "openai.completion", "openai.responses",
+                "openai.embeddings", "openai.multimodal_chat",
+                "openai.multimodal_responses",
+            }
+            if (
+                profile.get("kind") != "service"
+                or not _loopback_http_url(profile["gateway_url"], path="")
+                or not _loopback_http_url(profile.get("slots_url"), path="/slots")
+                or not _loopback_http_url(profile.get("health_url"), path=None)
+                or not any(shape in openai_shapes for shape in shapes)
+            ):
+                raise ValueError(f"{name} has an invalid direct OpenAI service contract")
         concurrency = profile.get("concurrency_limit")
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
             raise ValueError(f"{name} has an invalid concurrency limit")
