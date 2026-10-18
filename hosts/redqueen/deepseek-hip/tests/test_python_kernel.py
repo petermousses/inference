@@ -34,6 +34,12 @@ class NativeKernelModuleTest(unittest.TestCase):
         self.assertEqual(result.dtype, values.dtype)
         torch.testing.assert_close(result.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
+    def test_rmsnorm_rejects_nonpositive_epsilon_before_native_call(self):
+        values = torch.ones((2, 8), dtype=torch.bfloat16, device="cuda")
+        weight = torch.ones((8,), dtype=torch.bfloat16, device="cuda")
+        with self.assertRaisesRegex(ValueError, "finite positive number"):
+            kernel.rmsnorm(values, weight, 0.0)
+
     def test_rope_matches_reference_for_strided_tail_and_inverse(self):
         backing = torch.randn((2, 3, 4, 48), dtype=torch.float32, device="cuda").to(torch.bfloat16)
         tail = backing[..., 8:40]

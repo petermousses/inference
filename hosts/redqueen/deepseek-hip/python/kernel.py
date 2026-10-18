@@ -225,13 +225,13 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     if dim == 0 or rows == 0 or weight.numel() != dim:
         raise ValueError("RMSNorm input and weight dimensions are incompatible or empty")
     if isinstance(eps, bool):
-        raise TypeError("RMSNorm eps must be a finite nonnegative number")
+        raise TypeError("RMSNorm eps must be a finite positive number")
     try:
         eps = float(eps)
     except (TypeError, ValueError) as exc:
-        raise TypeError("RMSNorm eps must be a finite nonnegative number") from exc
-    if not math.isfinite(eps) or eps < 0:
-        raise ValueError("RMSNorm eps must be a finite nonnegative number")
+        raise TypeError("RMSNorm eps must be a finite positive number") from exc
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("RMSNorm eps must be a finite positive number")
 
     contiguous_x = _contiguous(x)
     contiguous_weight = _contiguous(weight)
