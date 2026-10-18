@@ -15,4 +15,5 @@ mkdir -p "${build_dir}"
   -shared \
   "${root}/src/quantization.hip" \
   "${root}/src/fp8_gemm.hip" \
+  "${root}/src/rmsnorm.hip" \
   -o "${build_dir}/libredqueen_ds4_hip.so"
