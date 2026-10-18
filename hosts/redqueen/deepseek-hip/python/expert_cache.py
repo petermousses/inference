@@ -52,6 +52,7 @@ class ExpertCacheStats:
     idle_bytes: int
     entries: int
     pending_loads: int
+    quarantined: bool
 
     @property
     def within_capacity(self) -> bool:
@@ -75,6 +76,7 @@ class ExpertCacheLease:
         self._key = key
         self._entry = entry
         self._expert = entry.expert
+        self._quarantined = False
 
     def _get_expert(self) -> LoadedFP4Expert:
         if self._expert is None:
@@ -117,7 +119,18 @@ class ExpertCacheLease:
         self._key = None
         self._entry = None
         self._expert = None
+        if self._quarantined:
+            # Keep the cache entry permanently leased. Its GPU completion state
+            # is unknown, so only worker teardown may release these references.
+            return
         cache._release_entry(key, entry)
+
+    def quarantine(self) -> None:
+        """Pin this entry and prevent cache reuse after an unconfirmed GPU fence."""
+        if self._cache is None:
+            raise ExpertCacheError("expert lease is no longer active")
+        self._quarantined = True
+        self._cache._quarantine()
 
 
 class FP4ExpertCache:
@@ -156,6 +169,16 @@ class FP4ExpertCache:
         self._resident_bytes = 0
         self._loading_bytes = 0
         self._releasing_bytes = 0
+        self._quarantined = False
+
+    @staticmethod
+    def _quarantined_error() -> ExpertCacheError:
+        return ExpertCacheError("expert cache is quarantined; worker restart is required")
+
+    def _quarantine(self) -> None:
+        with self._condition:
+            self._quarantined = True
+            self._condition.notify_all()
 
     @staticmethod
     def _validate_capacity(capacity_bytes: int) -> None:
@@ -180,6 +203,7 @@ class FP4ExpertCache:
             idle_bytes=self._resident_bytes - leased_bytes,
             entries=len(self._entries),
             pending_loads=len(self._loading),
+            quarantined=self._quarantined,
         )
 
     @property
@@ -246,7 +270,11 @@ class FP4ExpertCache:
             capacity_error = None
             with self._condition:
                 while key in self._loading or self._releasing_bytes:
+                    if self._quarantined:
+                        raise self._quarantined_error()
                     self._condition.wait()
+                if self._quarantined:
+                    raise self._quarantined_error()
                 if self._resident_bytes + self._loading_bytes > self._capacity_bytes:
                     capacity_error = self._capacity_error_locked(estimate)
                 else:
@@ -317,6 +345,8 @@ class FP4ExpertCache:
                 self._entries.move_to_end(key)
                 self._resident_bytes += estimate
                 self._condition.notify_all()
+                if self._quarantined:
+                    raise self._quarantined_error()
 
         lease = ExpertCacheLease(self, key, entry)
         try:
@@ -343,6 +373,8 @@ class FP4ExpertCache:
         """
         self._validate_capacity(capacity_bytes)
         with self._condition:
+            if self._quarantined:
+                raise self._quarantined_error()
             self._capacity_bytes = capacity_bytes
             dropped = self._evict_idle_locked()
             evicted_bytes = sum(entry.resident_bytes for entry in dropped)
