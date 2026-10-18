@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import torch
 
@@ -292,6 +292,59 @@ class SessionStateTest(unittest.TestCase):
             thread.join()
         self.assertEqual(failures, [])
         self.assertEqual(sum(isinstance(event, tuple) and event[0] == "exit" for event in self.events), 1)
+
+
+class ComfyUISmokeGuardTest(unittest.TestCase):
+    def test_inactive_comfyui_needs_no_queue_probe_or_service_change(self):
+        with (
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_state", return_value="inactive"),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle") as queue,
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_systemctl") as control,
+        ):
+            with run_dense_checkpoint_smoke._comfyui_smoke_window():
+                pass
+        queue.assert_not_called()
+        control.assert_not_called()
+
+    def test_active_comfyui_jobs_fail_closed_without_stopping_service(self):
+        with (
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_state", return_value="active"),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle", return_value=False),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_systemctl") as control,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "active or pending work"):
+                with run_dense_checkpoint_smoke._comfyui_smoke_window():
+                    self.fail("checkpoint work started over an active ComfyUI job")
+        control.assert_not_called()
+
+    def test_idle_comfyui_is_stopped_for_the_window_and_restored(self):
+        with (
+            patch.object(
+                run_dense_checkpoint_smoke,
+                "_comfyui_state",
+                side_effect=["active", "inactive", "active"],
+            ),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle", return_value=True),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_systemctl") as control,
+        ):
+            with run_dense_checkpoint_smoke._comfyui_smoke_window():
+                self.assertEqual(control.call_args_list, [call("stop")])
+        self.assertEqual(control.call_args_list, [call("stop"), call("start")])
+
+    def test_comfyui_is_restored_when_checkpoint_run_fails(self):
+        with (
+            patch.object(
+                run_dense_checkpoint_smoke,
+                "_comfyui_state",
+                side_effect=["active", "inactive", "active"],
+            ),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle", return_value=True),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_systemctl") as control,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "checkpoint failure"):
+                with run_dense_checkpoint_smoke._comfyui_smoke_window():
+                    raise RuntimeError("checkpoint failure")
+        self.assertEqual(control.call_args_list, [call("stop"), call("start")])
 
 
 class AdmissionTest(unittest.TestCase):
