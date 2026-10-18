@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import cached_model
 from cached_model import install_cached_moe
 
 
@@ -159,6 +161,42 @@ class CachedMoEInstallationTest(unittest.TestCase):
         self.assertIsNot(moe.forward, first_forward)
         second.close()
         self.assertIs(moe.forward, original)
+
+    def test_concurrent_installation_has_one_owner(self):
+        marker_check_barrier = threading.Barrier(2)
+
+        class BarrierMoe(SimpleNamespace):
+            def __getattribute__(self, name):
+                if name == cached_model._INSTALLATION_MARKER:
+                    try:
+                        return super().__getattribute__(name)
+                    except AttributeError:
+                        try:
+                            marker_check_barrier.wait(timeout=0.1)
+                        except threading.BrokenBarrierError:
+                            pass
+                        raise
+                return super().__getattribute__(name)
+
+        moe = BarrierMoe(**vars(_moe(0)))
+        transformer = SimpleNamespace(layers=[SimpleNamespace(ffn=moe)], mtp=[])
+
+        def install():
+            try:
+                return "installed", install_cached_moe(
+                    transformer, _Cache(), lambda values, weight: values
+                )
+            except RuntimeError as error:
+                return "rejected", error
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            outcomes = list(executor.map(lambda _: install(), range(2)))
+        installations = [value for state, value in outcomes if state == "installed"]
+        rejected = [value for state, value in outcomes if state == "rejected"]
+        self.assertEqual(len(installations), 1)
+        self.assertEqual(len(rejected), 1)
+        self.assertRegex(str(rejected[0]), "already belongs")
+        installations[0].close()
 
 
 class ReservedSyncOperationTest(unittest.IsolatedAsyncioTestCase):

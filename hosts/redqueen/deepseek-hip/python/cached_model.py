@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import threading
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from expert_moe import execute_cached_moe
 
 _T = TypeVar("_T")
 _INSTALLATION_MARKER = "_redqueen_cached_moe_installation"
+_INSTALLATION_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -46,19 +48,20 @@ class CachedMoEInstallation:
         self.close()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        if self._execution_lock.locked():
-            raise RuntimeError("cannot close cached MoE installation during model execution")
-        for patch in self._patches:
-            if getattr(patch.moe, _INSTALLATION_MARKER, None) is not self:
-                raise RuntimeError("cached MoE installation ownership changed")
-            if patch.moe.forward is not patch.installed:
-                raise RuntimeError("MoE.forward changed while the cache was installed")
-        for patch in self._patches:
-            patch.moe.forward = patch.original
-            delattr(patch.moe, _INSTALLATION_MARKER)
-        self._closed = True
+        with _INSTALLATION_LOCK:
+            if self._closed:
+                return
+            if self._execution_lock.locked():
+                raise RuntimeError("cannot close cached MoE installation during model execution")
+            for patch in self._patches:
+                if getattr(patch.moe, _INSTALLATION_MARKER, None) is not self:
+                    raise RuntimeError("cached MoE installation ownership changed")
+                if patch.moe.forward is not patch.installed:
+                    raise RuntimeError("MoE.forward changed while the cache was installed")
+            for patch in self._patches:
+                patch.moe.forward = patch.original
+                delattr(patch.moe, _INSTALLATION_MARKER)
+            self._closed = True
 
     async def run_reserved_sync(
         self,
@@ -206,58 +209,61 @@ def install_cached_moe(
             raise ValueError(f"{name} MoE layer id does not match its transformer index")
         targets.append((moe, mtp_index, True, name))
 
-    for moe, _, _, name in targets:
-        if hasattr(moe, _INSTALLATION_MARKER):
-            raise RuntimeError(f"{name} already belongs to a cached MoE installation")
+    with _INSTALLATION_LOCK:
+        for moe, _, _, name in targets:
+            if hasattr(moe, _INSTALLATION_MARKER):
+                raise RuntimeError(f"{name} already belongs to a cached MoE installation")
 
-    patches: list[_ForwardPatch] = []
-    for moe, cache_layer_id, mtp_layer, name in targets:
-        original = moe.forward
+        patches: list[_ForwardPatch] = []
+        for moe, cache_layer_id, mtp_layer, name in targets:
+            original = moe.forward
 
-        def cached_forward(
-            activations,
-            image_mask=None,
-            *,
-            _moe=moe,
-            _layer_id=cache_layer_id,
-            _mtp_layer=mtp_layer,
-        ):
-            return execute_cached_moe(
-                cache,
+            def cached_forward(
                 activations,
-                _moe.gate,
-                _moe.shared_experts,
-                linear,
-                layer_id=_layer_id,
-                n_routed_experts=_moe.n_routed_experts,
-                swiglu_limit=_moe.shared_experts.swiglu_limit,
-                image_mask=image_mask,
-                fence=fence,
-                mtp_layer=_mtp_layer,
+                image_mask=None,
+                *,
+                _moe=moe,
+                _layer_id=cache_layer_id,
+                _mtp_layer=mtp_layer,
+            ):
+                return execute_cached_moe(
+                    cache,
+                    activations,
+                    _moe.gate,
+                    _moe.shared_experts,
+                    linear,
+                    layer_id=_layer_id,
+                    n_routed_experts=_moe.n_routed_experts,
+                    swiglu_limit=_moe.shared_experts.swiglu_limit,
+                    image_mask=image_mask,
+                    fence=fence,
+                    mtp_layer=_mtp_layer,
+                )
+
+            cached_forward.__name__ = (
+                f"cached_{name.replace('[', '_').replace(']', '')}_forward"
             )
+            patches.append(_ForwardPatch(moe, original, cached_forward))
 
-        cached_forward.__name__ = f"cached_{name.replace('[', '_').replace(']', '')}_forward"
-        patches.append(_ForwardPatch(moe, original, cached_forward))
-
-    installation = CachedMoEInstallation(patches, cache, fence)
-    marked: list[_ForwardPatch] = []
-    patched: list[_ForwardPatch] = []
-    try:
-        for patch in patches:
-            setattr(patch.moe, _INSTALLATION_MARKER, installation)
-            marked.append(patch)
-        for patch in patches:
-            patch.moe.forward = patch.installed
-            patched.append(patch)
-    except BaseException:
-        for patch in reversed(patched):
-            if patch.moe.forward is patch.installed:
-                patch.moe.forward = patch.original
-        for patch in reversed(marked):
-            if getattr(patch.moe, _INSTALLATION_MARKER, None) is installation:
-                delattr(patch.moe, _INSTALLATION_MARKER)
-        raise
-    return installation
+        installation = CachedMoEInstallation(patches, cache, fence)
+        marked: list[_ForwardPatch] = []
+        patched: list[_ForwardPatch] = []
+        try:
+            for patch in patches:
+                setattr(patch.moe, _INSTALLATION_MARKER, installation)
+                marked.append(patch)
+            for patch in patches:
+                patch.moe.forward = patch.installed
+                patched.append(patch)
+        except BaseException:
+            for patch in reversed(patched):
+                if patch.moe.forward is patch.installed:
+                    patch.moe.forward = patch.original
+            for patch in reversed(marked):
+                if getattr(patch.moe, _INSTALLATION_MARKER, None) is installation:
+                    delattr(patch.moe, _INSTALLATION_MARKER)
+            raise
+        return installation
 
 
 def _run_and_fence(
