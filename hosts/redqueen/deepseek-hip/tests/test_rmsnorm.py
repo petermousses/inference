@@ -46,6 +46,8 @@ class NativeRmsnormTest(unittest.TestCase):
             ctypes.c_void_p,
         ]
         cls.library.redqueen_ds4_rmsnorm.restype = ctypes.c_int
+        cls.library.redqueen_ds4_test_leave_pending_launch_error.argtypes = []
+        cls.library.redqueen_ds4_test_leave_pending_launch_error.restype = ctypes.c_int
 
     def call_rmsnorm(self, input_tensor, weight, eps, guarded=True):
         input_shape = tuple(input_tensor.shape)
@@ -149,6 +151,28 @@ class NativeRmsnormTest(unittest.TestCase):
         self.assertTrue(torch.isnan(actual[0]).all())
         self.assertTrue(torch.isnan(actual[1, 0]))
         self.assertEqual(float(actual[1, 1]), 0.0)
+
+    def test_pending_launch_error_is_returned_before_enqueuing(self):
+        input_gpu = torch.ones((2, 3), dtype=torch.float32, device="cuda")
+        weight_gpu = torch.ones((3,), dtype=torch.float32, device="cuda")
+        output_gpu = torch.full_like(input_gpu, 123.0)
+        pending_error = self.library.redqueen_ds4_test_leave_pending_launch_error()
+        self.assertNotEqual(pending_error, 0, "test helper did not leave a pending HIP launch error")
+
+        result = self.library.redqueen_ds4_rmsnorm(
+            ctypes.c_void_p(input_gpu.data_ptr()),
+            ctypes.c_void_p(weight_gpu.data_ptr()),
+            ctypes.c_void_p(output_gpu.data_ptr()),
+            2,
+            3,
+            F32,
+            F32,
+            1.0e-6,
+            ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+        )
+        self.assertEqual(result, pending_error)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.all(output_gpu == 123.0), "RMSNorm enqueued despite returning a prior HIP error")
 
     def test_rejects_invalid_arguments_without_launching(self):
         input_gpu = torch.ones((2, 3), dtype=torch.float32, device="cuda")

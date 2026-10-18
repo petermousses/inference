@@ -12,6 +12,7 @@ extern "C" {
 
 // Operates on contiguous row-major input [rows, dim] and weight [dim]. The
 // output dtype matches input_dtype. Device pointers and stream are HIP handles.
+// A pending HIP launch error is returned and cleared before this call enqueues.
 int redqueen_ds4_rmsnorm(
     const void* input,
     const void* weight,

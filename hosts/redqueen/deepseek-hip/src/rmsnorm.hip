@@ -99,6 +99,11 @@ int launch_rmsnorm(
     int dim,
     float eps,
     hipStream_t stream) {
+  const hipError_t pending_error = hipGetLastError();
+  if (pending_error != hipSuccess && pending_error != hipErrorNotReady) {
+    return static_cast<int>(pending_error);
+  }
+
   hipLaunchKernelGGL(
       (rmsnorm_kernel<InputDtype, WeightDtype, Output>),
       dim3(static_cast<unsigned int>(rows)),
