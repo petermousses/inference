@@ -1,10 +1,11 @@
 """Materialize bounded checkpoint tensors directly onto a PyTorch device.
 
-Callers must reserve the live host and device allocations before materializing data.
-During the copy, the raw host bytes and destination tensor overlap, so reserve at
-least twice the requested output size in addition to the checkpoint reader's
-transient read headroom. The returned device tensors remain caller-owned and must
-stay accounted until released.
+Callers must reserve live host and device allocations before materializing data.
+During a read, the raw host bytes and output tensor overlap, so reserve at least
+twice the output size in addition to the checkpoint reader's transient read
+headroom. ``copy_tensor_to_device`` also retains its full destination and needs
+space for an overlapping host/device chunk. Caller-owned tensors stay accounted
+until released.
 """
 
 from __future__ import annotations
@@ -140,3 +141,71 @@ def read_rows_to_device(
     torch, dtype, target = _destination(info.dtype, device)
     raw = checkpoint.read_rows(name, stable_rows, max_bytes=max_bytes)
     return _to_device(raw, torch, dtype, (row_count, *info.shape[1:]), target)
+
+
+def copy_tensor_to_device(
+    checkpoint: SafeTensorCheckpoint,
+    name: str,
+    destination,
+    *,
+    max_chunk_bytes: int = 64 * 1024 * 1024,
+):
+    """Copy one complete tensor into a preallocated contiguous destination in bounded chunks.
+
+    The caller must reserve the full destination plus twice the largest chunk size
+    (raw host bytes and temporary device tensor) and the reader's transient read
+    headroom before allocating or copying. Device copies may still be in flight
+    when this function returns. Keep the reservation and destination alive until
+    a fence on the destination device completes, including after an exception. A
+    fence can use ``torch.cuda.synchronize(destination.device)``. The allocator may
+    retain reusable chunk storage after the fence; the broker must keep counting
+    that pool until its backing is actually returned. If any chunk read or copy
+    fails, the destination may be partially initialized and must be discarded.
+    """
+    checkpoint._validate_limit(max_chunk_bytes)
+    info = checkpoint.tensors[name]
+    torch, dtype = _torch_dtype(info.dtype)
+    if not isinstance(destination, torch.Tensor):
+        raise TypeError("destination must be a torch.Tensor")
+    if tuple(destination.shape) != info.shape:
+        raise ValueError(
+            f"destination shape {tuple(destination.shape)} does not match tensor shape {info.shape}"
+        )
+    if destination.dtype != dtype:
+        raise TypeError(f"destination dtype {destination.dtype} does not match checkpoint dtype {dtype}")
+    if not destination.is_contiguous():
+        raise ValueError("destination must be contiguous")
+    if destination.device.type == "meta":
+        raise ValueError("destination must have allocated storage")
+
+    if not info.nbytes:
+        checkpoint.read_tensor_bytes(name, max_bytes=max_chunk_bytes)
+        return destination
+
+    if not info.shape:
+        chunk = read_tensor_to_device(
+            checkpoint, name, device=destination.device, max_bytes=max_chunk_bytes
+        )
+        with torch.no_grad():
+            destination.copy_(chunk)
+        return destination
+
+    row_bytes = info.row_bytes
+    rows_per_chunk = min(_MAX_ROWS_PER_READ, max_chunk_bytes // row_bytes)
+    if rows_per_chunk < 1:
+        raise ValueError(
+            f"max_chunk_bytes {max_chunk_bytes} is smaller than one row of tensor {name} ({row_bytes} bytes)"
+        )
+
+    with torch.no_grad():
+        for start in range(0, info.shape[0], rows_per_chunk):
+            end = min(start + rows_per_chunk, info.shape[0])
+            chunk = read_rows_to_device(
+                checkpoint,
+                name,
+                range(start, end),
+                device=destination.device,
+                max_bytes=max_chunk_bytes,
+            )
+            destination[start:end].copy_(chunk)
+    return destination

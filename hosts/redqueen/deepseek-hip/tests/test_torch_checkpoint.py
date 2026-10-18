@@ -29,6 +29,7 @@ class CheckpointFixture:
                 "weights.safetensors": {
                     "table": ("I16", [3, 2], self.values),
                     "empty_rows": ("U8", [4, 0], b""),
+                    "scalar": ("I16", [], struct.pack("<h", 42)),
                 }
             },
         )
@@ -80,6 +81,52 @@ class TorchCheckpointTest(CheckpointFixture, unittest.TestCase):
         result.fill_(0)
         after = hashlib.sha256((self.root / "weights.safetensors").read_bytes()).digest()
         self.assertEqual(after, before)
+
+    def test_copies_large_tensor_in_bounded_row_chunks_into_existing_storage(self):
+        destination = torch.full((3, 2), -1, dtype=torch.int16)
+        pointer = destination.data_ptr()
+        original = torch_checkpoint.read_rows_to_device
+        reads = []
+
+        def record_read(checkpoint, name, rows, **kwargs):
+            reads.append((rows.start, rows.stop, kwargs["max_bytes"]))
+            return original(checkpoint, name, rows, **kwargs)
+
+        with unittest.mock.patch.object(
+            torch_checkpoint, "read_rows_to_device", side_effect=record_read
+        ):
+            result = torch_checkpoint.copy_tensor_to_device(
+                self.reader, "table", destination, max_chunk_bytes=8
+            )
+
+        self.assertIs(result, destination)
+        self.assertEqual(destination.data_ptr(), pointer)
+        self.assertEqual(destination.tolist(), [[11, 12], [21, 22], [31, 32]])
+        self.assertEqual(reads, [(0, 2, 8), (2, 3, 8)])
+
+    def test_copies_scalar_and_empty_tensor(self):
+        scalar = torch.empty((), dtype=torch.int16)
+        empty = torch.empty((4, 0), dtype=torch.uint8)
+        self.assertIs(
+            torch_checkpoint.copy_tensor_to_device(self.reader, "scalar", scalar), scalar
+        )
+        self.assertEqual(scalar.item(), 42)
+        self.assertIs(
+            torch_checkpoint.copy_tensor_to_device(self.reader, "empty_rows", empty), empty
+        )
+
+    def test_rejects_destination_shape_and_row_chunks_that_cannot_fit(self):
+        wrong_shape = torch.empty((2, 2), dtype=torch.int16)
+        with self.assertRaises(ValueError):
+            torch_checkpoint.copy_tensor_to_device(self.reader, "table", wrong_shape)
+
+        destination = torch.full((3, 2), -1, dtype=torch.int16)
+        with unittest.mock.patch.object(torch_checkpoint, "read_rows_to_device") as read_rows:
+            with self.assertRaises(ValueError):
+                torch_checkpoint.copy_tensor_to_device(
+                    self.reader, "table", destination, max_chunk_bytes=3
+                )
+        read_rows.assert_not_called()
 
 
 class TorchCheckpointValidationTest(CheckpointFixture, unittest.TestCase):
