@@ -19,6 +19,7 @@ from redqueen_adapters.image_api import ImageSettings, create_image_app
 from redqueen_adapters.jev_api import JevSettings, create_jev_app
 from redqueen_adapters.memory_profile import MIB, build_profiles, file_signature, memory_rows, verify_profiles, weight_paths
 from redqueen_adapters.ownership import OwnedRequest, records
+from redqueen_adapters import scheduler_api
 from redqueen_adapters.scheduler_api import Memory, Runtime, Scheduler, create_apps
 from redqueen_adapters.scheduler_client import ResourceLock, SchedulerClient
 
@@ -656,6 +657,36 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ProfileTest(unittest.TestCase):
+    def test_capacity_limits_apply_redqueen_budgets_and_prefill_headroom(self):
+        gib = 1024**3
+        policy = {
+            "gpu_budget_mib": 88 * 1024,
+            "host_budget_mib": 104 * 1024,
+            "minimum_host_available_mib": 8 * 1024,
+            "prefill_headroom_mib": 5 * 1024,
+        }
+        limits = getattr(scheduler_api, "capacity_limits", None)
+        self.assertTrue(callable(limits), "scheduler must expose its checked capacity calculation")
+
+        normal = limits(policy, gpu_total=96 * gib, host_total=125 * gib)
+        self.assertEqual(normal, Memory(88 * gib, 104 * gib))
+
+        constrained = limits(policy, gpu_total=96 * gib, host_total=110 * gib)
+        self.assertEqual(constrained, Memory(88 * gib, 97 * gib))
+
+    def test_capacity_limits_reject_invalid_budgets(self):
+        policy = {
+            "gpu_budget_mib": 0,
+            "host_budget_mib": 104 * 1024,
+            "minimum_host_available_mib": 8 * 1024,
+            "prefill_headroom_mib": 5 * 1024,
+        }
+        self.assertTrue(callable(getattr(scheduler_api, "capacity_limits", None)))
+        with self.assertRaises(ValueError):
+            scheduler_api.capacity_limits(
+                policy, gpu_total=96 * 1024**3, host_total=125 * 1024**3
+            )
+
     def test_device_context_and_compute_are_included(self):
         rows = memory_rows("ROCm0 73486 1914 901\nHost 12620 429 47\n")
         self.assertGreater(sum(rows["ROCm0"]), (73486 + 1914 + 901) * MIB)

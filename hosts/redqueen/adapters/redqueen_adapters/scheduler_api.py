@@ -49,6 +49,22 @@ def footprint(spec: dict) -> Memory:
     return Memory(spec["gpu_bytes"], spec["host_bytes"])
 
 
+def capacity_limits(policy: dict, *, gpu_total: int, host_total: int) -> Memory:
+    """Return the managed ceilings after preserving host availability headroom."""
+    gpu_budget = policy["gpu_budget_mib"] * MIB
+    host_budget = policy["host_budget_mib"] * MIB
+    host_reserve = (
+        policy["minimum_host_available_mib"] + policy["prefill_headroom_mib"]
+    ) * MIB
+    if min(gpu_budget, host_budget, gpu_total, host_total) <= 0:
+        raise ValueError("memory budgets and discovered capacities must be positive")
+    if min(policy["minimum_host_available_mib"], policy["prefill_headroom_mib"]) < 0:
+        raise ValueError("memory headroom reserves must not be negative")
+    if host_total <= host_reserve:
+        raise ValueError("host memory is below the required availability reserve")
+    return Memory(min(gpu_total, gpu_budget), min(host_budget, host_total - host_reserve))
+
+
 class Runtime:
     def __init__(self, policy: dict, resources: dict, session: aiohttp.ClientSession, api_key: str):
         self.policy, self.resources, self.session = policy, resources, session
@@ -233,7 +249,9 @@ class Runtime:
         gpu_total = int(devices[0].read_text())
         gpu_used = int(devices[0].with_name("mem_info_gtt_used").read_text())
         meminfo = {key: int(value.split()[0]) * 1024 for key, value in (line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())}
-        capacity = Memory(gpu_total - self.policy["gpu_reserve_mib"] * MIB, min(self.policy["host_budget_mib"] * MIB, meminfo["MemTotal"] - self.policy["host_reserve_mib"] * MIB))
+        capacity = capacity_limits(
+            self.policy, gpu_total=gpu_total, host_total=meminfo["MemTotal"]
+        )
         return capacity, Memory(gpu_used, meminfo["MemTotal"] - meminfo["MemAvailable"])
 
 
