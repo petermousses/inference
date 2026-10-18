@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+from contextlib import contextmanager
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+import time
+from urllib.request import urlopen
 
 from checkpoint_mapping_audit import (
     _execute_pinned_model,
     _pinned_inference_imports,
     verify_pinned_inference_sources,
 )
+from checkpoint_forward_smoke import run_checkpoint_forward_smoke
 from checkpoint_reader import SafeTensorCheckpoint
 from dense_checkpoint import (
     DenseLoadMemoryEstimate,
@@ -32,6 +38,183 @@ _PREFILL_HEADROOM = 5 * _GIB
 _HOST_PREFILL_HEADROOM = 5 * _GIB
 _GTT_RELEASE_TOLERANCE = 256 * 1024 * 1024
 _SESSION_ACCOUNTING_TOLERANCE = 16 * 1024 * 1024
+_COMFYUI_QUEUE_URL = "http://127.0.0.1:8189/queue"
+_COMFYUI_QUEUE_LIMIT = 64 * 1024
+_COMFYUI_GUARD_URL = "http://127.0.0.1:8189/redqueen/admission-guard"
+_COMFYUI_RESTORE_MARKER = Path("/srv/ai/model-router/run/comfyui-restore.json")
+_HOST_LEASE_DIRECTORY = Path("/srv/ai/model-router/run/leases")
+
+
+def _validate_lease_directory(lease_directory: Path) -> Path:
+    """Require the lock and restore marker paths shared by host recovery."""
+    try:
+        selected = lease_directory.expanduser().resolve()
+        expected = _HOST_LEASE_DIRECTORY.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("cannot resolve the host scheduler lease directory") from exc
+    if selected != expected:
+        raise RuntimeError(
+            "checkpoint smoke must use the host scheduler lease directory "
+            f"{expected}; custom paths bypass host recovery coordination"
+        )
+    return expected
+
+
+def _comfyui_state() -> str:
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "show",
+                "comfyui.service",
+                "--property=ActiveState",
+                "--value",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("cannot inspect ComfyUI service state") from exc
+    state = result.stdout.strip()
+    if result.returncode or state not in {
+        "active",
+        "inactive",
+        "failed",
+        "activating",
+        "deactivating",
+    }:
+        raise RuntimeError("ComfyUI service state is unknown")
+    return state
+
+
+def _comfyui_queue_idle() -> bool:
+    try:
+        with urlopen(_COMFYUI_QUEUE_URL, timeout=2) as response:
+            body = response.read(_COMFYUI_QUEUE_LIMIT + 1)
+    except (OSError, TimeoutError) as exc:
+        raise RuntimeError("cannot verify the ComfyUI queue") from exc
+    if len(body) > _COMFYUI_QUEUE_LIMIT:
+        raise RuntimeError("ComfyUI queue response exceeded its size limit")
+    try:
+        queue = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("ComfyUI returned an invalid queue response") from exc
+    if (
+        not isinstance(queue, dict)
+        or not isinstance(queue.get("queue_running"), list)
+        or not isinstance(queue.get("queue_pending"), list)
+    ):
+        raise RuntimeError("ComfyUI returned an invalid queue response")
+    return not queue["queue_running"] and not queue["queue_pending"]
+
+
+def _comfyui_guard_ready() -> bool:
+    try:
+        with urlopen(_COMFYUI_GUARD_URL, timeout=2) as response:
+            body = response.read(4097)
+    except (OSError, TimeoutError) as exc:
+        raise RuntimeError("ComfyUI prompt admission guard is unavailable") from exc
+    if len(body) > 4096:
+        raise RuntimeError("ComfyUI prompt admission guard response exceeded its size limit")
+    try:
+        status = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("ComfyUI prompt admission guard returned invalid status") from exc
+    if (
+        not isinstance(status, dict)
+        or status.get("component") != "redqueen-prompt-admission"
+        or isinstance(status.get("version"), bool)
+        or status.get("version") != 1
+        or isinstance(status.get("pid"), bool)
+        or not isinstance(status.get("pid"), int)
+        or status["pid"] < 1
+    ):
+        raise RuntimeError("ComfyUI prompt admission guard is not installed")
+    return True
+
+
+def _comfyui_systemctl(action: str) -> None:
+    try:
+        subprocess.run(
+            ["/usr/bin/systemctl", "--user", action, "comfyui.service"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"could not {action} ComfyUI for the checkpoint smoke") from exc
+
+
+def _wait_for_comfyui_state(expected: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        state = _comfyui_state()
+        if state == expected or (expected == "inactive" and state == "failed"):
+            return
+        if state == "failed" or time.monotonic() >= deadline:
+            raise RuntimeError(f"ComfyUI did not reach {expected} state")
+        time.sleep(0.25)
+
+
+@contextmanager
+def _comfyui_smoke_window(restore_marker: Path = _COMFYUI_RESTORE_MARKER):
+    """Drain ComfyUI, block direct submissions, and restore its prior state."""
+    state = _comfyui_state()
+    if state in {"inactive", "failed"}:
+        yield
+        return
+    if state != "active":
+        raise RuntimeError("ComfyUI is transitioning; refusing checkpoint GPU allocation")
+    if not _comfyui_guard_ready():
+        raise RuntimeError("ComfyUI prompt admission guard is not ready")
+    if not _comfyui_queue_idle():
+        raise RuntimeError("ComfyUI has active or pending work; refusing checkpoint GPU allocation")
+    try:
+        from redqueen_adapters.host_reliability import atomic_json, durable_unlink
+    except ImportError as exc:
+        raise RuntimeError("host recovery helpers are unavailable") from exc
+    if restore_marker.exists() or restore_marker.is_symlink():
+        raise RuntimeError("a previous ComfyUI restore is still pending")
+    atomic_json(
+        restore_marker,
+        {
+            "version": 1,
+            "unit": "comfyui.service",
+            "was_active": True,
+            "pid": os.getpid(),
+        },
+    )
+    try:
+        _comfyui_systemctl("stop")
+        _wait_for_comfyui_state("inactive", timeout=60)
+        yield
+    finally:
+        _comfyui_systemctl("start")
+        _wait_for_comfyui_state("active", timeout=180)
+        if not _comfyui_guard_ready():
+            raise RuntimeError("ComfyUI restarted without its admission guard")
+        durable_unlink(restore_marker)
+
+
+def _run_with_host_isolation(options: argparse.Namespace) -> int:
+    """Build and run while scheduler, deployment, and ComfyUI work is isolated."""
+    if options.forward_smoke and not os.environ.get("DS4_HIP_LIBRARY"):
+        adapter_dir = Path(__file__).resolve().parent
+        subprocess.run(
+            [str(adapter_dir.parent / "build.sh")], check=True, timeout=600
+        )
+        build_directory = Path(
+            os.environ.get("BUILD_DIR", str(adapter_dir.parent / "build"))
+        ).expanduser()
+        os.environ["DS4_HIP_LIBRARY"] = str(
+            build_directory / "libredqueen_ds4_hip.so"
+        )
+    with _comfyui_smoke_window(options.lease_directory.parent / "comfyui-restore.json"):
+        return _run(options)
 
 
 def _memory_snapshot() -> tuple[int, int, int]:
@@ -207,7 +390,68 @@ def main() -> int:
         description="Load dense DeepSeek 1017 weights and a 220k-token session on Redqueen."
     )
     parser.add_argument("--estimate-only", action="store_true")
+    parser.add_argument(
+        "--forward-smoke",
+        action="store_true",
+        help="run one checkpoint-backed native HIP prefill and DSpark decode step",
+    )
+    parser.add_argument(
+        "--lease-directory",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "DS4_LEASE_DIRECTORY",
+                str(_HOST_LEASE_DIRECTORY),
+            )
+        ).expanduser(),
+        help="scheduler lease directory used to drain brokered model work",
+    )
     options = parser.parse_args()
+    if options.estimate_only:
+        return _run(options)
+    options.lease_directory = _validate_lease_directory(options.lease_directory)
+
+    adapter_source = Path(__file__).resolve().parents[2] / "adapters"
+    sys.path.insert(0, str(adapter_source))
+    try:
+        from redqueen_adapters.scheduler_client import (
+            SerializedExecution,
+            run_thread_shielded,
+        )
+    except ImportError as exc:
+        raise RuntimeError("host scheduler lease implementation is unavailable") from exc
+
+    async def run_under_host_leases() -> int:
+        execution = SerializedExecution(options.lease_directory)
+        async with execution.hold_maintenance():
+            run_directory = options.lease_directory.parent
+            for name in ("deployment.json", "maintenance.json", "comfyui-restore.json"):
+                marker = run_directory / name
+                if marker.exists() or marker.is_symlink():
+                    raise RuntimeError(f"host maintenance marker is present: {marker}")
+            recovery_path = run_directory / "recovery.json"
+            if recovery_path.exists() or recovery_path.is_symlink():
+                try:
+                    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("host recovery state is unreadable") from exc
+                if not isinstance(recovery, dict) or recovery.get("state") in {
+                    "recovering",
+                    "quarantined",
+                }:
+                    raise RuntimeError("host recovery is pending or quarantined")
+            print(
+                "scheduler FIFO execution and host operations leases acquired; "
+                "running isolated checkpoint smoke",
+                flush=True,
+            )
+            return await run_thread_shielded(_run_with_host_isolation, options)
+
+    return asyncio.run(run_under_host_leases())
+
+
+def _run(options: argparse.Namespace) -> int:
+    """Load, execute, and tear down the checkpoint smoke under its host leases."""
 
     inference_dir = Path(
         os.environ.get(
@@ -426,6 +670,21 @@ def main() -> int:
                         device,
                         torch,
                     )
+                    if options.forward_smoke:
+                        run_checkpoint_forward_smoke(
+                            kernel=kernel,
+                            reference=reference,
+                            model=model,
+                            args=args,
+                            tokenizer=tokenizer,
+                            checkpoint=checkpoint,
+                            device=device,
+                            torch=torch,
+                            memory=memory,
+                            admission_check=_check_admission,
+                            fence=fence,
+                            release_allocator=release_allocator,
+                        )
                     session_state.close()
                     session_allocated_after_close = torch.cuda.memory_allocated(device)
                     if abs(session_allocated_after_close - session_allocated_before) > _SESSION_ACCOUNTING_TOLERANCE:

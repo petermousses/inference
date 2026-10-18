@@ -6,6 +6,7 @@ import math
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -22,7 +23,12 @@ from redqueen_adapters.memory_profile import MIB, build_profiles, file_signature
 from redqueen_adapters.ownership import OwnedRequest, records
 from redqueen_adapters import scheduler_api
 from redqueen_adapters.scheduler_api import Memory, Runtime, Scheduler, create_apps, footprint
-from redqueen_adapters.scheduler_client import ResourceLock, SchedulerClient, SerializedExecution
+from redqueen_adapters.scheduler_client import (
+    ResourceLock,
+    SchedulerClient,
+    SerializedExecution,
+    run_thread_shielded,
+)
 
 
 def resource(size: int, kind: str = "text") -> dict:
@@ -341,6 +347,20 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         await self.scheduler.reap()
         self.assertEqual(self.runtime.stops, [])
 
+    async def test_pending_comfyui_restore_blocks_model_load_after_operation_lock_release(self):
+        directory = Path(self.directory.name)
+        self.scheduler = Scheduler(self.resources, self.runtime, directory / "leases", self.policy, clock=lambda: 1000)
+        (directory / "comfyui-restore.json").write_text(
+            '{"version":1,"unit":"comfyui.service","was_active":true,"pid":123}'
+        )
+
+        with self.assertRaises(AdmissionError) as error:
+            await self.scheduler.admit("a")
+
+        self.assertEqual(error.exception.code, "maintenance")
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.runtime.stops, [])
+
     async def test_warm_admission_preserves_busy_and_unknown_activity_during_other_load(self):
         self.runtime.loaded = {"a": "ready"}
         await self.scheduler.refresh()
@@ -434,6 +454,117 @@ class ExecutionGateTest(unittest.IsolatedAsyncioTestCase):
             release_second.set()
             await asyncio.gather(first, second, third)
             self.assertTrue(third_started.is_set())
+
+    async def test_maintenance_window_keeps_fifo_and_host_operation_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lease_directory = root / "leases"
+            normal = SerializedExecution(lease_directory)
+            maintenance = SerializedExecution(lease_directory)
+            later = SerializedExecution(lease_directory)
+            queue = lease_directory / "execution-queue"
+            first_started, release_first = asyncio.Event(), asyncio.Event()
+            maintenance_started, release_maintenance = asyncio.Event(), asyncio.Event()
+            later_started = asyncio.Event()
+
+            async def hold_first():
+                async with normal.hold():
+                    first_started.set()
+                    await release_first.wait()
+
+            async def hold_maintenance():
+                async with maintenance.hold_maintenance():
+                    execution_probe = ResourceLock(
+                        lease_directory, "global-execution", exclusive=True
+                    )
+                    self.assertFalse(execution_probe.acquire())
+                    execution_probe.close()
+                    operations_probe = ResourceLock(root, "operations.lock", exclusive=True)
+                    self.assertFalse(operations_probe.acquire())
+                    operations_probe.close()
+                    maintenance_started.set()
+                    await release_maintenance.wait()
+
+            async def hold_later():
+                async with later.hold():
+                    later_started.set()
+
+            async def wait_for_tickets(count):
+                for _ in range(100):
+                    if len(list(queue.glob("*.ticket"))) >= count:
+                        return
+                    await asyncio.sleep(0.01)
+                self.fail("execution ticket was not queued")
+
+            first = asyncio.create_task(hold_first())
+            await first_started.wait()
+            middle = asyncio.create_task(hold_maintenance())
+            await wait_for_tickets(1)
+            queued = asyncio.create_task(hold_later())
+            await wait_for_tickets(2)
+
+            release_first.set()
+            await maintenance_started.wait()
+            self.assertFalse(later_started.is_set())
+            release_maintenance.set()
+            await asyncio.gather(first, middle, queued)
+            self.assertTrue(later_started.is_set())
+
+    async def test_maintenance_window_fails_closed_when_host_operations_are_busy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lease_directory = root / "leases"
+            operations = ResourceLock(root, "operations.lock", exclusive=True)
+            self.assertTrue(operations.acquire())
+            self.addCleanup(operations.close)
+
+            with self.assertRaisesRegex(RuntimeError, "host operations are busy"):
+                async with SerializedExecution(lease_directory).hold_maintenance():
+                    self.fail("maintenance entered despite an occupied host operations lock")
+
+            execution = ResourceLock(lease_directory, "global-execution", exclusive=True)
+            self.assertTrue(execution.acquire())
+            execution.close()
+
+    async def test_maintenance_window_stays_held_until_cancelled_thread_finishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lease_directory = root / "leases"
+            worker_started, release_worker = threading.Event(), threading.Event()
+
+            def worker():
+                worker_started.set()
+                if not release_worker.wait(2):
+                    raise TimeoutError("test worker was not released")
+
+            async def run_worker():
+                async with SerializedExecution(lease_directory).hold_maintenance():
+                    await run_thread_shielded(worker)
+
+            task = asyncio.create_task(run_worker())
+            self.assertTrue(await asyncio.to_thread(worker_started.wait, 2))
+            task.cancel()
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done())
+
+            execution_probe = ResourceLock(
+                lease_directory, "global-execution", exclusive=True
+            )
+            self.assertFalse(execution_probe.acquire())
+            execution_probe.close()
+            operations_probe = ResourceLock(root, "operations.lock", exclusive=True)
+            self.assertFalse(operations_probe.acquire())
+            operations_probe.close()
+
+            release_worker.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            execution = ResourceLock(lease_directory, "global-execution", exclusive=True)
+            self.assertTrue(execution.acquire())
+            execution.close()
+            operations = ResourceLock(root, "operations.lock", exclusive=True)
+            self.assertTrue(operations.acquire())
+            operations.close()
 
 
 class ProxyTest(unittest.IsolatedAsyncioTestCase):
@@ -915,6 +1046,18 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await runtime.ready("comfyui"))
         self.api_ready = True
         self.assertTrue(await runtime.ready("comfyui"))
+
+    async def test_comfy_start_command_waits_past_systemd_readiness_deadline(self):
+        self.resources["comfyui"].update(
+            units=["comfyui.service"], start_command_timeout_s=240
+        )
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+        with patch.object(runtime, "command", new=AsyncMock(return_value="")) as command, patch.object(
+            runtime, "ready", new=AsyncMock(return_value=True)
+        ):
+            await runtime.start("comfyui")
+        self.assertEqual(command.await_args.args, ("start", "comfyui.service"))
+        self.assertEqual(command.await_args.kwargs["timeout"], 240)
 
     async def test_image_readiness_requires_installed_workflow_nodes(self):
         self.resources["comfyui"].update(health_url=str(self.upstream.make_url("/health")), nodes_url=str(self.upstream.make_url("/object_info")), required_nodes=["UnetLoaderGGUF"])

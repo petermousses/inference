@@ -114,6 +114,8 @@ link_path "$host_root/comfyui/download-qwen-image-2.1.sh" \
   /srv/ai/comfyui/download-qwen-image-2.1.sh file yes
 link_path "$host_root/comfyui/extra-model-paths.yaml" \
   /srv/ai/comfyui/extra-model-paths.yaml file yes
+link_path "$host_root/comfyui/custom_nodes/redqueen_admission_guard" \
+  /srv/ai/comfyui/state/custom_nodes/redqueen_admission_guard dir no
 link_path "$host_root/comfyui/prepare-qwen-image-2.1-workflows.sh" \
   /srv/ai/comfyui/prepare-qwen-image-2.1-workflows.sh file yes
 link_path "$host_root/comfyui/qwen-image-2.1.sha256" \

@@ -9,3 +9,5 @@ DS4_HIP_TEST_SUPPORT=1 BUILD_DIR="${build_dir}" "${root}/build.sh"
 DS4_HIP_LIBRARY="${build_dir}/libredqueen_ds4_hip.so" \
 PYTHONPATH="${root}/python${PYTHONPATH:+:${PYTHONPATH}}" \
   "${PYTHON:-python3}" -m unittest discover -s "${root}/tests" -p 'test_*.py' -v
+"${PYTHON:-python3}" -m unittest discover \
+  -s "${root}/../comfyui/tests" -p 'test_*.py' -v

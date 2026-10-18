@@ -77,8 +77,8 @@ def command(*arguments: str, check: bool = True, timeout: float = 35):
     return result
 
 
-def systemctl(*arguments: str, check: bool = True):
-    return command("/usr/bin/systemctl", "--user", *arguments, check=check)
+def systemctl(*arguments: str, check: bool = True, timeout: float = 35):
+    return command("/usr/bin/systemctl", "--user", *arguments, check=check, timeout=timeout)
 
 
 def atomic_write(path: Path, body: bytes, mode: int = 0o600) -> None:
@@ -139,8 +139,26 @@ def operation_lock(directory: Path, *, wait: bool = False):
 def leases_held(directory: Path) -> bool:
     """Only flock ownership matters; file timestamps never expire work."""
     for path in sorted((directory / "leases").glob("*")):
-        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
         try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            # Queue tickets can be removed while a recovery scan is underway.
+            continue
+        if stat.S_ISDIR(mode):
+            # SerializedExecution stores its FIFO tickets in this child
+            # directory. It is not itself a request lease.
+            continue
+        if not stat.S_ISREG(mode):
+            raise RuntimeError(f"unexpected non-regular lease entry: {path}")
+        try:
+            descriptor = os.open(
+                path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+            )
+        except FileNotFoundError:
+            continue
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise RuntimeError(f"lease entry changed type while scanning: {path}")
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -199,7 +217,7 @@ def preflight_unit_body(root: Path) -> bytes:
     return ("[Unit]\n"
             "Description=Recover interrupted Redqueen deployments and validate unattended startup\n"
             "After=network-online.target\nWants=network-online.target\n"
-            "Before=llama-swap.service redqueen-scheduler.service qwen-image-adapter.service jevk5-adapter.service default.target\n"
+            "Before=comfyui.service llama-swap.service redqueen-scheduler.service qwen-image-adapter.service jevk5-adapter.service default.target\n"
             "\n[Service]\nType=oneshot\nRemainAfterExit=yes\n"
             "Environment=PYTHONDONTWRITEBYTECODE=1\nEnvironment=XDG_RUNTIME_DIR=%t\n"
             "Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus\n"
@@ -272,6 +290,18 @@ def transient_directories(root: Path) -> None:
     safe_directory(root / "model-router/run")
     safe_directory(root / "model-router/run/leases", 0o700)
     safe_directory(root / "model-router/run/requests", 0o700)
+    lock_path = root / "model-router/run/operations.lock"
+    descriptor = os.open(
+        lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise RuntimeError(f"operations lock must be a regular ai-owned file: {lock_path}")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
     for relative in ("input", "output", "temp", "user/default/workflows"):
         safe_directory(root / "comfyui/state" / relative)
 
@@ -578,6 +608,148 @@ def front_alive(item: tuple[str, str]) -> bool:
         return False
 
 
+def comfyui_guard_ready() -> bool:
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:8189/redqueen/admission-guard", timeout=2
+        ) as response:
+            body = response.read(4097)
+    except (OSError, urllib.error.URLError, TimeoutError):
+        return False
+    if len(body) > 4096:
+        return False
+    try:
+        status = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(status, dict)
+        and status.get("component") == "redqueen-prompt-admission"
+        and not isinstance(status.get("version"), bool)
+        and status.get("version") == 1
+        and isinstance(status.get("pid"), int)
+        and not isinstance(status.get("pid"), bool)
+        and status["pid"] > 0
+    )
+
+
+def restore_comfyui_if_requested(root: Path, state: dict, *, now: float) -> None:
+    """Finish a ComfyUI stop interrupted after its durable restore marker."""
+    directory = root / "model-router/run"
+    marker = directory / "comfyui-restore.json"
+    try:
+        descriptor = os.open(
+            marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        )
+    except FileNotFoundError:
+        state.pop("comfyui_restore", None)
+        return
+    except OSError as error:
+        state["comfyui_restore"] = {
+            "state": "quarantined",
+            "reason": f"restore marker cannot be opened: {type(error).__name__}",
+        }
+        return
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > 4096
+        ):
+            state["comfyui_restore"] = {
+                "state": "quarantined",
+                "reason": "restore marker is not a private regular ai-owned file",
+            }
+            return
+        body = os.read(descriptor, 4097)
+    finally:
+        os.close(descriptor)
+    if len(body) > 4096:
+        state["comfyui_restore"] = {
+            "state": "quarantined",
+            "reason": "restore marker exceeds its size limit",
+        }
+        return
+    try:
+        document = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        state["comfyui_restore"] = {
+            "state": "quarantined",
+            "reason": f"restore marker is unreadable: {type(error).__name__}",
+        }
+        return
+    if (
+        not isinstance(document, dict)
+        or isinstance(document.get("version"), bool)
+        or document.get("version") != 1
+        or document.get("unit") != "comfyui.service"
+        or document.get("was_active") is not True
+        or isinstance(document.get("pid"), bool)
+        or not isinstance(document.get("pid"), int)
+        or document["pid"] < 1
+    ):
+        state["comfyui_restore"] = {
+            "state": "quarantined",
+            "reason": "restore marker contents are invalid",
+        }
+        return
+
+    previous = state.get("comfyui_restore", {})
+    retry_at = previous.get("next_retry", 0) if isinstance(previous, dict) else 0
+    if isinstance(retry_at, (int, float)) and not isinstance(retry_at, bool) and now < retry_at:
+        return
+    try:
+        with operation_lock(directory):
+            # The smoke may have restored and removed the marker while this
+            # supervisor was waiting for the same operation lock.
+            if not marker.exists():
+                state.pop("comfyui_restore", None)
+                return
+            if any((directory / name).exists() for name in ("deployment.json", "maintenance.json")):
+                state["comfyui_restore"] = {
+                    "state": "deferred",
+                    "reason": "host maintenance is still active",
+                }
+                return
+            if leases_held(directory):
+                state["comfyui_restore"] = {
+                    "state": "deferred",
+                    "reason": "inference work is active",
+                }
+                return
+
+            active = systemctl(
+                "show", "comfyui.service", "--property=ActiveState", "--value"
+            )
+            active_state = active.stdout.strip()
+            if active_state in {"inactive", "failed"}:
+                systemctl("reset-failed", "comfyui.service", check=False)
+                systemctl("start", "comfyui.service", timeout=240)
+            elif active_state == "active" and not comfyui_guard_ready():
+                systemctl("restart", "comfyui.service", timeout=240)
+            active = systemctl(
+                "show", "comfyui.service", "--property=ActiveState", "--value"
+            )
+            active_state = active.stdout.strip()
+            if active_state != "active" or not comfyui_guard_ready():
+                raise RuntimeError("ComfyUI did not return with its admission guard ready")
+            durable_unlink(marker)
+            state.pop("comfyui_restore", None)
+    except MaintenanceBusy as error:
+        state["comfyui_restore"] = {
+            "state": "deferred",
+            "reason": str(error),
+        }
+    except Exception as error:
+        state["comfyui_restore"] = {
+            "state": "cooling_down",
+            "reason": f"restore failed: {type(error).__name__}",
+            "next_retry": now + 60,
+        }
+
+
 def supervise_once(root: Path, state: dict, *, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     directory = root / "model-router/run"
@@ -592,6 +764,7 @@ def supervise_once(root: Path, state: dict, *, now: float | None = None) -> dict
         # candidate services. Leave the journal intact for operator diagnosis.
         atomic_json(directory / "supervisor.json", state)
         return state
+    restore_comfyui_if_requested(root, state, now=now)
     with ThreadPoolExecutor(max_workers=len(FRONT_URLS)) as executor:
         checks = list(executor.map(front_alive, FRONT_URLS.items()))
     maintenance_path = directory / "maintenance.json"
