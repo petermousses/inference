@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from checkpoint_mapping_audit import (
     _execute_pinned_model,
@@ -19,6 +20,7 @@ from dense_checkpoint import (
     DenseTensorPlan,
     load_dense_checkpoint,
 )
+from session_state import SessionStateMemoryEstimate, load_session_state, plan_session_state
 from torch_checkpoint import read_rows_to_device
 
 
@@ -27,7 +29,9 @@ _MAX_MANAGED_GTT = 88 * _GIB
 _MAX_MANAGED_PHYSICAL = 104 * _GIB
 _MIN_HOST_AVAILABLE = 8 * _GIB
 _PREFILL_HEADROOM = 5 * _GIB
+_HOST_PREFILL_HEADROOM = 5 * _GIB
 _GTT_RELEASE_TOLERANCE = 256 * 1024 * 1024
+_SESSION_ACCOUNTING_TOLERANCE = 16 * 1024 * 1024
 
 
 def _memory_snapshot() -> tuple[int, int, int]:
@@ -49,17 +53,31 @@ def _memory_snapshot() -> tuple[int, int, int]:
     return gtt_total - gtt_used, host_available_kib * 1024, gtt_total
 
 
-def _check_admission(estimate: DenseLoadMemoryEstimate) -> tuple[int, int, int]:
+def _check_admission(estimate) -> tuple[int, int, int]:
     if estimate.device_peak_bytes > _MAX_MANAGED_GTT:
-        raise RuntimeError("dense load exceeds the 88 GiB managed GTT ceiling")
+        raise RuntimeError("model allocation exceeds the 88 GiB managed GTT ceiling")
     if estimate.physical_peak_bytes > _MAX_MANAGED_PHYSICAL:
-        raise RuntimeError("dense load exceeds the 104 GiB managed physical-memory ceiling")
+        raise RuntimeError("model allocation exceeds the 104 GiB managed physical-memory ceiling")
     free_gtt, host_available, _gtt_total = _memory_snapshot()
     if free_gtt < estimate.device_peak_bytes + _PREFILL_HEADROOM:
-        raise RuntimeError("dense load would consume the 5 GiB prefill headroom")
-    if host_available - estimate.physical_peak_bytes < _MIN_HOST_AVAILABLE:
-        raise RuntimeError("dense load would leave less than 8 GiB host memory available")
+        raise RuntimeError("model allocation would consume the 5 GiB prefill headroom")
+    if host_available - estimate.physical_peak_bytes < _MIN_HOST_AVAILABLE + _HOST_PREFILL_HEADROOM:
+        raise RuntimeError("model allocation would violate the 8 GiB host minimum plus 5 GiB prefill headroom")
     return free_gtt, host_available, _gtt_total
+
+
+def _combined_startup_estimate(dense, session):
+    return SimpleNamespace(
+        resident_device_bytes=dense.resident_device_bytes + session.resident_device_bytes,
+        device_peak_bytes=max(
+            dense.device_peak_bytes,
+            dense.resident_device_bytes + session.device_peak_bytes,
+        ),
+        physical_peak_bytes=max(
+            dense.physical_peak_bytes,
+            dense.resident_device_bytes + session.physical_peak_bytes,
+        ),
+    )
 
 
 def _verify_loaded_categories(model, plan, torch) -> None:
@@ -151,9 +169,42 @@ def _verify_converted_samples(checkpoint, model, plan, device, torch) -> tuple[s
     return direct_item.target_name, wo_a_item.target_name
 
 
+def _buffer_at(model, name: str):
+    module_name, separator, attribute = name.rpartition(".")
+    module = model.get_submodule(module_name) if separator else model
+    return module._buffers[attribute]
+
+
+def _verify_session_state(model, state, frequency_factory, device, torch) -> None:
+    factory_cache_clear = getattr(frequency_factory, "cache_clear", None)
+    if callable(factory_cache_clear):
+        factory_cache_clear()
+    try:
+        for allocation in state.plan.allocations:
+            values = [_buffer_at(model, name) for name in allocation.names]
+            if not values or any(value.is_meta or value.device != device for value in values):
+                raise RuntimeError(f"session buffer is missing from the HIP device: {allocation.names}")
+            if allocation.kind == "freqs_cis":
+                if any(value is not values[0] for value in values[1:]):
+                    raise RuntimeError(f"shared rotary table was duplicated: {allocation.names}")
+                with torch.device(device):
+                    expected = frequency_factory(*allocation.frequency_key)
+                if expected.device != device or not torch.equal(values[0], expected):
+                    raise AssertionError(f"official rotary values differ: {allocation.names[0]}")
+                del expected
+            elif allocation.kind == "score_state":
+                if not torch.isneginf(values[0]).all().item():
+                    raise AssertionError(f"compressor score state was not initialized to -inf: {allocation.names[0]}")
+            elif torch.count_nonzero(values[0]).item() != 0:
+                raise AssertionError(f"session cache was not zero initialized: {allocation.names[0]}")
+    finally:
+        if callable(factory_cache_clear):
+            factory_cache_clear()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Load dense DeepSeek 1017 state on Redqueen under managed memory ceilings."
+        description="Load dense DeepSeek 1017 weights and a 220k-token session on Redqueen."
     )
     parser.add_argument("--estimate-only", action="store_true")
     options = parser.parse_args()
@@ -198,7 +249,7 @@ def main() -> int:
                 torch.set_default_dtype(torch.bfloat16)
                 args = reference["ModelArgs"](**model_config)
                 args.max_batch_size = 1
-                args.max_seq_len = 1
+                args.max_seq_len = 220000
                 tokenizer = AutoTokenizer.from_pretrained(
                     str(checkpoint_root), local_files_only=True
                 )
@@ -211,46 +262,87 @@ def main() -> int:
                 checkpoint_root,
                 expected_revision=kernel.REFERENCE_COMMIT,
             ) as checkpoint:
-                memory = {"active": False, "free_gtt_before_load": None}
+                memory = {
+                    "active_leases": 0,
+                    "free_gtt_before_load": None,
+                    "session_allocated_before": None,
+                    "session_reserved_before": None,
+                }
 
-                def admission(estimate: DenseLoadMemoryEstimate):
-                    free_gtt, host_available, gtt_total = _check_admission(estimate)
+                def admission(estimate):
+                    component_free, component_host, component_total = _check_admission(estimate)
+                    combined = None
+                    if isinstance(estimate, DenseLoadMemoryEstimate):
+                        session_plan = plan_session_state(model, args)
+                        combined = _combined_startup_estimate(estimate, session_plan.estimate)
+                        combined_free, combined_host, combined_total = _check_admission(combined)
+                        summary = (
+                            f"tensors={estimate.dense_tensor_count}; "
+                            f"experts kept meta={estimate.routed_expert_target_bytes / _GIB:.2f} GiB; "
+                            f"Engram tables kept meta={estimate.engram_table_target_bytes / _GIB:.2f} GiB"
+                        )
+                        prefix = "dense load"
+                    elif isinstance(estimate, SessionStateMemoryEstimate):
+                        summary = (
+                            f"buffers={estimate.buffer_count}; rotary={estimate.rotary_bytes / _GIB:.3f} GiB; "
+                            f"windows={estimate.window_kv_bytes / _GIB:.3f} GiB; "
+                            f"compressed KV={estimate.compressed_kv_bytes / _GIB:.3f} GiB; "
+                            f"index cache={estimate.index_cache_bytes / _GIB:.3f} GiB"
+                        )
+                        prefix = "220k session"
+                    else:
+                        raise TypeError(f"unsupported smoke reservation estimate: {type(estimate).__name__}")
                     print(
-                        "dense load admission: "
-                        f"tensors={estimate.dense_tensor_count}, "
-                        f"resident={estimate.resident_device_bytes / _GIB:.2f} GiB, "
+                        f"{prefix} admission: {summary}; "
+                        f"resident={estimate.resident_device_bytes / _GIB:.2f} GiB; "
                         f"GTT peak={estimate.device_peak_bytes / _GIB:.2f} GiB "
-                        f"(free={free_gtt / _GIB:.2f}/{gtt_total / _GIB:.2f} GiB), "
-                        f"physical peak={estimate.physical_peak_bytes / _GIB:.2f} GiB, "
-                        f"host available={host_available / _GIB:.2f} GiB, "
-                        f"experts kept meta={estimate.routed_expert_target_bytes / _GIB:.2f} GiB, "
-                        f"Engram tables kept meta={estimate.engram_table_target_bytes / _GIB:.2f} GiB",
+                        f"(free={component_free / _GIB:.2f}/{component_total / _GIB:.2f} GiB); "
+                        f"physical peak={estimate.physical_peak_bytes / _GIB:.2f} GiB; "
+                        f"host available={component_host / _GIB:.2f} GiB",
                         flush=True,
                     )
+                    if combined is not None:
+                        print(
+                            "combined dense plus 220k session estimate: "
+                            f"resident={combined.resident_device_bytes / _GIB:.2f} GiB; "
+                            f"GTT peak={combined.device_peak_bytes / _GIB:.2f} GiB "
+                            f"(free={combined_free / _GIB:.2f}/{combined_total / _GIB:.2f} GiB); "
+                            f"physical peak={combined.physical_peak_bytes / _GIB:.2f} GiB; "
+                            f"host available={combined_host / _GIB:.2f} GiB",
+                            flush=True,
+                        )
                     if options.estimate_only:
                         raise SystemExit(0)
 
                     class SmokeReservation:
                         def __enter__(self):
                             free_gtt, _host_available, _gtt_total = _check_admission(estimate)
-                            memory["free_gtt_before_load"] = free_gtt
-                            memory["active"] = True
+                            if isinstance(estimate, DenseLoadMemoryEstimate):
+                                memory["free_gtt_before_load"] = free_gtt
+                            elif isinstance(estimate, SessionStateMemoryEstimate):
+                                torch.cuda.synchronize(device)
+                                torch.cuda.reset_peak_memory_stats(device)
+                                memory["session_allocated_before"] = torch.cuda.memory_allocated(device)
+                                memory["session_reserved_before"] = torch.cuda.memory_reserved(device)
+                            memory["active_leases"] += 1
                             return self
 
                         def __exit__(self, exc_type, exc, traceback):
-                            memory["active"] = False
+                            memory["active_leases"] -= 1
+                            if memory["active_leases"] < 0:
+                                raise RuntimeError("smoke reservation lease count underflow")
                             return False
 
                     return SmokeReservation()
 
                 def fence():
-                    if not memory["active"]:
-                        raise RuntimeError("dense state was fenced outside its memory admission")
+                    if memory["active_leases"] <= 0:
+                        raise RuntimeError("model state was fenced outside memory admission")
                     torch.cuda.synchronize(device)
 
                 def release_allocator():
-                    if not memory["active"]:
-                        raise RuntimeError("dense allocator release escaped its memory admission")
+                    if memory["active_leases"] <= 0:
+                        raise RuntimeError("allocator release escaped memory admission")
                     torch.cuda.empty_cache()
 
                 def progress(done: int, total: int, item: DenseTensorPlan):
@@ -260,9 +352,10 @@ def main() -> int:
                             flush=True,
                         )
 
-                state = None
+                dense_state = None
+                session_state = None
                 try:
-                    state = load_dense_checkpoint(
+                    dense_state = load_dense_checkpoint(
                         checkpoint,
                         model,
                         device=device,
@@ -271,36 +364,109 @@ def main() -> int:
                         release_allocator=release_allocator,
                         progress=progress,
                     )
-                    plan = state.plan
+                    plan = dense_state.plan
                     _verify_loaded_categories(model, plan, torch)
                     direct_name, wo_a_name = _verify_converted_samples(
                         checkpoint, model, plan, device, torch
                     )
-                    state.close()
+                    if model.max_seq_len != args.max_seq_len:
+                        raise RuntimeError("meta model was not constructed for the 220k session limit")
+
+                    def reset_runtime_references():
+                        shared = reference["shared_attn"]
+                        for name in ("compress_kv", "index_k", "topk_idxs", "candidates"):
+                            setattr(shared, name, None)
+                        for module in model.modules():
+                            if module.__class__.__name__ == "Indexer":
+                                module.freqs_cis = None
+
+                    session_state = load_session_state(
+                        model,
+                        args,
+                        device=device,
+                        frequency_factory=reference["precompute_freqs_cis"],
+                        admission=admission,
+                        fence=fence,
+                        reset_runtime_references=reset_runtime_references,
+                        release_allocator=release_allocator,
+                    )
+                    session_plan = session_state.plan
+                    session_allocated_before = memory["session_allocated_before"]
+                    session_reserved_before = memory["session_reserved_before"]
+                    if session_allocated_before is None or session_reserved_before is None:
+                        raise RuntimeError("session allocation and allocator baselines were not captured")
+                    torch.cuda.synchronize(device)
+                    session_allocated_after = torch.cuda.memory_allocated(device)
+                    actual_session_bytes = session_allocated_after - session_allocated_before
+                    if abs(actual_session_bytes - session_plan.estimate.resident_device_bytes) > _SESSION_ACCOUNTING_TOLERANCE:
+                        raise RuntimeError(
+                            "session tensor allocations differ from the admitted resident estimate: "
+                            f"actual={actual_session_bytes}, "
+                            f"estimated={session_plan.estimate.resident_device_bytes}"
+                        )
+                    session_peak_bytes = torch.cuda.max_memory_allocated(device) - session_allocated_before
+                    if session_peak_bytes > session_plan.estimate.device_peak_bytes + _SESSION_ACCOUNTING_TOLERANCE:
+                        raise RuntimeError(
+                            "session allocation peak exceeded the admitted estimate: "
+                            f"actual={session_peak_bytes}, estimated={session_plan.estimate.device_peak_bytes}"
+                        )
+                    session_reserved_peak_bytes = (
+                        torch.cuda.max_memory_reserved(device) - session_reserved_before
+                    )
+                    if session_reserved_peak_bytes > session_plan.estimate.device_peak_bytes + _SESSION_ACCOUNTING_TOLERANCE:
+                        raise RuntimeError(
+                            "session allocator-reserved peak exceeded the admitted estimate: "
+                            f"actual={session_reserved_peak_bytes}, "
+                            f"estimated={session_plan.estimate.device_peak_bytes}"
+                        )
+                    _verify_session_state(
+                        model,
+                        session_state,
+                        reference["precompute_freqs_cis"],
+                        device,
+                        torch,
+                    )
+                    session_state.close()
+                    session_allocated_after_close = torch.cuda.memory_allocated(device)
+                    if abs(session_allocated_after_close - session_allocated_before) > _SESSION_ACCOUNTING_TOLERANCE:
+                        raise RuntimeError("session close retained allocated CUDA tensor storage")
+                    if any(
+                        not container[attribute].is_meta
+                        for allocation in session_plan.allocations
+                        for container, attribute, _original in allocation.locations
+                    ):
+                        raise RuntimeError("session close did not restore buffers to meta state")
+                    dense_state.close()
                     if not all(
                         tensor.is_meta for tensor in model.state_dict(keep_vars=True).values()
                     ):
-                        raise RuntimeError("dense close did not restore the graph to meta state")
+                        raise RuntimeError("dense close did not restore checkpoint state to meta")
                     free_gtt_after, _, _ = _memory_snapshot()
                     free_gtt_before = memory["free_gtt_before_load"]
                     if free_gtt_before is None or (
                         free_gtt_after + _GTT_RELEASE_TOLERANCE < free_gtt_before
                     ):
                         raise RuntimeError(
-                            "dense close did not return GTT backing to the pre-load baseline: "
+                            "model-state close did not return GTT backing to the pre-load baseline: "
                             f"before={free_gtt_before}, after={free_gtt_after}"
                         )
                 finally:
-                    if state is not None and not state._closed and not state._quarantined:
-                        state.close()
+                    if session_state is not None and not session_state._closed and not session_state._quarantined:
+                        session_state.close()
+                    if dense_state is not None and not dense_state._closed and not dense_state._quarantined:
+                        dense_state.close()
 
                 print(
-                    "pinned dense checkpoint HIP smoke: PASS; "
+                    "pinned dense checkpoint and 220k session-state HIP smoke: PASS; "
                     f"hip={torch.version.hip}; loaded={plan.estimate.dense_tensor_count} tensors; "
                     f"resident={plan.estimate.resident_device_bytes / _GIB:.2f} GiB; "
+                    f"session={session_plan.estimate.resident_device_bytes / _GIB:.3f} GiB; "
+                    f"session allocation delta={actual_session_bytes / _GIB:.3f} GiB; "
+                    f"session peak={session_peak_bytes / _GIB:.3f} GiB; "
+                    f"allocator-reserved peak={session_reserved_peak_bytes / _GIB:.3f} GiB; "
                     f"direct={direct_name}; wo_a={wo_a_name}; "
-                    "routed experts and Engram tables remained meta; close restored all checkpoint state "
-                    "and returned GTT backing to baseline"
+                    "routed experts and Engram tables remained meta; all 220k session buffers matched "
+                    "official initialization; close restored checkpoint/session state and returned GTT backing"
                 )
     finally:
         sys.path[:] = previous_path
