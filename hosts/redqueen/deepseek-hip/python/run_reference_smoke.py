@@ -42,8 +42,12 @@ def main() -> None:
     usage = {"rmsnorm": 0, "rope": 0}
     # run_path returns a shallow globals copy; function objects still resolve
     # names through their original module dictionary.
-    model_globals = reference["Transformer"].forward.__globals__
-    rmsnorm_class = model_globals["RMSNorm"]
+    rmsnorm_class = reference["RMSNorm"]
+    model_globals = rmsnorm_class.forward.__globals__
+    if model_globals.get("RMSNorm") is not rmsnorm_class:
+        raise RuntimeError("could not resolve pinned model module globals")
+    if "apply_rotary_emb" not in model_globals:
+        raise RuntimeError("pinned model module has no apply_rotary_emb global")
 
     def native_rmsnorm(self, x):
         usage["rmsnorm"] += 1
