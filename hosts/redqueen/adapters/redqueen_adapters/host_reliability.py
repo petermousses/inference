@@ -27,7 +27,7 @@ import urllib.request
 
 
 FRONT_URLS = {
-    "llama-swap.service": "http://127.0.0.1:8083/health",
+    "llama-swap.service": "http://127.0.0.1:8084/health",
     "redqueen-scheduler.service": "http://10.9.20.242:8081/healthz",
     "qwen-image-adapter.service": "http://10.9.20.242:8190/healthz",
     "jevk5-adapter.service": "http://10.9.20.242:8191/healthz",

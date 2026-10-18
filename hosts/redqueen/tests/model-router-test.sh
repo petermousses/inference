@@ -5,6 +5,7 @@ readonly test_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly host_root="$(cd -- "${test_root}/.." && pwd)"
 readonly repo_root="$(cd -- "${host_root}/../.." && pwd)"
 readonly router_config="${host_root}/model-router/config.yaml"
+readonly scheduler_policy="${host_root}/model-router/scheduler.json"
 
 readonly -a text_models=(
   qwen3.8-27b
@@ -39,6 +40,18 @@ grep -Fq -- '--ctx-size 220000' "${router_config}"
 grep -Fq -- "--chat-template-kwargs '{\"clear_thinking\":true}'" "${router_config}"
 grep -Fq '          swap: false' "${router_config}"
 grep -Fq '          exclusive: false' "${router_config}"
+python3 - "${scheduler_policy}" <<'PY'
+import json
+import pathlib
+import sys
+
+policy = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert policy["upstream_url"] == "http://127.0.0.1:8084"
+assert policy["gpu_budget_mib"] == 88 * 1024
+assert policy["host_budget_mib"] == 104 * 1024
+assert policy["minimum_host_available_mib"] == 8 * 1024
+assert policy["prefill_headroom_mib"] == 5 * 1024
+PY
 if grep -Fq 'deepseek-v4.1-flash-q2' "${router_config}"; then
   printf 'DeepSeek is not eligible for registration until its weights verify\n' >&2
   exit 1
@@ -69,7 +82,7 @@ PY
   fi
 done
 
-grep -Fq -- '--listen 127.0.0.1:8083' "${host_root}/systemd/llama-swap.service"
+grep -Fq -- '--listen 127.0.0.1:8084' "${host_root}/systemd/llama-swap.service"
 grep -Fq 'ProtectHome=read-only' "${host_root}/systemd/redqueen-scheduler.service"
 
 printf 'static model-router and image-pipeline checks passed\n'

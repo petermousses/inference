@@ -3,8 +3,10 @@ set -euo pipefail
 umask 0027
 
 readonly model_root="${MODEL_ROOT:-/srv/ai/models}"
-readonly required_bytes=429332209744
+readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly required_bytes=573929568511
 readonly reserve_bytes=100000000000
+readonly deepseek_1017_bytes=510311045295
 # the xet resolver rejects open-ended ranges for very large artifacts.
 readonly ranged_download_threshold_bytes=2147483648
 readonly ranged_download_chunk_bytes=1073741824
@@ -16,8 +18,8 @@ fi
 
 plan() {
   printf '%-32s %12s  %s\n' MODEL BYTES FILE
-  printf '%-32s %12s  %s\n' deepseek-v4.1-flash-q2 365713686528 \
-    DeepSeek-V4.1-Flash-Q2.gguf
+  printf '%-32s %12s  %s\n' deepseek-v4.1-flash-1017 \
+    "${deepseek_1017_bytes}" 'official Safetensors checkpoint (48 shards + tokenizer/config/encoding)'
   printf '%-32s %12s  %s\n' gemma-4-e4b-it 5150682208 \
     'Q4_0 GGUF + Q8_0 vision projector'
   printf '%-32s %12s  %s\n' gemma-4-12b-it 7378660832 \
@@ -32,6 +34,39 @@ plan() {
   printf 'destination root: %s\n' "${model_root}"
 }
 
+validate_deepseek_1017_manifest() {
+  local manifest="${script_dir}/deepseek-v4.1-flash-1017.files.tsv"
+  local source_path expected_size expected_sha256 source_oid
+  local file_count=0 total_bytes=0
+
+  [[ -s "${manifest}" ]] || {
+    printf 'missing DeepSeek file inventory: %s\n' "${manifest}" >&2
+    return 1
+  }
+
+  while IFS=$'\t' read -r source_path expected_size expected_sha256 source_oid; do
+    [[ -n "${source_path}" ]] || continue
+    [[ "${source_path}" != /* && "/${source_path}/" != *"/../"* ]] || {
+      printf 'unsafe path in DeepSeek file inventory: %s\n' "${source_path}" >&2
+      return 1
+    }
+    [[ "${expected_size}" =~ ^[0-9]+$ \
+      && "${expected_sha256}" =~ ^[0-9a-f]{64}$ \
+      && "${source_oid}" =~ ^[0-9a-f]{40}$ ]] || {
+      printf 'invalid DeepSeek file inventory row for %s\n' "${source_path}" >&2
+      return 1
+    }
+    file_count=$((file_count + 1))
+    total_bytes=$((total_bytes + expected_size))
+  done <"${manifest}"
+
+  [[ "${file_count}" -eq 83 && "${total_bytes}" -eq "${deepseek_1017_bytes}" ]] || {
+    printf 'unexpected DeepSeek inventory: expected 83 files / %s bytes, found %s files / %s bytes\n' \
+      "${deepseek_1017_bytes}" "${file_count}" "${total_bytes}" >&2
+    return 1
+  }
+}
+
 verify_all() {
   local model_id root
   for model_id in \
@@ -40,7 +75,7 @@ verify_all() {
     gemma-4-26b-a4b-it \
     qwen-image-2.1-uncensored \
     qwen3.6-35b-a3b \
-    deepseek-v4.1-flash-q2; do
+    deepseek-v4.1-flash-1017; do
     root="${model_root}/${model_id}"
     [[ -s "${root}/SHA256SUMS" ]] || {
       printf 'missing checksum manifest: %s\n' "${root}/SHA256SUMS" >&2
@@ -51,6 +86,7 @@ verify_all() {
   done
 }
 
+download_scope=all
 case "${1:---plan}" in
   --plan)
     plan
@@ -62,8 +98,11 @@ case "${1:---plan}" in
     ;;
   --download)
     ;;
+  --download-deepseek-1017)
+    download_scope=deepseek-only
+    ;;
   *)
-    printf 'usage: %s [--plan|--download|--verify-only]\n' "$0" >&2
+    printf 'usage: %s [--plan|--download|--download-deepseek-1017|--verify-only]\n' "$0" >&2
     exit 2
     ;;
 esac
@@ -75,10 +114,16 @@ flock -n 9 || {
   exit 1
 }
 
+validate_deepseek_1017_manifest
+
 available_bytes="$(df -B1 --output=avail "${model_root}" | tail -n 1 | tr -d ' ')"
-if (( available_bytes < required_bytes + reserve_bytes )); then
+required_download_bytes="${required_bytes}"
+if [[ "${download_scope}" == "deepseek-only" ]]; then
+  required_download_bytes="${deepseek_1017_bytes}"
+fi
+if (( available_bytes < required_download_bytes + reserve_bytes )); then
   printf 'need at least %s bytes plus %s bytes of free-space reserve; found %s\n' \
-    "${required_bytes}" "${reserve_bytes}" "${available_bytes}" >&2
+    "${required_download_bytes}" "${reserve_bytes}" "${available_bytes}" >&2
   exit 1
 fi
 
@@ -347,6 +392,39 @@ finish_model() {
   )
 }
 
+finish_snapshot_model() {
+  local model_id="$1"
+  local root="${model_root}/${model_id}"
+  (
+    cd -- "${root}"
+    sha256sum SOURCE_REVISION >>.SHA256SUMS.tmp
+    mv -- .SHA256SUMS.tmp SHA256SUMS
+    chmod 0440 SHA256SUMS
+    sha256sum --check SHA256SUMS
+  )
+}
+
+download_deepseek_1017() {
+  local model_id=deepseek-v4.1-flash-1017
+  local source_path expected_size expected_sha256 source_oid
+
+  prepare_manifest "${model_id}"
+  while IFS=$'\t' read -r source_path expected_size expected_sha256 source_oid; do
+    [[ -n "${source_path}" ]] || continue
+    download_artifact "${model_id}" \
+      deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+      1bae0e1088993b9b82de08f59de5be5a34e42170 \
+      "${source_path}" "${source_path}" "${expected_size}" "${expected_sha256}"
+  done <"${script_dir}/deepseek-v4.1-flash-1017.files.tsv"
+  write_source_revision "${model_id}" \
+    'repository=deepseek-ai/DeepSeek-V4.1-Flash-1017' \
+    'revision=1bae0e1088993b9b82de08f59de5be5a34e42170' \
+    'files=83; bytes=510311045295; safetensors_shards=48' \
+    'file_inventory=deepseek-v4.1-flash-1017.files.tsv' \
+    'license=MIT'
+  finish_snapshot_model "${model_id}"
+}
+
 prepare_manifest() {
   local model_id="$1"
   local root="${model_root}/${model_id}"
@@ -397,6 +475,12 @@ download_gemma() {
     'license=Apache-2.0'
   finish_model "${model_id}"
 }
+
+if [[ "${download_scope}" == "deepseek-only" ]]; then
+  download_deepseek_1017
+  printf 'DeepSeek-V4.1-Flash-1017 downloaded and SHA-256 verified\n'
+  exit 0
+fi
 
 download_gemma gemma-4-e4b-it \
   ggml-org/gemma-4-E4B-it-GGUF \
@@ -489,27 +573,6 @@ write_source_revision qwen3.6-35b-a3b \
   'license=Apache-2.0'
 finish_model qwen3.6-35b-a3b
 
-prepare_manifest deepseek-v4.1-flash-q2
-download_artifact deepseek-v4.1-flash-q2 \
-  antirez/deepseek-v4.1-flash-gguf \
-  dd8a266f7145edc19e2334b46e19b6821f221dc7 \
-  DeepSeek-V4.1-Flash-Q2.gguf \
-  DeepSeek-V4.1-Flash-Q2.gguf \
-  365713686528 1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42
-download_text deepseek-v4.1-flash-q2 \
-  'https://huggingface.co/antirez/deepseek-v4.1-flash-gguf/resolve/dd8a266f7145edc19e2334b46e19b6821f221dc7/LICENSE?download=true' \
-  LICENSE
-fetch_model_docs deepseek-v4.1-flash-q2 \
-  antirez/deepseek-v4.1-flash-gguf \
-  dd8a266f7145edc19e2334b46e19b6821f221dc7
-write_source_revision deepseek-v4.1-flash-q2 \
-  'repository=antirez/deepseek-v4.1-flash-gguf' \
-  'revision=dd8a266f7145edc19e2334b46e19b6821f221dc7' \
-  'source_model_repository=deepseek-ai/DeepSeek-V4.1-Flash' \
-  'source_model_revision=df42c109f1defefcbfcedbe7d905718a12266e40' \
-  'quantization=Q2 hybrid; 188.83 GiB FP8 Engram tables included' \
-  'runtime_target=DwarfStar experimental DeepSeek-V4.1 path; not stock llama.cpp' \
-  'license=MIT'
-finish_model deepseek-v4.1-flash-q2
+download_deepseek_1017
 
 printf 'all evaluation model artifacts downloaded and SHA-256 verified\n'
