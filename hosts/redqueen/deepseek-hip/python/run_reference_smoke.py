@@ -65,11 +65,9 @@ def main() -> None:
         or swiglu_limit <= 0
     ):
         raise SystemExit("pinned 1017 config must declare a positive swiglu_limit")
-    n_mtp_layers = model_config.get("num_nextn_predict_layers")
+    n_mtp_layers = model_config.get("n_mtp_layers")
     if type(n_mtp_layers) is not int or n_mtp_layers < 1:
-        raise SystemExit(
-            "pinned 1017 config must declare a positive num_nextn_predict_layers"
-        )
+        raise SystemExit("pinned 1017 config must declare a positive n_mtp_layers")
 
     adapter_dir = Path(__file__).resolve().parent
     checkpoint_root = inference_dir.parent
