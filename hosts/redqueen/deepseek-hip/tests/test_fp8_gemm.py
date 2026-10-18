@@ -162,9 +162,12 @@ class NativeFp8GemmTest(unittest.TestCase):
         a = torch.zeros((m, k), dtype=torch.float8_e4m3fn)
         b = torch.zeros((n, k), dtype=torch.float8_e4m3fn)
         a[:, 0] = 1.0
-        a[:, 1] = 0.0625
+        a[0, 1] = 0.0625
+        a[1, 1] = 0.09375
         b[:, 0] = 1.0
-        b[:, 1] = 0.0625
+        b[0, 1] = 0.0625
+        b[1, 1] = 0.125
+        b[2, 1] = 0.0625
         a_bytes = a.view(torch.uint8)
         b_bytes = b.view(torch.uint8)
         scales_a = torch.full((m, 1), 127, dtype=torch.uint8)
@@ -172,9 +175,18 @@ class NativeFp8GemmTest(unittest.TestCase):
 
         fp32 = self.call_gemm(a_bytes, scales_a, b_bytes, scales_b, group_size, torch.float32, guarded=True)
         bf16 = self.call_gemm(a_bytes, scales_a, b_bytes, scales_b, group_size, torch.bfloat16, guarded=True)
-        midpoint = 1.0 + 2.0**-8
-        self.assertTrue(torch.equal(fp32, torch.full((m, n), midpoint, dtype=torch.float32)))
-        self.assertTrue(torch.equal(bf16, torch.ones((m, n), dtype=torch.bfloat16)))
+        expected_fp32 = torch.tensor(
+            [
+                [1.0 + 2.0**-8, 1.0 + 2.0**-7, 1.0 + 2.0**-8],
+                [1.0 + 3.0 * 2.0**-9, 1.0 + 3.0 * 2.0**-8, 1.0 + 3.0 * 2.0**-9],
+            ],
+            dtype=torch.float32,
+        )
+        expected_bf16 = torch.tensor(
+            [[1.0, 1.0078125, 1.0], [1.0078125, 1.015625, 1.0078125]], dtype=torch.bfloat16
+        )
+        self.assertTrue(torch.equal(fp32, expected_fp32))
+        self.assertTrue(torch.equal(bf16, expected_bf16))
 
     def test_non_tile_aligned_shapes_are_bounds_safe(self):
         generator = torch.Generator(device="cpu").manual_seed(41017)
