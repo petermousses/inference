@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import threading
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
@@ -309,6 +311,7 @@ class ComfyUISmokeGuardTest(unittest.TestCase):
     def test_active_comfyui_jobs_fail_closed_without_stopping_service(self):
         with (
             patch.object(run_dense_checkpoint_smoke, "_comfyui_state", return_value="active"),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_guard_ready", return_value=True),
             patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle", return_value=False),
             patch.object(run_dense_checkpoint_smoke, "_comfyui_systemctl") as control,
         ):
@@ -317,34 +320,75 @@ class ComfyUISmokeGuardTest(unittest.TestCase):
                     self.fail("checkpoint work started over an active ComfyUI job")
         control.assert_not_called()
 
-    def test_idle_comfyui_is_stopped_for_the_window_and_restored(self):
+    def test_active_comfyui_without_submission_barrier_fails_closed(self):
         with (
-            patch.object(
-                run_dense_checkpoint_smoke,
-                "_comfyui_state",
-                side_effect=["active", "inactive", "active"],
-            ),
-            patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle", return_value=True),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_state", return_value="active"),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_guard_ready", return_value=False),
+            patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle") as queue,
             patch.object(run_dense_checkpoint_smoke, "_comfyui_systemctl") as control,
         ):
-            with run_dense_checkpoint_smoke._comfyui_smoke_window():
-                self.assertEqual(control.call_args_list, [call("stop")])
-        self.assertEqual(control.call_args_list, [call("stop"), call("start")])
+            with self.assertRaisesRegex(RuntimeError, "guard is not ready"):
+                with run_dense_checkpoint_smoke._comfyui_smoke_window():
+                    self.fail("checkpoint work ran without the direct submission barrier")
+        queue.assert_not_called()
+        control.assert_not_called()
+
+    def test_idle_comfyui_is_stopped_for_the_window_and_restored(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "comfyui-restore.json"
+            with (
+                patch.object(
+                    run_dense_checkpoint_smoke,
+                    "_comfyui_state",
+                    side_effect=["active", "inactive", "active"],
+                ),
+                patch.object(run_dense_checkpoint_smoke, "_comfyui_guard_ready", return_value=True),
+                patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle", return_value=True),
+                patch.object(run_dense_checkpoint_smoke, "_comfyui_systemctl") as control,
+            ):
+                with run_dense_checkpoint_smoke._comfyui_smoke_window(marker):
+                    self.assertTrue(marker.exists())
+                    self.assertEqual(control.call_args_list, [call("stop")])
+            self.assertEqual(control.call_args_list, [call("stop"), call("start")])
+            self.assertFalse(marker.exists())
 
     def test_comfyui_is_restored_when_checkpoint_run_fails(self):
-        with (
-            patch.object(
-                run_dense_checkpoint_smoke,
-                "_comfyui_state",
-                side_effect=["active", "inactive", "active"],
-            ),
-            patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle", return_value=True),
-            patch.object(run_dense_checkpoint_smoke, "_comfyui_systemctl") as control,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "checkpoint failure"):
-                with run_dense_checkpoint_smoke._comfyui_smoke_window():
-                    raise RuntimeError("checkpoint failure")
-        self.assertEqual(control.call_args_list, [call("stop"), call("start")])
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "comfyui-restore.json"
+            with (
+                patch.object(
+                    run_dense_checkpoint_smoke,
+                    "_comfyui_state",
+                    side_effect=["active", "inactive", "active"],
+                ),
+                patch.object(run_dense_checkpoint_smoke, "_comfyui_guard_ready", return_value=True),
+                patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle", return_value=True),
+                patch.object(run_dense_checkpoint_smoke, "_comfyui_systemctl") as control,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "checkpoint failure"):
+                    with run_dense_checkpoint_smoke._comfyui_smoke_window(marker):
+                        raise RuntimeError("checkpoint failure")
+            self.assertEqual(control.call_args_list, [call("stop"), call("start")])
+            self.assertFalse(marker.exists())
+
+    def test_failed_service_restore_leaves_a_marker_for_the_supervisor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "comfyui-restore.json"
+            with (
+                patch.object(run_dense_checkpoint_smoke, "_comfyui_state", return_value="active"),
+                patch.object(run_dense_checkpoint_smoke, "_comfyui_guard_ready", return_value=True),
+                patch.object(run_dense_checkpoint_smoke, "_comfyui_queue_idle", return_value=True),
+                patch.object(run_dense_checkpoint_smoke, "_wait_for_comfyui_state"),
+                patch.object(
+                    run_dense_checkpoint_smoke,
+                    "_comfyui_systemctl",
+                    side_effect=[None, RuntimeError("start failed")],
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "start failed"):
+                    with run_dense_checkpoint_smoke._comfyui_smoke_window(marker):
+                        pass
+            self.assertTrue(marker.is_file())
 
 
 class AdmissionTest(unittest.TestCase):

@@ -36,12 +36,35 @@ class UnitPolicyTest(unittest.TestCase):
     def test_preflight_runs_before_fronts_and_recovery_uses_regular_copy(self):
         for name in host.FRONT_URLS:
             self.assertIn("After=redqueen-preflight.service", (ROOT / "systemd" / name).read_text())
+        comfy_unit = (ROOT / "systemd/comfyui.service").read_text()
+        after = next(line for line in comfy_unit.splitlines() if line.startswith("After="))
+        self.assertIn("redqueen-preflight.service", after.split("=", 1)[1].split())
         service = (ROOT / "systemd/redqueen-supervisor.service").read_text()
         self.assertIn("/srv/ai/model-router/libexec/host_reliability.py", service)
         self.assertNotIn("/srv/ai/adapters/source", service)
         for name in ("qwen-image-adapter", "jevk5-adapter"):
             self.assertIn("ReadWritePaths=/srv/ai/model-router/run/requests", (ROOT / "systemd" / f"{name}.service").read_text())
         self.assertEqual(host.preflight_unit_body(Path("/srv/ai")), (ROOT / "systemd/redqueen-preflight.service").read_bytes())
+
+    def test_transient_setup_creates_private_regular_operations_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host.transient_directories(root)
+            lock = root / "model-router/run/operations.lock"
+            self.assertTrue(lock.is_file())
+            self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+            lock.unlink()
+            lock.symlink_to(root / "outside")
+            with self.assertRaises(OSError):
+                host.transient_directories(root)
+
+    def test_comfyui_requires_the_prompt_admission_guard_before_startup_succeeds(self):
+        unit = (ROOT / "systemd/comfyui.service").read_text()
+        self.assertIn(
+            "ExecStartPost=/srv/ai/comfyui/venv/bin/python "
+            "/srv/ai/config/hosts/redqueen/comfyui/check_admission_guard.py",
+            unit,
+        )
 
     def test_every_native_model_uses_an_unbounded_socket_timeout(self):
         config = (ROOT / "model-router/config.yaml").read_text()
@@ -134,8 +157,11 @@ class RecoveryTest(HostFixture):
         self.assertTrue(unit.is_file())
         self.assertFalse(unit.is_symlink())
         self.assertIn(str(helper), unit.read_text())
-        self.assertIn("Before=llama-swap.service", unit.read_text())
-        self.assertIn("default.target", unit.read_text())
+        before = next(line for line in unit.read_text().splitlines() if line.startswith("Before="))
+        dependencies = before.split("=", 1)[1].split()
+        self.assertIn("comfyui.service", dependencies)
+        self.assertIn("llama-swap.service", dependencies)
+        self.assertIn("default.target", dependencies)
         # A partial/corrupt candidate checkout cannot remove either dependency
         # used by this already enabled boot job.
         candidate = self.root / "inference"
@@ -373,6 +399,59 @@ class SupervisorTest(HostFixture):
         self.assertTrue(all(info["state"] == "ready" for info in state["fronts"].values()))
         control.assert_not_called()
         self.assertTrue(all(url.endswith(("/healthz", "/health")) for url in host.FRONT_URLS.values()))
+
+    def test_supervisor_restores_comfyui_from_a_crash_persistent_marker(self):
+        marker = self.directory / "comfyui-restore.json"
+        host.atomic_json(marker, {
+            "version": 1, "unit": "comfyui.service", "was_active": True, "pid": 123,
+        })
+        def control(*args, **kwargs):
+            if args[:2] == ("show", "comfyui.service"):
+                return subprocess.CompletedProcess(args, 0, "active\n", "")
+            return self.result(*args, **kwargs)
+
+        with patch.object(host, "front_alive", return_value=True), patch.object(
+            host, "systemctl", side_effect=control
+        ), patch.object(host, "comfyui_guard_ready", return_value=True):
+            state = host.supervise_once(self.root, {}, now=0)
+        self.assertFalse(marker.exists())
+        self.assertNotIn("comfyui_restore", state)
+
+    def test_supervisor_starts_stopped_comfyui_before_clearing_restore_marker(self):
+        marker = self.directory / "comfyui-restore.json"
+        host.atomic_json(marker, {
+            "version": 1, "unit": "comfyui.service", "was_active": True, "pid": 123,
+        })
+        active_states = iter(("inactive\n", "active\n"))
+
+        def control(*args, **kwargs):
+            if args[0] == "show":
+                return subprocess.CompletedProcess(args, 0, next(active_states), "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch.object(host, "systemctl", side_effect=control) as calls, patch.object(
+            host, "comfyui_guard_ready", return_value=True
+        ):
+            state = {}
+            host.restore_comfyui_if_requested(self.root, state, now=0)
+        self.assertFalse(marker.exists())
+        self.assertNotIn("comfyui_restore", state)
+        self.assertTrue(any(call.args[:2] == ("start", "comfyui.service") for call in calls.call_args_list))
+
+    def test_comfyui_restore_waits_for_inference_leases(self):
+        marker = self.directory / "comfyui-restore.json"
+        host.atomic_json(marker, {
+            "version": 1, "unit": "comfyui.service", "was_active": True, "pid": 123,
+        })
+        with (self.directory / "leases/active-request").open("w") as active:
+            fcntl.flock(active, fcntl.LOCK_SH)
+            control = Mock(side_effect=self.result)
+            state = {}
+            with patch.object(host, "systemctl", side_effect=control):
+                host.restore_comfyui_if_requested(self.root, state, now=0)
+        self.assertTrue(marker.exists())
+        self.assertEqual(state["comfyui_restore"]["state"], "deferred")
+        control.assert_not_called()
 
     def test_active_model_defers_every_restart_without_expiring_lease(self):
         control = Mock(side_effect=self.result)

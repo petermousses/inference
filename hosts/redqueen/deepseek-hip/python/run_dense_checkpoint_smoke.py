@@ -40,6 +40,8 @@ _GTT_RELEASE_TOLERANCE = 256 * 1024 * 1024
 _SESSION_ACCOUNTING_TOLERANCE = 16 * 1024 * 1024
 _COMFYUI_QUEUE_URL = "http://127.0.0.1:8189/queue"
 _COMFYUI_QUEUE_LIMIT = 64 * 1024
+_COMFYUI_GUARD_URL = "http://127.0.0.1:8189/redqueen/admission-guard"
+_COMFYUI_RESTORE_MARKER = Path("/srv/ai/model-router/run/comfyui-restore.json")
 
 
 def _comfyui_state() -> str:
@@ -93,6 +95,31 @@ def _comfyui_queue_idle() -> bool:
     return not queue["queue_running"] and not queue["queue_pending"]
 
 
+def _comfyui_guard_ready() -> bool:
+    try:
+        with urlopen(_COMFYUI_GUARD_URL, timeout=2) as response:
+            body = response.read(4097)
+    except (OSError, TimeoutError) as exc:
+        raise RuntimeError("ComfyUI prompt admission guard is unavailable") from exc
+    if len(body) > 4096:
+        raise RuntimeError("ComfyUI prompt admission guard response exceeded its size limit")
+    try:
+        status = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("ComfyUI prompt admission guard returned invalid status") from exc
+    if (
+        not isinstance(status, dict)
+        or status.get("component") != "redqueen-prompt-admission"
+        or isinstance(status.get("version"), bool)
+        or status.get("version") != 1
+        or isinstance(status.get("pid"), bool)
+        or not isinstance(status.get("pid"), int)
+        or status["pid"] < 1
+    ):
+        raise RuntimeError("ComfyUI prompt admission guard is not installed")
+    return True
+
+
 def _comfyui_systemctl(action: str) -> None:
     try:
         subprocess.run(
@@ -118,16 +145,33 @@ def _wait_for_comfyui_state(expected: str, timeout: float) -> None:
 
 
 @contextmanager
-def _comfyui_smoke_window():
-    """Stop an idle direct ComfyUI listener during checkpoint GPU allocation."""
+def _comfyui_smoke_window(restore_marker: Path = _COMFYUI_RESTORE_MARKER):
+    """Drain ComfyUI, block direct submissions, and restore its prior state."""
     state = _comfyui_state()
     if state in {"inactive", "failed"}:
         yield
         return
     if state != "active":
         raise RuntimeError("ComfyUI is transitioning; refusing checkpoint GPU allocation")
+    if not _comfyui_guard_ready():
+        raise RuntimeError("ComfyUI prompt admission guard is not ready")
     if not _comfyui_queue_idle():
         raise RuntimeError("ComfyUI has active or pending work; refusing checkpoint GPU allocation")
+    try:
+        from redqueen_adapters.host_reliability import atomic_json, durable_unlink
+    except ImportError as exc:
+        raise RuntimeError("host recovery helpers are unavailable") from exc
+    if restore_marker.exists() or restore_marker.is_symlink():
+        raise RuntimeError("a previous ComfyUI restore is still pending")
+    atomic_json(
+        restore_marker,
+        {
+            "version": 1,
+            "unit": "comfyui.service",
+            "was_active": True,
+            "pid": os.getpid(),
+        },
+    )
     try:
         _comfyui_systemctl("stop")
         _wait_for_comfyui_state("inactive", timeout=60)
@@ -135,6 +179,9 @@ def _comfyui_smoke_window():
     finally:
         _comfyui_systemctl("start")
         _wait_for_comfyui_state("active", timeout=180)
+        if not _comfyui_guard_ready():
+            raise RuntimeError("ComfyUI restarted without its admission guard")
+        durable_unlink(restore_marker)
 
 
 def _run_with_host_isolation(options: argparse.Namespace) -> int:
@@ -150,7 +197,7 @@ def _run_with_host_isolation(options: argparse.Namespace) -> int:
         os.environ["DS4_HIP_LIBRARY"] = str(
             build_directory / "libredqueen_ds4_hip.so"
         )
-    with _comfyui_smoke_window():
+    with _comfyui_smoke_window(options.lease_directory.parent / "comfyui-restore.json"):
         return _run(options)
 
 
@@ -361,7 +408,7 @@ def main() -> int:
         execution = SerializedExecution(options.lease_directory)
         async with execution.hold_maintenance():
             run_directory = options.lease_directory.parent
-            for name in ("deployment.json", "maintenance.json"):
+            for name in ("deployment.json", "maintenance.json", "comfyui-restore.json"):
                 marker = run_directory / name
                 if marker.exists() or marker.is_symlink():
                     raise RuntimeError(f"host maintenance marker is present: {marker}")

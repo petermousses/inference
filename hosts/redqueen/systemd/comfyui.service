@@ -1,7 +1,7 @@
 [Unit]
 Description=ComfyUI Qwen Image 2.1 backend
 Wants=network-online.target
-After=network-online.target
+After=network-online.target redqueen-preflight.service
 ConditionPathIsDirectory=/srv/ai/comfyui/source
 ConditionPathIsDirectory=/srv/ai/comfyui/venv
 ConditionPathExists=/srv/ai/comfyui/extra-model-paths.yaml
@@ -18,6 +18,7 @@ Environment=TORCH_HOME=/srv/ai/cache/torch
 Environment=XDG_CACHE_HOME=/srv/ai/cache
 ExecStartPre=/usr/bin/mkdir -p /srv/ai/comfyui/state/custom_nodes /srv/ai/comfyui/state/input /srv/ai/comfyui/state/models /srv/ai/comfyui/state/output /srv/ai/comfyui/state/temp /srv/ai/comfyui/state/user/default/workflows
 ExecStart=/srv/ai/comfyui/venv/bin/python /srv/ai/comfyui/source/main.py --listen 127.0.0.1 --port 8189 --disable-auto-launch --base-directory /srv/ai/comfyui/state --extra-model-paths-config /srv/ai/comfyui/extra-model-paths.yaml
+ExecStartPost=/srv/ai/comfyui/venv/bin/python /srv/ai/config/hosts/redqueen/comfyui/check_admission_guard.py
 Restart=no
 RestartSec=5
 TimeoutStartSec=180

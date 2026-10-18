@@ -2,7 +2,7 @@
 Description=Recover interrupted Redqueen deployments and validate unattended startup
 After=network-online.target
 Wants=network-online.target
-Before=llama-swap.service redqueen-scheduler.service qwen-image-adapter.service jevk5-adapter.service default.target
+Before=comfyui.service llama-swap.service redqueen-scheduler.service qwen-image-adapter.service jevk5-adapter.service default.target
 
 [Service]
 Type=oneshot
