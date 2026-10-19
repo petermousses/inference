@@ -25,6 +25,20 @@ int redqueen_ds4_fp8_gemm(
     int output_type,
     void* stream_handle);
 
+// Tiled implementation with the same exact per-group accumulation contract.
+int redqueen_ds4_fp8_gemm_tiled(
+    const void* a_e4m3,
+    const void* scale_a_e8m0,
+    const void* b_e4m3,
+    const void* scale_b_e8m0,
+    void* output,
+    int m,
+    int n,
+    int k,
+    int group_size,
+    int output_type,
+    void* stream_handle);
+
 #ifdef __cplusplus
 }
 #endif

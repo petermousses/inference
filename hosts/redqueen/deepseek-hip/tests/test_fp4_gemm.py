@@ -7,6 +7,8 @@ import unittest
 
 import torch
 
+import kernel
+
 REFERENCE_COMMIT = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 SCALE_E8M0 = 0
 SCALE_F32 = 1
@@ -91,7 +93,17 @@ class NativeFp4GemmTest(unittest.TestCase):
         cls.library.redqueen_ds4_test_leave_pending_launch_error.argtypes = []
         cls.library.redqueen_ds4_test_leave_pending_launch_error.restype = ctypes.c_int
 
-    def call_gemm(self, a, scale_a, b_packed, scale_b, activation_group_size, output_type=torch.float32, guarded=False):
+    def call_gemm(
+        self,
+        a,
+        scale_a,
+        b_packed,
+        scale_b,
+        activation_group_size,
+        output_type=torch.float32,
+        guarded=False,
+        output_fill=None,
+    ):
         m, k = a.shape
         n = b_packed.shape[0]
         self.assertEqual(b_packed.shape[1] * 2, k)
@@ -112,6 +124,8 @@ class NativeFp4GemmTest(unittest.TestCase):
         else:
             storage = None
             output = torch.empty((m, n), dtype=output_type, device="cuda")
+            if output_fill is not None:
+                output.fill_(output_fill)
 
         result = self.library.redqueen_ds4_fp4_gemm(
             ctypes.c_void_p(a_gpu.data_ptr()),
@@ -184,6 +198,79 @@ class NativeFp4GemmTest(unittest.TestCase):
                 actual = self.call_gemm(a, scale_a, b_packed, scale_b, activation_group_size, guarded=True)
                 expected = reference_fp4_gemm(a, scale_a, b_packed, scale_b, activation_group_size)
                 torch.testing.assert_close(actual, expected, rtol=3.0e-5, atol=3.0e-5)
+
+    def test_tiled_exact_matches_scalar_reference_bitwise(self):
+        generator = torch.Generator(device="cpu").manual_seed(4101921)
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float32)
+            for activation_group_size in (32, 128):
+                for scale_type in (SCALE_E8M0, SCALE_F32):
+                    with self.subTest(activation_group_size=activation_group_size, scale_type=scale_type):
+                        m, n, k = 17, 33, 256
+                        a = torch.randn((m, k), generator=generator).to(torch.float8_e4m3fn)
+                        codes = torch.randint(0, 16, (n, k), generator=generator, dtype=torch.uint8)
+                        b_packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).contiguous()
+                        if scale_type == SCALE_E8M0:
+                            scale_a_raw = torch.randint(
+                                124,
+                                131,
+                                (m, k // activation_group_size),
+                                generator=generator,
+                                dtype=torch.uint8,
+                            )
+                            scale_b_raw = torch.randint(
+                                124,
+                                131,
+                                (n, k // 32),
+                                generator=generator,
+                                dtype=torch.uint8,
+                            )
+                            scale_a = scale_a_raw.cuda().view(torch.float8_e8m0fnu)
+                            scale_b = scale_b_raw.cuda().view(torch.float8_e8m0fnu)
+                        else:
+                            scale_a_raw = torch.rand(
+                                (m, k // activation_group_size), generator=generator
+                            ) + 0.5
+                            scale_b_raw = torch.rand((n, k // 32), generator=generator) + 0.5
+                            scale_a = scale_a_raw.cuda()
+                            scale_b = scale_b_raw.cuda()
+
+                        scalar = self.call_gemm(
+                            a.view(torch.uint8),
+                            scale_a_raw,
+                            b_packed,
+                            scale_b_raw,
+                            activation_group_size,
+                        )
+                        tiled = kernel.fp4_gemm(
+                            a.cuda(),
+                            scale_a,
+                            b_packed.cuda().view(torch.float4_e2m1fn_x2),
+                            scale_b,
+                            scale_dtype=(torch.float8_e8m0fnu if scale_type == SCALE_E8M0 else torch.float32),
+                            act_block_size=activation_group_size,
+                        )
+                        torch.cuda.synchronize()
+                        self.assertTrue(torch.equal(tiled.cpu(), scalar))
+        finally:
+            torch.set_default_dtype(previous_dtype)
+
+    def test_large_output_uses_two_dimensional_grid_and_writes_tail(self):
+        m, n, k = 65536, 256, 32
+        a = torch.full((m, k), 0x38, dtype=torch.uint8)
+        scale_a = torch.full((m, 1), 127, dtype=torch.uint8)
+        b_packed = torch.full((n, k // 2), 0x22, dtype=torch.uint8)
+        scale_b = torch.full((n, 1), 127, dtype=torch.uint8)
+        actual = self.call_gemm(
+            a,
+            scale_a,
+            b_packed,
+            scale_b,
+            32,
+            output_fill=-17.0,
+        )
+        self.assertTrue(torch.equal(actual, torch.full_like(actual, 32.0)))
 
     def test_fp32_result_and_bf16_round_to_nearest_even(self):
         m, n, k = 2, 1, 32

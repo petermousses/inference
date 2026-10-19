@@ -6,6 +6,7 @@ import os
 import unittest
 
 import torch
+import kernel
 
 REFERENCE_COMMIT = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 FP8_E4M3_MAX = 448.0
@@ -109,6 +110,54 @@ class NativeQuantizationTest(unittest.TestCase):
                         f"actual={actual_quantized[first].item()} ({actual_values[first].item()}), "
                         f"expected={expected_quantized[first].item()} ({expected_values[first].item()})"
                     )
+
+    def test_large_group_count_uses_two_dimensional_grid(self):
+        values = torch.zeros((65536, 32), dtype=torch.bfloat16)
+        values[-1] = torch.linspace(-256.0, 256.0, 32).to(torch.bfloat16)
+        expected_quantized, expected_scales = reference_quantize(values, 32)
+        actual_quantized, actual_scales = self.quantize(values, 32)
+        self.assertTrue(torch.equal(actual_scales, expected_scales))
+        self.assertTrue(torch.equal(actual_quantized, expected_quantized))
+
+    def test_inplace_quantize_dequantize_matches_reference_on_noncontiguous_input(self):
+        generator = torch.Generator(device="cpu").manual_seed(1017043)
+        base = ((torch.rand((9, 64), generator=generator) * 200.0) - 100.0).to(torch.bfloat16)
+        values = base[:, ::2]
+        expected_quantized, expected_scales = reference_quantize(values, 32)
+        decoded_scales = (expected_scales.to(torch.int32) << 23).view(torch.float32)
+        decoded_scales[expected_scales == 0] = 2.0**-127
+        expected = (
+            expected_quantized.view(torch.float8_e4m3fn).float()
+            * decoded_scales.repeat_interleave(32, dim=-1)
+        ).to(torch.bfloat16)
+        values_gpu = base.cuda()[:, ::2]
+        result = kernel.act_quant(
+            values_gpu,
+            32,
+            scale_fmt="ue8m0",
+            scale_dtype=torch.float8_e8m0fnu,
+            inplace=True,
+        )
+        self.assertIs(result, values_gpu)
+        self.assertTrue(torch.equal(result.cpu(), expected))
+
+    def test_large_inplace_quantization_does_not_allocate_full_size_temporaries(self):
+        kernel._library()
+        values = torch.randn((2048, 512), dtype=torch.bfloat16, device="cuda")
+        torch.cuda.synchronize()
+        allocated_before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        result = kernel.act_quant(
+            values,
+            128,
+            scale_fmt="ue8m0",
+            scale_dtype=torch.float8_e8m0fnu,
+            inplace=True,
+        )
+        torch.cuda.synchronize()
+        peak_delta = torch.cuda.max_memory_allocated() - allocated_before
+        self.assertIs(result, values)
+        self.assertLess(peak_delta, values.numel() * values.element_size())
 
     def test_rejects_unsupported_group_size(self):
         source = torch.zeros((1, 128), dtype=torch.bfloat16, device="cuda")

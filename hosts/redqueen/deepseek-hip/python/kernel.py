@@ -58,6 +58,13 @@ def _library() -> ctypes.CDLL:
         floating = ctypes.c_float
         signatures = {
             "redqueen_ds4_quantize_activation": [pointer, pointer, pointer, integer, integer, integer, pointer],
+            "redqueen_ds4_quantize_dequantize_activation_bf16": [
+                pointer,
+                integer,
+                integer,
+                integer,
+                pointer,
+            ],
             "redqueen_ds4_decode_e8m0": [pointer, pointer, integer, pointer],
             "redqueen_ds4_rmsnorm": [
                 pointer,
@@ -108,7 +115,34 @@ def _library() -> ctypes.CDLL:
                 integer,
                 pointer,
             ],
+            "redqueen_ds4_fp8_gemm_tiled": [
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                integer,
+                integer,
+                integer,
+                integer,
+                integer,
+                pointer,
+            ],
             "redqueen_ds4_fp4_gemm": [
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                integer,
+                integer,
+                integer,
+                integer,
+                integer,
+                integer,
+                pointer,
+            ],
+            "redqueen_ds4_fp4_gemm_tiled": [
                 pointer,
                 pointer,
                 pointer,
@@ -351,24 +385,27 @@ def act_quant(
     rows = _c_int(z.numel() // cols, "row count")
     if rows == 0:
         raise ValueError("empty activation tensors are not supported")
+    z.record_stream(stream)
+    if inplace:
+        _check(
+            _library().redqueen_ds4_quantize_dequantize_activation_bf16(
+                _ptr(z), rows, cols, block_size, _stream_ptr(stream)
+            ),
+            "FP8 activation quantize/dequantize",
+        )
+        if z is not x:
+            x.copy_(z)
+        return x
+
     output = torch.empty(z.shape, dtype=torch.float8_e4m3fn, device=device)
     scales = torch.empty((*z.shape[:-1], cols // block_size), dtype=e8m0, device=device)
-    z.record_stream(stream)
     _check(
         _library().redqueen_ds4_quantize_activation(
             _ptr(z), _ptr(output), _ptr(scales), rows, cols, block_size, _stream_ptr(stream)
         ),
         "FP8 activation quantization",
     )
-    if not inplace:
-        return output, scales
-
-    # The official inplace path dequantizes the quantized FP8 values back to
-    # the input dtype before copying them into x.
-    decoded_scales = _e8m0_to_float(scales).reshape(rows, -1).repeat_interleave(block_size, dim=-1)
-    dequantized = (output.float().reshape(rows, cols) * decoded_scales).to(dtype=x.dtype).reshape(z.shape)
-    x.copy_(dequantized)
-    return x
+    return output, scales
 
 
 def fp4_act_quant(
@@ -437,6 +474,47 @@ def _default_output_type() -> tuple[torch.dtype, int]:
     raise NotImplementedError(f"native GEMM supports float32 or bfloat16 output, not {output_dtype}")
 
 
+def _fp8_grouped_fp32_matmul(a, a_s, b, b_s, *, m: int, n: int, k: int, block_size: int, device):
+    """Use rocBLAS per FP8 K block while preserving the reference scale order."""
+    if torch.get_default_dtype() != torch.bfloat16:
+        raise NotImplementedError("the grouped FP32 FP8-GEMM profile requires a bfloat16 output")
+
+    k_blocks = k // block_size
+    a_matrix = a.reshape(m, k)
+    a_scale_matrix = a_s.reshape(m, k_blocks)
+    b_matrix = b.reshape(n, k)
+    b_scale_matrix = b_s.reshape((n + block_size - 1) // block_size, k_blocks)
+    b_group_values = [
+        b_matrix[:, group * block_size : (group + 1) * block_size].float()
+        for group in range(k_blocks)
+    ]
+    b_group_scales = [
+        b_scale_matrix[:, group].float().repeat_interleave(block_size)[:n].reshape(1, n)
+        for group in range(k_blocks)
+    ]
+
+    output = torch.empty((*a.shape[:-1], n), dtype=torch.bfloat16, device=device)
+    output_matrix = output.reshape(m, n)
+    row_tile = 1_024
+    for first in range(0, m, row_tile):
+        last = min(first + row_tile, m)
+        a_tile = a_matrix[first:last]
+        a_scale_tile = a_scale_matrix[first:last]
+        accumulated = torch.zeros((last - first, n), dtype=torch.float32, device=device)
+        for group in range(k_blocks):
+            first_k = group * block_size
+            last_k = first_k + block_size
+            a_values = a_tile[:, first_k:last_k].float()
+            partial = torch.mm(a_values, b_group_values[group].transpose(0, 1))
+            partial.mul_(a_scale_tile[:, group].float().reshape(-1, 1))
+            partial.mul_(b_group_scales[group])
+            accumulated.add_(partial)
+        output_matrix[first:last] = accumulated.to(torch.bfloat16)
+        del accumulated
+    del b_group_values, b_group_scales
+    return output
+
+
 def fp8_gemm(
     a: torch.Tensor,
     a_s: torch.Tensor,
@@ -473,10 +551,31 @@ def fp8_gemm(
     if tuple(b_s.shape) != ((n + block_size - 1) // block_size, k // block_size):
         raise ValueError("b_s has an incompatible shape")
 
+    gemm_impl = os.environ.get("DS4_HIP_FP8_GEMM_IMPL", "exact")
+    if gemm_impl == "fp32-grouped-matmul":
+        output = _fp8_grouped_fp32_matmul(
+            a,
+            a_s,
+            b,
+            b_s,
+            m=m,
+            n=n,
+            k=k,
+            block_size=block_size,
+            device=device,
+        )
+    elif gemm_impl == "exact":
+        output = None
+    else:
+        raise ValueError(f"unsupported DS4_HIP_FP8_GEMM_IMPL: {gemm_impl!r}")
+
+    if output is not None:
+        return output
+
     output_dtype, output_type = _default_output_type()
     output = torch.empty((*a.shape[:-1], n), dtype=output_dtype, device=device)
     _check(
-        _library().redqueen_ds4_fp8_gemm(
+        _library().redqueen_ds4_fp8_gemm_tiled(
             _ptr(a), _ptr(a_s), _ptr(b), _ptr(b_s), _ptr(output), m, n, k, block_size, output_type, _stream_ptr(stream)
         ),
         "FP8 GEMM",
@@ -527,7 +626,7 @@ def fp4_gemm(
     output_dtype, output_type = _default_output_type()
     output = torch.empty((*a.shape[:-1], n), dtype=output_dtype, device=device)
     _check(
-        _library().redqueen_ds4_fp4_gemm(
+        _library().redqueen_ds4_fp4_gemm_tiled(
             _ptr(a),
             _ptr(a_s),
             _ptr(b),

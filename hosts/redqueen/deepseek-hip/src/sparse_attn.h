@@ -4,6 +4,10 @@
 #include <stdint.h>
 
 #ifdef __cplusplus
+#include <cstdint>
+#endif
+
+#ifdef __cplusplus
 extern "C" {
 #endif
 
@@ -17,6 +21,23 @@ int redqueen_ds4_sparse_attn(
     const void* kv_bf16,
     const float* sink_f32,
     const int32_t* indices_i32,
+    void* output_bf16,
+    int batch,
+    int queries,
+    int heads,
+    int dim,
+    int keys,
+    int topk,
+    float scale,
+    void* stream_handle);
+
+// Experimental faster path; its FP32 reduction order differs from the frozen
+// scalar implementation and it is not used by the model-facing Python API.
+int redqueen_ds4_sparse_attn_experimental_tiled(
+    const void* q_bf16,
+    const void* kv_bf16,
+    const float* sink_f32,
+    const std::int32_t* indices_i32,
     void* output_bf16,
     int batch,
     int queries,

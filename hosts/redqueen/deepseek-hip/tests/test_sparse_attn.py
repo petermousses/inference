@@ -7,6 +7,8 @@ import unittest
 
 import torch
 
+import kernel
+
 REFERENCE_COMMIT = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 
 
@@ -82,10 +84,12 @@ class NativeSparseAttnTest(unittest.TestCase):
             ctypes.c_void_p,
         ]
         cls.library.redqueen_ds4_sparse_attn.restype = ctypes.c_int
+        cls.library.redqueen_ds4_sparse_attn_experimental_tiled.argtypes = cls.library.redqueen_ds4_sparse_attn.argtypes
+        cls.library.redqueen_ds4_sparse_attn_experimental_tiled.restype = ctypes.c_int
         cls.library.redqueen_ds4_test_leave_pending_launch_error.argtypes = []
         cls.library.redqueen_ds4_test_leave_pending_launch_error.restype = ctypes.c_int
 
-    def call_sparse_attn(self, q, kv, sink, indices, scale, guarded=True):
+    def call_sparse_attn(self, q, kv, sink, indices, scale, guarded=True, experimental_tiled=False):
         q_gpu = q.contiguous().cuda()
         kv_gpu = kv.contiguous().cuda()
         sink_gpu = sink.contiguous().cuda()
@@ -107,7 +111,12 @@ class NativeSparseAttnTest(unittest.TestCase):
             output = torch.empty((batch, queries, heads, dim), dtype=torch.bfloat16, device="cuda")
 
         stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-        result = self.library.redqueen_ds4_sparse_attn(
+        operation = (
+            self.library.redqueen_ds4_sparse_attn_experimental_tiled
+            if experimental_tiled
+            else self.library.redqueen_ds4_sparse_attn
+        )
+        result = operation(
             ctypes.c_void_p(q_gpu.data_ptr()),
             ctypes.c_void_p(kv_gpu.data_ptr()),
             ctypes.c_void_p(sink_gpu.data_ptr()),
@@ -213,6 +222,40 @@ class NativeSparseAttnTest(unittest.TestCase):
         actual = self.call_sparse_attn(q, kv, sink, indices, 0.11)
         expected = reference_sparse_attn(q, kv, sink, indices, 0.11)
         self.assert_matches_reference(actual, expected, max_ulp=2)
+
+    def test_model_api_uses_frozen_scalar_path_for_dim512(self):
+        generator = torch.Generator().manual_seed(61017)
+        q = torch.randn((1, 2, 3, 512), generator=generator).to(torch.bfloat16)
+        kv = torch.randn((1, 130, 512), generator=generator).to(torch.bfloat16)
+        sink = torch.tensor([0.15, -0.45, 0.3], dtype=torch.float32)
+        indices = torch.arange(130, dtype=torch.int32).view(1, 1, 130).expand(1, 2, 130)
+        expected = self.call_sparse_attn(q, kv, sink, indices, 0.11)
+        actual = kernel.sparse_attn(q.cuda(), kv.cuda(), sink.cuda(), indices.cuda(), 0.11)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(actual.cpu(), expected))
+
+    def test_experimental_parallel_reduction_stays_outside_model_api(self):
+        generator = torch.Generator().manual_seed(61017)
+        q = torch.randn((1, 2, 3, 512), generator=generator).to(torch.bfloat16)
+        kv = torch.randn((1, 130, 512), generator=generator).to(torch.bfloat16)
+        sink = torch.tensor([0.15, -0.45, 0.3], dtype=torch.float32)
+        indices = torch.arange(130, dtype=torch.int32).view(1, 1, 130).expand(1, 2, 130)
+        actual = self.call_sparse_attn(q, kv, sink, indices, 0.11, experimental_tiled=True)
+        exact = self.call_sparse_attn(q, kv, sink, indices, 0.11)
+        expected = reference_sparse_attn(q, kv, sink, indices, 0.11)
+        # The experiment uses another FP32 reduction order; only a tolerance
+        # is claimed here. The model API remains bitwise on the scalar path.
+        max_abs_error = float((actual.float() - expected.float()).abs().max())
+        self.assertLessEqual(max_abs_error, 1.0e-2)
+        self.assertLessEqual(float((actual.float() - exact.float()).abs().max()), 1.0e-2)
+
+    def test_large_query_head_grid_uses_safe_two_dimensional_launch(self):
+        q = torch.zeros((1, 65_536, 1, 128), dtype=torch.bfloat16)
+        kv = torch.ones((1, 1, 128), dtype=torch.bfloat16)
+        sink = torch.zeros((1,), dtype=torch.float32)
+        indices = torch.zeros((1, 65_536, 1), dtype=torch.int32)
+        actual = self.call_sparse_attn(q, kv, sink, indices, 1.0)
+        self.assertTrue(torch.equal(actual, torch.full_like(actual, 0.5)))
 
     def test_output_feature_slices_cross_256_thread_boundaries(self):
         q = torch.zeros((1, 1, 3, 513), dtype=torch.bfloat16)
