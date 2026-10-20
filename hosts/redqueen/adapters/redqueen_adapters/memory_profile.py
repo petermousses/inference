@@ -65,7 +65,7 @@ def file_signature(path: Path, *, content: bool = False) -> dict:
     return result
 
 
-def verify_profiles(document: dict) -> None:
+def verify_profiles(document: dict, *, verify_sources: bool = True) -> None:
     if document.get("version") != 1 or document.get("worker_profile_version") != 1 or not document.get("resources"):
         raise ValueError("invalid memory profile document")
     for name, profile in document["resources"].items():
@@ -138,6 +138,8 @@ def verify_profiles(document: dict) -> None:
             units = runtime_identity.get("service_units")
             if not isinstance(units, list) or not units or any(not isinstance(unit, str) or not unit for unit in units):
                 raise ValueError(f"{name} has an invalid service runtime identity")
+            if profile.get("units") != units:
+                raise ValueError(f"{name} service units disagree with its runtime identity")
         shapes = profile.get("supported_request_shapes")
         if (
             not isinstance(shapes, list)
@@ -160,6 +162,17 @@ def verify_profiles(document: dict) -> None:
                 or not any(shape in openai_shapes for shape in shapes)
             ):
                 raise ValueError(f"{name} has an invalid direct OpenAI service contract")
+        probe_paths = {
+            "health_url": None,
+            "ready_url": None,
+            "slots_url": "/slots",
+            "queue_url": None,
+            "nodes_url": None,
+            "gateway_url": "",
+        }
+        for field, expected_path in probe_paths.items():
+            if field in profile and not _loopback_http_url(profile[field], path=expected_path):
+                raise ValueError(f"{name} has an invalid {field} endpoint")
         concurrency = profile.get("concurrency_limit")
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
             raise ValueError(f"{name} has an invalid concurrency limit")
@@ -169,9 +182,12 @@ def verify_profiles(document: dict) -> None:
     if not isinstance(sources, list) or not sources:
         raise ValueError("invalid memory profile sources")
     for expected in sources:
-        actual = file_signature(Path(expected["path"]), content="sha256" in expected)
-        if actual != expected:
-            raise ValueError(f"memory profile is stale: {expected['path']}; rebuild profiles")
+        if not isinstance(expected, dict) or not isinstance(expected.get("path"), str) or not expected["path"]:
+            raise ValueError("invalid memory profile source")
+        if verify_sources:
+            actual = file_signature(Path(expected["path"]), content="sha256" in expected)
+            if actual != expected:
+                raise ValueError(f"memory profile is stale: {expected['path']}; rebuild profiles")
 
 
 def weight_paths(path: Path) -> list[Path]:
@@ -584,16 +600,42 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("/srv/ai/model-router/run/memory-profiles.json"))
     args = parser.parse_args()
     document = build_profiles(args.router, args.policy)
-    temporary = args.output.with_name(args.output.name + f".{os.getpid()}.tmp")
-    try:
-        with temporary.open("x") as target:
-            json.dump(document, target, indent=2)
-            target.flush()
-            os.fsync(target.fileno())
-        os.chmod(temporary, 0o600)
-        temporary.replace(args.output)
-    finally:
-        temporary.unlink(missing_ok=True)
+    output = args.output.resolve()
+
+    def write() -> None:
+        # Recheck after acquiring the same lock as admission and deployment:
+        # a concurrent source update must not publish a stale profile.
+        verify_profiles(document)
+        temporary = output.with_name(output.name + f".{os.getpid()}.tmp")
+        try:
+            with temporary.open("x") as target:
+                json.dump(document, target, indent=2)
+                target.flush()
+                os.fsync(target.fileno())
+            os.chmod(temporary, 0o600)
+            temporary.replace(output)
+            descriptor = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    policy = json.loads(args.policy.read_text())
+    configured_output = Path(policy["profile_path"]).resolve()
+    if output == configured_output:
+        socket_path = Path(policy["socket_path"])
+        if not socket_path.is_absolute() or socket_path.resolve().parent != output.parent:
+            raise ValueError("scheduler socket and memory profile must share the locked directory")
+        if __package__:
+            from .host_reliability import operation_lock
+        else:
+            from host_reliability import operation_lock
+        with operation_lock(output.parent):
+            write()
+    else:
+        write()
     for name, spec in document["resources"].items():
         print(f"{name}: GPU {spec['gpu_bytes'] / MIB:.0f} MiB, host {spec['host_bytes'] / MIB:.0f} MiB, context {spec['context_tokens']}, artifacts {spec['artifact_fingerprint'][:12]}")
 
