@@ -11,15 +11,13 @@ readonly unsloth_deepseek_q2_bytes=335765753183
 # the xet resolver rejects open-ended ranges for very large artifacts.
 readonly ranged_download_threshold_bytes=2147483648
 readonly ranged_download_chunk_bytes=1073741824
-
-if [[ "$(id -u)" -eq 0 ]]; then
-  printf 'refusing to download model files as root\n' >&2
-  exit 1
-fi
+unsloth_q2_remaining_bytes=0
+unsloth_q2_verified_destinations=$'\n'
 
 plan() {
   local unsloth_remaining_bytes
-  unsloth_remaining_bytes="$(unsloth_deepseek_q2_remaining_bytes)" || return 1
+  unsloth_deepseek_q2_remaining_bytes || return 1
+  unsloth_remaining_bytes="${unsloth_q2_remaining_bytes}"
   printf '%-32s %12s  %s\n' MODEL BYTES FILE
   printf '%-32s %12s  %s\n' deepseek-v4.1-flash-1017 \
     "${deepseek_1017_bytes}" 'official Safetensors checkpoint (48 shards + tokenizer/config/encoding)'
@@ -111,23 +109,33 @@ unsloth_deepseek_q2_remaining_bytes() {
   local manifest="${script_dir}/deepseek-v4.1-flash-1017-unsloth.files.tsv"
   local root="${model_root}/deepseek-v4.1-flash-1017-unsloth"
   local source_path expected_size expected_sha256 source_oid
-  local destination partial partial_size remaining_bytes=0
+  local destination partial artifact_size partial_size remaining_bytes=0
+  local verified_destinations=$'\n'
 
   while IFS=$'\t' read -r source_path expected_size expected_sha256 source_oid; do
     [[ -n "${source_path}" ]] || continue
     destination="${root}/${source_path}"
     partial="${destination}.part"
 
-    # Existing destinations are validated before use by download_artifact.
-    # Only contiguous .part bytes can be credited; range staging files are
-    # deliberately ignored because they may need to be fetched again and are
-    # temporarily duplicated when appended to .part.
-    if [[ -f "${destination}" ]]; then
-      continue
-    fi
+    # Completed destinations count only after the pinned size and hash pass.
     if [[ -e "${destination}" || -L "${destination}" ]]; then
-      printf 'refusing to estimate non-file destination: %s\n' "${destination}" >&2
-      return 1
+      [[ -f "${destination}" ]] || {
+        printf 'refusing to estimate non-file destination: %s\n' "${destination}" >&2
+        return 1
+      }
+      artifact_size="$(wc -c <"${destination}" | tr -d '[:space:]')"
+      if [[ "${artifact_size}" != "${expected_size}" ]]; then
+        printf 'existing file has the wrong size; preserving it: %s\n' "${destination}" >&2
+        return 1
+      fi
+      printf '%s  %s\n' "${expected_sha256}" "${destination}" \
+        | sha256sum --check --status || {
+          printf 'existing file has the wrong SHA-256; preserving it: %s\n' \
+            "${destination}" >&2
+          return 1
+        }
+      verified_destinations+="${destination}"$'\n'
+      continue
     fi
 
     partial_size=0
@@ -141,10 +149,14 @@ unsloth_deepseek_q2_remaining_bytes() {
       printf 'refusing to estimate non-file partial: %s\n' "${partial}" >&2
       return 1
     fi
+    # Only contiguous .part bytes can be credited; range staging files are
+    # deliberately ignored because they may need to be fetched again and are
+    # temporarily duplicated when appended to .part.
     remaining_bytes=$((remaining_bytes + expected_size - partial_size))
   done <"${manifest}"
 
-  printf '%s\n' "${remaining_bytes}"
+  unsloth_q2_remaining_bytes="${remaining_bytes}"
+  unsloth_q2_verified_destinations="${verified_destinations}"
 }
 
 verify_unsloth_deepseek_q2() {
@@ -212,6 +224,11 @@ case "${1:---plan}" in
     ;;
 esac
 
+if [[ "$(id -u)" -eq 0 ]]; then
+  printf 'refusing to download model files as root\n' >&2
+  exit 1
+fi
+
 mkdir -p -- "${model_root}"
 exec 9>"${model_root}/.evaluation-models-download.lock"
 flock -n 9 || {
@@ -227,7 +244,8 @@ required_download_bytes="${required_bytes}"
 if [[ "${download_scope}" == "deepseek-only" ]]; then
   required_download_bytes="${deepseek_1017_bytes}"
 elif [[ "${download_scope}" == "unsloth-only" ]]; then
-  required_download_bytes="$(unsloth_deepseek_q2_remaining_bytes)"
+  unsloth_deepseek_q2_remaining_bytes || exit 1
+  required_download_bytes="${unsloth_q2_remaining_bytes}"
 fi
 if (( available_bytes < required_download_bytes + reserve_bytes )); then
   printf 'need at least %s bytes plus %s bytes of free-space reserve; found %s\n' \
@@ -261,11 +279,14 @@ download_artifact() {
 
   mkdir -p -- "$(dirname -- "${destination}")"
   if [[ -f "${destination}" ]]; then
-    printf '%s  %s\n' "${expected_sha256}" "${destination}" | sha256sum --check --status || {
-      printf 'existing file has the wrong SHA-256; preserving it: %s\n' \
-        "${destination}" >&2
-      return 1
-    }
+    if [[ "${unsloth_q2_verified_destinations}" != *$'\n'"${destination}"$'\n'* ]]; then
+      printf '%s  %s\n' "${expected_sha256}" "${destination}" \
+        | sha256sum --check --status || {
+          printf 'existing file has the wrong SHA-256; preserving it: %s\n' \
+            "${destination}" >&2
+          return 1
+        }
+    fi
     printf 'verified existing %s\n' "${destination}"
   else
     [[ ! -e "${destination}" ]] || {

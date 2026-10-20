@@ -44,6 +44,13 @@ grep -Fq '          exclusive: false' "${router_config}"
 
 download_test_root="$(mktemp -d)"
 trap 'rm -rf -- "${download_test_root}"' EXIT
+download_test_bin="${download_test_root}/bin"
+mkdir -p -- "${download_test_bin}"
+cat >"${download_test_bin}/sha256sum" <<'SH'
+#!/bin/sh
+[ "${MODEL_ROUTER_TEST_SHA256SUM_OK:-0}" = 1 ]
+SH
+chmod +x "${download_test_bin}/sha256sum"
 expected_unsloth_remaining_bytes="$(python3 - "${download_test_root}" \
   "${host_root}/models/deepseek-v4.1-flash-1017-unsloth.files.tsv" <<'PY'
 import pathlib
@@ -75,10 +82,22 @@ print(sum(int(row[1]) for row in rows) - int(rows[0][1]) - partial_bytes)
 PY
 )"
 unsloth_plan="$(MODEL_ROOT="${download_test_root}" \
+  MODEL_ROUTER_TEST_SHA256SUM_OK=1 PATH="${download_test_bin}:${PATH}" \
   bash "${host_root}/models/download-evaluation-models.sh" --plan)"
 if [[ "${unsloth_plan}" != *"remaining targeted Unsloth DeepSeek bytes: ${expected_unsloth_remaining_bytes}"* ]]; then
   printf 'Unsloth download plan did not account for completed and resumable bytes\n%s\n' \
     "${unsloth_plan}" >&2
+  exit 1
+fi
+if invalid_unsloth_plan="$(MODEL_ROOT="${download_test_root}" \
+  MODEL_ROUTER_TEST_SHA256SUM_OK=0 PATH="${download_test_bin}:${PATH}" \
+  bash "${host_root}/models/download-evaluation-models.sh" --plan 2>&1)"; then
+  printf 'Unsloth download plan accepted a completed file with the wrong SHA-256\n' >&2
+  exit 1
+fi
+if [[ "${invalid_unsloth_plan}" != *'existing file has the wrong SHA-256'* ]]; then
+  printf 'unexpected failure while rejecting an invalid completed shard\n%s\n' \
+    "${invalid_unsloth_plan}" >&2
   exit 1
 fi
 
