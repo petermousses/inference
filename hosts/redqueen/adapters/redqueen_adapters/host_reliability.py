@@ -177,12 +177,14 @@ def boot_id() -> str:
 
 def begin_journal(directory: Path, repo: Path, previous: str, enabled: dict,
                   active: list[str], profile_path: Path, backup: Path | None,
-                  preflight_definition: dict | None = None) -> dict:
+                  preflight_definition: dict | None = None, branch: str | None = None) -> dict:
+    backup_sha256 = hashlib.sha256(backup.read_bytes()).hexdigest() if backup is not None else None
     document = {
         "version": 1, "phase": "prepared", "repo": str(repo), "previous": previous,
         "enabled": enabled, "active": active, "profile_path": str(profile_path),
         "profile_backup": str(backup) if backup is not None else None,
-        "pid": os.getpid(), "boot_id": boot_id(), "started_at": time.time(),
+        "profile_backup_sha256": backup_sha256,
+        "branch": branch, "pid": os.getpid(), "boot_id": boot_id(), "started_at": time.time(),
         "preflight_definition": preflight_definition,
     }
     atomic_json(directory / "deployment.json", document)
@@ -194,10 +196,11 @@ def deployment_phase(directory: Path, document: dict, phase: str) -> None:
     atomic_json(directory / "deployment.json", document)
 
 
-def finish_deployment(directory: Path, repo: Path, revision: str) -> None:
+def finish_deployment(directory: Path, repo: Path, revision: str, profile_path: Path) -> None:
+    profile_sha256 = hashlib.sha256(profile_path.read_bytes()).hexdigest()
     atomic_json(directory / "last-good.json", {
         "version": 1, "repo": str(repo), "revision": revision,
-        "completed_at": time.time(), "boot_id": boot_id(),
+        "profile_sha256": profile_sha256, "completed_at": time.time(), "boot_id": boot_id(),
     })
     durable_unlink(directory / "deployment.json")
 
@@ -525,6 +528,11 @@ def restore_journal(root: Path, document: dict) -> None:
     previous = document["previous"]
     if not isinstance(previous, str) or len(previous) != 40 or any(c not in "0123456789abcdef" for c in previous):
         raise RuntimeError("deployment journal has an invalid rollback revision")
+    branch = document.get("branch")
+    if branch is not None:
+        if not isinstance(branch, str) or not branch or branch.startswith("-"):
+            raise RuntimeError("deployment journal has an invalid rollback branch")
+        command("git", "-C", str(repo), "check-ref-format", "--branch", branch)
     if not set(document["enabled"]).issubset(ALL_UNITS) or not set(document["active"]).issubset(ALL_UNITS):
         raise RuntimeError("deployment journal contains unmanaged units")
     profile = Path(document["profile_path"])
@@ -537,10 +545,25 @@ def restore_journal(root: Path, document: dict) -> None:
     command("git", "-C", str(repo), "cat-file", "-e", f"{previous}^{{commit}}")
     # Do not discard an irreplaceable profile backup after stopping services.
     old_profile = backup.read_bytes() if backup is not None else None
+    if "profile_backup_sha256" in document:
+        expected_backup_sha256 = document["profile_backup_sha256"]
+        if backup is None:
+            if expected_backup_sha256 is not None:
+                raise RuntimeError("deployment journal has a checksum without a profile backup")
+        elif (
+            not isinstance(expected_backup_sha256, str)
+            or len(expected_backup_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in expected_backup_sha256)
+            or old_profile is None
+            or hashlib.sha256(old_profile).hexdigest() != expected_backup_sha256
+        ):
+            raise RuntimeError("deployment profile backup failed its journal checksum; manual recovery required")
     # Recovery may run inside either support service itself. Never ask its
     # service manager to stop the process currently restoring the host.
     systemctl("stop", *FRONT_URLS, *BACKENDS)
     command("git", "-C", str(repo), "switch", "--detach", previous)
+    if branch:
+        command("git", "-C", str(repo), "switch", "--force-create", branch, previous)
     for unit in ("redqueen-scheduler.service", *SUPPORT):
         if not (repo / "hosts/redqueen/systemd" / unit).exists():
             for path in (Path.home() / ".config/systemd/user" / unit, Path.home() / ".config/systemd/user/default.target.wants" / unit):
@@ -566,9 +589,13 @@ def restore_journal(root: Path, document: dict) -> None:
     atomic_json(directory / "recovery.json", {
         "state": "rolled_back", "revision": previous, "at": time.time(), "boot_id": boot_id(),
     })
-    atomic_json(directory / "last-good.json", {
-        "version": 1, "repo": str(repo), "revision": previous, "rolled_back_at": time.time(), "boot_id": boot_id(),
-    })
+    marker = {
+        "version": 1, "repo": str(repo), "revision": previous,
+        "rolled_back_at": time.time(), "boot_id": boot_id(),
+    }
+    if old_profile is not None:
+        marker["profile_sha256"] = hashlib.sha256(old_profile).hexdigest()
+    atomic_json(directory / "last-good.json", marker)
     durable_unlink(directory / "deployment.json")
 
 

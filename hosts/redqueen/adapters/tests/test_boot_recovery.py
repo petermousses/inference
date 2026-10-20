@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from redqueen_adapters import host_reliability as host
+from redqueen_adapters.memory_profile import file_signature, fingerprint_artifacts, memory_contract
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -564,16 +565,60 @@ class DeploymentSafetyTest(unittest.TestCase):
         self.addCleanup(home_patch.stop)
         self.source = self.repo / "hosts/redqueen"
         (self.source / "model-router").mkdir(parents=True)
+        (self.source / "adapters/redqueen_adapters").mkdir(parents=True)
         (self.source / "systemd").mkdir()
         for unit in self.deploy.FRONTS + self.deploy.MANAGED:
             (self.source / "systemd" / unit).write_text("fixture")
         self.directory = self.repo / "run"
         self.directory.mkdir()
         self.profile = self.directory / "profiles.json"
-        self.profile.write_text("old profiles")
-        self.policy = {"profile_path": str(self.profile)}
-        (self.source / "model-router/scheduler.json").write_text(json.dumps(self.policy))
+        self.policy = {
+            "profile_path": str(self.profile),
+            "socket_path": str(self.directory / "scheduler.sock"),
+            "services": {},
+        }
+        policy_path = self.source / "model-router/scheduler.json"
+        policy_path.write_text(json.dumps(self.policy))
+        router_path = self.source / "model-router/config.yaml"
+        router_path.write_text("models:\n  a:\n    cmd: /runtime --model /model.gguf --ctx-size 8\n")
+        profiler_path = self.source / "adapters/redqueen_adapters/memory_profile.py"
+        profiler_path.write_text("# fixture profiler\n")
         self.previous, self.candidate = "1" * 40, "2" * 40
+        artifact_identity = [{
+            "model": "fixture",
+            "repositories": {"repository": "test/fixture"},
+            "revisions": {"revision": "test-revision"},
+            "manifest_sha256": "0" * 64,
+        }]
+        memory = memory_contract((0, 0))
+        resource = {
+            **memory,
+            "kind": "text",
+            "aliases": [],
+            "model_paths": ["/model.gguf"],
+            "memory": memory,
+            "artifact_identity": artifact_identity,
+            "artifact_fingerprint": fingerprint_artifacts(artifact_identity),
+            "runtime_identity": {"path": "/runtime", "size": 0, "mtime_ns": 0},
+            "supported_request_shapes": ["openai.chat"],
+            "concurrency_limit": 1,
+        }
+        self.old_profiles = json.dumps({
+            "version": 1,
+            "worker_profile_version": 1,
+            "sources": [
+                file_signature(path, content=True)
+                for path in (router_path, policy_path, profiler_path)
+            ],
+            "resources": {"a": resource},
+        })
+        self.profile.write_text(self.old_profiles)
+        host.atomic_json(self.directory / "last-good.json", {
+            "version": 1,
+            "repo": str(self.repo),
+            "revision": self.previous,
+            "profile_sha256": hashlib.sha256(self.old_profiles.encode()).hexdigest(),
+        })
         self.pulled = False
         self.controls = []
         self.lease = Mock(path=self.directory / "leases/a")
@@ -589,11 +634,14 @@ class DeploymentSafetyTest(unittest.TestCase):
                 output = self.candidate if self.pulled else self.previous
             elif args[3:5] == ("rev-parse", "--verify"):
                 output = self.previous
+            elif args[3] == "show":
+                relative = args[4].split(":", 1)[1]
+                output = (self.repo / relative).read_text()
             elif args[3] == "pull":
                 journal = json.loads((self.directory / "deployment.json").read_text())
                 self.assertEqual(journal["phase"], "updating_source")
                 self.assertEqual(journal["previous"], self.previous)
-                self.assertEqual(Path(journal["profile_backup"]).read_text(), "old profiles")
+                self.assertEqual(Path(journal["profile_backup"]).read_text(), self.old_profiles)
                 self.assertTrue((self.repo / "libexec/host_reliability.py").is_file())
                 unit = self.home / ".config/systemd/user/redqueen-preflight.service"
                 self.assertTrue(unit.is_file())
@@ -614,7 +662,7 @@ class DeploymentSafetyTest(unittest.TestCase):
         return subprocess.CompletedProcess(args, code, output, "")
 
     def execute(self, *, drain=None, validate=None, update=True, check_only=False, control=None):
-        with patch.object(self.deploy.os, "geteuid", return_value=1002), patch.dict("os.environ", {"QWEN_API_KEY": "fixture"}), patch.object(self.deploy, "run", side_effect=self.run_command), patch.object(self.deploy, "systemctl", side_effect=control or self.control), patch.object(host, "systemctl", side_effect=control or self.control), patch.object(self.deploy, "validate", side_effect=validate or [(self.policy, {"resources": {"a": {}}}), (self.policy, {"resources": {"a": {}}})]), patch.object(self.deploy, "drain", new=drain or AsyncMock(return_value=[self.lease])), patch.object(self.deploy, "healthy", new=AsyncMock()):
+        with patch.object(self.deploy.os, "geteuid", return_value=1002), patch.dict("os.environ", {"QWEN_API_KEY": "fixture"}), patch.object(self.deploy, "run", side_effect=self.run_command), patch.object(self.deploy, "systemctl", side_effect=control or self.control), patch.object(host, "systemctl", side_effect=control or self.control), patch.object(self.deploy, "validate", side_effect=validate or [(self.policy, {"resources": {"a": {}}})]), patch.object(self.deploy, "drain", new=drain or AsyncMock(return_value=[self.lease])), patch.object(self.deploy, "healthy", new=AsyncMock()):
             self.deploy.deploy(self.repo, self.previous, update=update, check_only=check_only)
 
     def test_update_journals_and_installs_independent_recovery_before_git_pull(self):
@@ -638,7 +686,7 @@ class DeploymentSafetyTest(unittest.TestCase):
                 self.execute()
         self.assertFalse(self.pulled)
         self.assertFalse(any(args[0] == "stop" for args in self.controls))
-        self.assertEqual(self.profile.read_text(), "old profiles")
+        self.assertEqual(self.profile.read_text(), self.old_profiles)
         self.lease.close.assert_called_once()
 
     def test_failed_drain_never_pulls_or_stops_active_work(self):
@@ -647,16 +695,16 @@ class DeploymentSafetyTest(unittest.TestCase):
         self.assertFalse(self.pulled)
         self.assertFalse(any(args[0] == "stop" for args in self.controls))
 
-        self.assertEqual(self.profile.read_text(), "old profiles")
+        self.assertEqual(self.profile.read_text(), self.old_profiles)
         self.assertFalse((self.directory / "deployment.json").exists())
         with host.operation_lock(self.directory):
             pass
 
     def test_bad_candidate_after_pull_restores_source_profiles_and_units(self):
         with self.assertRaisesRegex(ValueError, "broken candidate"):
-            self.execute(validate=[(self.policy, {"resources": {"a": {}}}), ValueError("broken candidate")])
+            self.execute(validate=[ValueError("broken candidate")])
         self.assertFalse(self.pulled)
-        self.assertEqual(self.profile.read_text(), "old profiles")
+        self.assertEqual(self.profile.read_text(), self.old_profiles)
         self.assertIn(("start", "llama-swap.service"), self.controls)
         self.assertFalse((self.directory / "deployment.json").exists())
         self.lease.close.assert_called_once()
@@ -666,7 +714,7 @@ class DeploymentSafetyTest(unittest.TestCase):
         self.assertEqual(self.controls, [])
         self.assertFalse((self.directory / "operations.lock").exists())
         self.assertFalse((self.directory / "deployment.json").exists())
-        self.assertEqual(self.profile.read_text(), "old profiles")
+        self.assertEqual(self.profile.read_text(), self.old_profiles)
 
     def test_state_capture_failure_releases_drained_leases(self):
         def fail(*args, **kwargs):
