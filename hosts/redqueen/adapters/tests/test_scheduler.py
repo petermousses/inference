@@ -200,7 +200,7 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.scheduler.active["large"], 0)
         self.assertEqual(self.runtime.loaded, {})
 
-    async def test_cancelled_request_holds_global_execution_until_backend_goes_idle(self):
+    async def test_cancelled_request_protects_its_worker_while_other_workers_run(self):
         started = asyncio.Event()
 
         async def first():
@@ -208,8 +208,8 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
                 started.set()
                 await asyncio.Event().wait()
 
-        async def second():
-            async with self.scheduler.request("b"):
+        async def second(name):
+            async with self.scheduler.request(name):
                 return "started"
 
         request = asyncio.create_task(first())
@@ -218,7 +218,8 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         request.cancel()
         await asyncio.sleep(0.05)
 
-        queued = asyncio.create_task(second())
+        self.assertEqual(await asyncio.wait_for(second("b"), 1), "started")
+        queued = asyncio.create_task(second("a"))
         await asyncio.sleep(0.05)
         self.assertFalse(queued.done())
         self.runtime.occupied.clear()
@@ -251,7 +252,7 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("large", self.scheduler.states)
 
     async def test_rejected_admission_does_not_leave_an_abandoned_owner_record(self):
-        self.resources["large"] = resource(75)
+        self.resources["large"] = resource(101)
         self.runtime.loaded = {"a": "ready"}
         self.protect("a")
         with self.assertRaises(AdmissionError):
@@ -381,6 +382,71 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ExecutionGateTest(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_slot_excludes_another_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = SerializedExecution(Path(directory))
+            async with gate.hold_worker("a") as admission:
+                admission.ready()
+                script = """
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit(0)
+sys.exit(1)
+"""
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-c", script, str(Path(directory) / "worker-slots/a")],
+                    capture_output=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    async def test_shared_workers_drain_before_queued_maintenance_and_later_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate = SerializedExecution(Path(directory) / "leases")
+            entered = {name: asyncio.Event() for name in ("a", "b", "maintenance", "later")}
+            releases = {name: asyncio.Event() for name in entered}
+
+            async def worker(name):
+                async with gate.hold_worker(name) as admission:
+                    admission.ready()
+                    entered[name].set()
+                    await releases[name].wait()
+
+            async def maintenance():
+                async with gate.hold_maintenance():
+                    entered["maintenance"].set()
+                    await releases["maintenance"].wait()
+
+            async def queued(count):
+                async with asyncio.timeout(2):
+                    while len(list(gate.queue.glob("*.ticket"))) < count:
+                        await asyncio.sleep(0)
+
+            tasks = [asyncio.create_task(worker("a")), asyncio.create_task(worker("b"))]
+            try:
+                await asyncio.wait_for(entered["a"].wait(), 1)
+                await asyncio.wait_for(entered["b"].wait(), 1)
+                tasks.append(asyncio.create_task(maintenance()))
+                await queued(1)
+                tasks.append(asyncio.create_task(worker("later")))
+                await queued(2)
+                releases["a"].set()
+                await tasks[0]
+                self.assertFalse(entered["maintenance"].is_set())
+                releases["b"].set()
+                await asyncio.wait_for(entered["maintenance"].wait(), 1)
+                self.assertFalse(entered["later"].is_set())
+                releases["maintenance"].set()
+                await asyncio.wait_for(entered["later"].wait(), 1)
+            finally:
+                for release in releases.values():
+                    release.set()
+                await asyncio.gather(*tasks)
+
     async def test_gate_serializes_distinct_workers_and_releases_after_cancellation(self):
         with tempfile.TemporaryDirectory() as directory:
             first, second = SerializedExecution(Path(directory)), SerializedExecution(Path(directory))
@@ -666,6 +732,81 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(admitted.status, 200)
         self.assertEqual(self.runtime.stops, ["a"])
 
+    async def test_distinct_workers_overlap_when_their_full_peaks_fit(self):
+        self.runtime.limit = Memory(200, 200)
+        stream = await self.post("a", stream=True)
+        await self.started.wait()
+        try:
+            response = await asyncio.wait_for(self.post("b"), 1)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(self.runtime.stops, [])
+            self.assertEqual(self.runtime.loaded, {"a": "ready", "b": "ready"})
+        finally:
+            self.release.set()
+            await stream.read()
+
+    async def test_adapter_and_gateway_overlap_when_their_full_peaks_fit(self):
+        self.runtime.limit = Memory(200, 200)
+        self.resources["jevk5"] = resource(40, "service")
+        stream = await self.post("a", stream=True)
+        await self.started.wait()
+        adapter = SchedulerClient(self.policy["socket_path"])
+        backend_started = asyncio.Event()
+
+        async def score():
+            backend_started.set()
+
+        task = asyncio.create_task(adapter.run("jevk5", score))
+        try:
+            await asyncio.wait_for(backend_started.wait(), 1)
+            await task
+            self.assertEqual(self.runtime.stops, [])
+        finally:
+            self.release.set()
+            await stream.read()
+            await task
+
+    async def test_gateway_alias_and_adapter_share_one_physical_worker_slot(self):
+        self.resources["a"].update(
+            kind="service",
+            aliases=["a-alias"],
+            gateway_url=str(self.upstream.make_url("")).rstrip("/"),
+            supported_request_shapes=["openai.chat"],
+        )
+        stream = await self.post("a-alias", stream=True)
+        await self.started.wait()
+        backend_started = asyncio.Event()
+
+        async def score():
+            backend_started.set()
+
+        task = asyncio.create_task(SchedulerClient(self.policy["socket_path"]).run("a", score))
+        try:
+            queue = Path(self.policy["socket_path"]).parent / "leases/execution-queue"
+            async with asyncio.timeout(1):
+                while not list(queue.glob("*.ticket")):
+                    await asyncio.sleep(0)
+            self.assertFalse(backend_started.is_set())
+        finally:
+            self.release.set()
+            await stream.read()
+            await asyncio.wait_for(task, 1)
+        self.assertTrue(backend_started.is_set())
+
+    async def test_adapter_admission_rejects_an_eviction_lease_without_a_worker_slot(self):
+        directory = Path(self.policy["socket_path"]).parent / "leases"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        lease = ResourceLock(directory, "comfyui")
+        self.assertTrue(lease.acquire())
+        try:
+            async with aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=self.policy["socket_path"])) as session:
+                async with session.post("http://scheduler/admit", json={"resource": "comfyui"}) as response:
+                    self.assertEqual(response.status, 400)
+                    self.assertEqual((await response.json())["error"]["code"], "lease_required")
+            self.assertEqual(self.runtime.starts, [])
+        finally:
+            lease.close()
+
     async def test_same_model_waits_for_active_stream_before_next_request(self):
         stream = await self.post("a", stream=True)
         self.assertIn(b"hello", await stream.content.readany())
@@ -926,8 +1067,8 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             await SchedulerClient(self.policy["socket_path"]).run("comfyui", fail)
         self.assertEqual((await self.post("b")).status, 200)
 
-    async def test_image_and_both_decision_adapters_preserve_capacity_errors(self):
-        self.resources.update(jevk5=resource(60, "service"), clm=resource(60, "service"))
+    async def test_image_and_both_decision_adapters_preserve_permanent_capacity_errors(self):
+        self.resources.update(comfyui=resource(101, "service"), jevk5=resource(101, "service"), clm=resource(101, "service"))
         self.runtime.loaded = {"a": "ready"}
         active_model = ResourceLock(Path(self.policy["socket_path"]).parent / "leases", "a")
         self.assertTrue(active_model.acquire())
@@ -950,8 +1091,8 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             ):
                 response = await client.post(path, json=payload, headers={"Authorization": "Bearer secret"})
                 self.assertEqual(response.status, 503)
-                self.assertEqual(response.headers["Retry-After"], "1")
-                self.assertEqual((await response.json())["error"]["code"], "capacity_unavailable")
+                self.assertNotIn("Retry-After", response.headers)
+                self.assertEqual((await response.json())["error"]["code"], "model_exceeds_budget")
             backend.generate.assert_not_awaited()
             backend.decide.assert_not_awaited()
             backend.evaluate.assert_not_awaited()

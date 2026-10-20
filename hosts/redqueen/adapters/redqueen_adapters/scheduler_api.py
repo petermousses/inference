@@ -338,7 +338,7 @@ class Scheduler:
     def reserved(self) -> Memory:
         return sum((footprint(self.resources[name]) for name in self.states), Memory(0, 0))
 
-    async def admit(self, name: str, *, wait_for_idle: bool = False) -> None:
+    async def admit(self, name: str, *, wait_for_idle: bool = False, wait_for_capacity: bool = False) -> None:
         if name not in self.resources:
             raise AdmissionError(404, "model is not configured", "model_not_found")
         operation = ResourceLock(self.lock_dir.parent, "operations.lock")
@@ -357,23 +357,30 @@ class Scheduler:
                     self.runtime.verify_configuration()
                 except (OSError, ValueError, KeyError) as error:
                     raise AdmissionError(503, "memory profiles require deployment validation", "configuration_unready", retry_after=None) from error
-            await self._admit(name, wait_for_idle=wait_for_idle)
+            while True:
+                try:
+                    await self._admit(name, wait_for_idle=wait_for_idle)
+                    return
+                except AdmissionError as error:
+                    if not wait_for_capacity or error.code not in {"capacity_unavailable", "model_transition"}:
+                        raise
+                    # This waits for admission; no backend inference is retried.
+                    await asyncio.sleep(0.1)
         finally:
             operation.close()
 
-    async def _wait_for_idle_workers(self) -> None:
-        """Do not overlap brokered work with active unmanaged backend jobs."""
+    async def _wait_for_idle_worker(self, name: str) -> None:
+        """Protect this worker from overlap with its unmanaged backend jobs."""
         while True:
             await self.refresh()
-            active = False
-            for other in self.states:
-                if self.states[other] != "ready":
-                    raise AdmissionError(503, "backend activity is changing", "model_transition")
-                busy = await self.runtime.busy(other)
-                if busy is None:
-                    raise AdmissionError(503, "backend activity is unknown", "backend_health_uncertain")
-                active = active or busy
-            if not active:
+            if name not in self.states:
+                return
+            if self.states[name] != "ready":
+                raise AdmissionError(503, "backend activity is changing", "model_transition")
+            busy = await self.runtime.busy(name)
+            if busy is None:
+                raise AdmissionError(503, "backend activity is unknown", "backend_health_uncertain")
+            if not busy:
                 return
             await asyncio.sleep(0.1)
 
@@ -382,7 +389,7 @@ class Scheduler:
         if recovery.get("next_retry", 0) > self.clock():
             raise AdmissionError(503, "backend recovery is cooling down", "backend_recovering", retry_after=max(1, int(recovery["next_retry"] - self.clock())))
         if wait_for_idle:
-            await self._wait_for_idle_workers()
+            await self._wait_for_idle_worker(name)
         if self.transition.locked():
             # Existing warm work can proceed while another model loads. Probe
             # directly so a crashed warm model cannot autoload around the budget.
@@ -400,7 +407,7 @@ class Scheduler:
             try:
                 await self.refresh()
                 if wait_for_idle:
-                    await self._wait_for_idle_workers()
+                    await self._wait_for_idle_worker(name)
                 if name in self.states and self.states[name] != "ready":
                     raise AdmissionError(503, "model is changing state; retry shortly", "model_transition")
                 if name in self.states and not await self.runtime.ready(name):
@@ -488,7 +495,7 @@ class Scheduler:
         spec = self.resources.get(name)
         if spec is None or not is_openai_worker(spec):
             raise AdmissionError(404, "model is not configured", "model_not_found")
-        async with self.execution.hold():
+        async with self.execution.hold_worker(name) as execution:
             limit = self.resources[name].get(
                 "concurrency_limit", self.resources[name].get("concurrency", 1)
             )
@@ -504,7 +511,7 @@ class Scheduler:
                 owned = OwnedRequest(self.lock_dir.parent / "requests", name).begin()
                 # Finish admission cleanup even if its client disappears during a
                 # slow load; otherwise an unaccounted process could keep loading.
-                task = asyncio.create_task(self.admit(name, wait_for_idle=True))
+                task = asyncio.create_task(self.admit(name, wait_for_idle=True, wait_for_capacity=True))
                 try:
                     await asyncio.shield(task)
                 except asyncio.CancelledError:
@@ -515,6 +522,7 @@ class Scheduler:
                         pass
                     raise
                 admitted = True
+                execution.ready()
                 yield
             except BaseException as error:
                 if owned is not None:
@@ -538,7 +546,7 @@ class Scheduler:
                 lock.close()
 
     async def _wait_until_idle(self, name: str) -> None:
-        """Keep the global execution lease while cancelled GPU work drains."""
+        """Keep this worker's root and eviction lease until cancelled work drains."""
         while True:
             try:
                 busy = await self.runtime.busy(name)
@@ -691,13 +699,15 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
             raise ValueError("wait_for_idle must be a boolean")
         # The adapter holds a shared flock before requesting admission. It
         # remains the active-work signal even if this process restarts.
-        lock = ResourceLock(state["scheduler"].lock_dir, name, exclusive=True)
-        try:
-            if lock.acquire():
-                raise AdmissionError(400, "an active resource lease is required", "lease_required")
-        finally:
-            lock.close()
-        task = asyncio.create_task(state["scheduler"].admit(name, wait_for_idle=wait_for_idle))
+        for directory in (state["scheduler"].lock_dir, state["scheduler"].lock_dir / "worker-slots"):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock = ResourceLock(directory, name, exclusive=True)
+            try:
+                if lock.acquire():
+                    raise AdmissionError(400, "active resource and worker operation leases are required", "lease_required")
+            finally:
+                lock.close()
+        task = asyncio.create_task(state["scheduler"].admit(name, wait_for_idle=wait_for_idle, wait_for_capacity=True))
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
