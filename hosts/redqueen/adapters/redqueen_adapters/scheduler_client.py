@@ -82,8 +82,18 @@ class ResourceLock:
             self.fd = None
 
 
+class ExecutionAdmission:
+    """Keep the FIFO head until the worker's memory admission has completed."""
+
+    def __init__(self, ticket: Path):
+        self.ticket = ticket
+
+    def ready(self) -> None:
+        self.ticket.unlink(missing_ok=True)
+
+
 class SerializedExecution:
-    """FIFO serialize GPU work across broker and adapter processes on this host."""
+    """FIFO execution admission with exclusive maintenance and per-worker roots."""
 
     def __init__(self, directory: Path):
         self.directory = directory
@@ -144,20 +154,40 @@ class SerializedExecution:
             queue_lock.close()
 
     @asynccontextmanager
-    async def hold(self):
+    async def hold(self, *, resource: str | None = None):
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.queue.mkdir(mode=0o700, exist_ok=True)
+        worker = None
+        if resource is not None:
+            slots = self.directory / "worker-slots"
+            slots.mkdir(mode=0o700, exist_ok=True)
+            worker = ResourceLock(slots, resource, exclusive=True)
         ticket, ticket_fd = await self._new_ticket()
-        execution = ResourceLock(self.directory, "global-execution", exclusive=True)
+        execution = ResourceLock(self.directory, "global-execution", exclusive=resource is None)
         try:
-            while not self._is_head(ticket) or not execution.acquire():
+            while not self._is_head(ticket):
                 await asyncio.sleep(0.025)
-            ticket.unlink(missing_ok=True)
-            yield
+            if worker is not None:
+                while not worker.acquire():
+                    await asyncio.sleep(0.025)
+            while not execution.acquire():
+                await asyncio.sleep(0.025)
+            admission = ExecutionAdmission(ticket)
+            if resource is None:
+                admission.ready()
+            yield admission
         finally:
             execution.close()
+            if worker is not None:
+                worker.close()
             os.close(ticket_fd)
             ticket.unlink(missing_ok=True)
+
+    @asynccontextmanager
+    async def hold_worker(self, resource: str):
+        """One root per worker; admitted distinct workers may execute together."""
+        async with self.hold(resource=resource) as admission:
+            yield admission
 
     @asynccontextmanager
     async def hold_maintenance(self):
@@ -221,10 +251,11 @@ class SchedulerClient:
             yield {}
             return
         assert self.execution is not None
-        async with self.execution.hold():
+        async with self.execution.hold_worker(resource) as execution:
             async with self._lease(
                 resource, exclusive=exclusive, wait_for_idle=wait_for_idle
             ) as admission:
+                execution.ready()
                 yield admission
 
     @asynccontextmanager
