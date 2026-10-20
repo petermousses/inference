@@ -13,6 +13,12 @@
   "estimate_margin": 1.08,
   "model_overhead_mib": 512,
   "moe_stream_overhead_mib": 1536,
+  "lazy_tensor_profiles": {
+    "deepseek-v4.1-flash-1017-unsloth": {
+      "expected_tensors": ["per_layer_token_embd.weight"],
+      "working_set_estimate_mib": 5120
+    }
+  },
   "heartbeat_s": 15,
   "recovery_failures": 3,
   "stop_timeout_s": 35,
