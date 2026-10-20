@@ -3,7 +3,7 @@ set -euo pipefail
 umask 0027
 
 readonly revision=d81235049384534c167caea52b85a694f6103d14
-readonly runtime=llama.cpp-d812350-deepseek41-moe-v4
+readonly runtime=llama.cpp-d812350-deepseek41-moe-v5
 readonly target="/srv/ai/runtimes/${runtime}"
 readonly repository=https://github.com/ggml-org/llama.cpp.git
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -11,6 +11,7 @@ readonly runtime_metadata="${script_dir}/runtime-manifests/${runtime}"
 readonly patch_file="${runtime_metadata}/moe-stream.patch"
 readonly architecture_patch_file="${runtime_metadata}/deepseek41.patch"
 readonly direct_patch_file="${runtime_metadata}/deepseek41-direct.patch"
+readonly vision_patch_file="${runtime_metadata}/deepseek41v.patch"
 (cd -- "${runtime_metadata}" && sha256sum --check PATCH_SHA256)
 readonly patch_sha="$(sha256sum "${runtime_metadata}/PATCH_SHA256" | cut -d ' ' -f 1)"
 
@@ -39,6 +40,10 @@ if [[ -e "${target}" ]]; then
   server_help="$("${target}/bin/llama-server" --help 2>&1)"
   if [[ "${server_help}" != *"on-direct"* ]]; then
     printf 'pinned llama-server lacks direct Engram row support\n' >&2
+    exit 1
+  fi
+  if [[ "${server_help}" != *"--mmproj"* || "${server_help}" != *"--image-max-tokens"* ]]; then
+    printf 'pinned llama-server lacks multimodal image support\n' >&2
     exit 1
   fi
   runtime_version="$("${target}/bin/llama-server" --version 2>&1)"
@@ -133,6 +138,8 @@ git -C "${source_root}" apply --check "${architecture_patch_file}"
 git -C "${source_root}" apply "${architecture_patch_file}"
 git -C "${source_root}" apply --check "${direct_patch_file}"
 git -C "${source_root}" apply "${direct_patch_file}"
+git -C "${source_root}" apply --check "${vision_patch_file}"
+git -C "${source_root}" apply "${vision_patch_file}"
 
 export HIPCXX="$(hipconfig -l)/clang"
 export HIP_PATH="$(hipconfig -R)"
@@ -210,6 +217,10 @@ fi
 server_help="$("${stage}/bin/llama-server" --help 2>&1)"
 if [[ "${server_help}" != *"on-direct"* ]]; then
   printf 'built llama-server lacks direct Engram row support\n' >&2
+  exit 1
+fi
+if [[ "${server_help}" != *"--mmproj"* || "${server_help}" != *"--image-max-tokens"* ]]; then
+  printf 'built llama-server lacks multimodal image support\n' >&2
   exit 1
 fi
 missing_fit_libraries="$(ldd "${stage}/bin/llama-fit-params" | sed -n '/not found/p')"
