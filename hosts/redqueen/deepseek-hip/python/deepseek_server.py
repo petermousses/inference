@@ -423,13 +423,16 @@ def _request_options(body: dict) -> dict:
     allowed = {
         "model", "messages", "max_tokens", "max_completion_tokens", "temperature", "stream",
         "tools", "tool_choice", "reasoning_effort", "thinking_mode", "top_p", "n",
-        "presence_penalty", "frequency_penalty", "logit_bias", "stop",
+        "presence_penalty", "frequency_penalty", "logit_bias", "stop", "user",
     }
     unsupported = sorted(set(body) - allowed)
     if unsupported:
         raise RequestError(400, "unsupported_parameter", f"unsupported request fields: {', '.join(unsupported[:8])}")
     if "model" in body and (not isinstance(body["model"], str) or not body["model"]):
         raise RequestError(400, "invalid_request", "model must be a non-empty string")
+    user = body.get("user")
+    if user is not None and (not isinstance(user, str) or len(user) > 256):
+        raise RequestError(400, "invalid_request", "user must be a string of at most 256 characters")
     if "max_tokens" in body and "max_completion_tokens" in body:
         raise RequestError(400, "invalid_request", "send only one of max_tokens and max_completion_tokens")
     max_tokens = _positive_integer(body.get("max_completion_tokens", body.get("max_tokens", 256)), "max_tokens")
