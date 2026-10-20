@@ -36,6 +36,7 @@ from checkpoint_mapping_audit import (
     _pinned_inference_imports,
     verify_pinned_inference_sources,
 )
+from cached_model import install_cached_moe
 from checkpoint_reader import SafeTensorCheckpoint
 from dense_checkpoint import DenseLoadMemoryEstimate, load_dense_checkpoint
 from session_state import (
