@@ -31,6 +31,7 @@ GENERATED_PROFILE_FIELDS = {
     "weights_bytes", "model_paths", "context_tokens", "planner", "gpu_bytes",
     "host_bytes", "memory", "artifact_identity", "artifact_fingerprint",
     "runtime_identity", "supported_request_shapes", "concurrency_limit",
+    "max_image_inputs", "multimodal_workspace_mib",
 }
 
 
