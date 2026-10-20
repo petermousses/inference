@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
@@ -253,6 +254,20 @@ class SessionStateTest(unittest.TestCase):
         self.assertTrue(torch.equal(self.model.engram_hash.token_map, static_token_map))
         self.assertNotIn(("exit", None), self.events)
         state.close()
+
+    def test_close_drops_owned_tensors_before_releasing_backing_and_reservation(self):
+        state = self._state()
+        references = [weakref.ref(value) for value in state._loaded.values()]
+        observed = []
+
+        def release():
+            observed.append(all(reference() is None for reference in references))
+
+        state._release_allocator = release
+        state.close()
+
+        self.assertEqual(observed, [True])
+        self.assertEqual(self.events[-1], ("exit", None))
 
     def test_reset_fence_failure_quarantines_the_session(self):
         fence_calls = 0

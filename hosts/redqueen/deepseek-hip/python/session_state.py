@@ -477,6 +477,9 @@ class SessionState:
                 _call_sync(self._reset_runtime_references, "runtime reference reset")
                 for container, attribute, original in reversed(self._restore_locations):
                     container[attribute] = original
+                # The ownership map is the last strong reference to many buffers.
+                # Drop it before empty_cache/fencing and the reservation release.
+                self._loaded.clear()
                 gc.collect()
                 _call_sync(self._release_allocator, "release_allocator")
                 _call_sync(self._fence, "post-release GPU fence")

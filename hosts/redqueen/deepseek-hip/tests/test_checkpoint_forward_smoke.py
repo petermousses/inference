@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+import weakref
 from types import SimpleNamespace
 
 from checkpoint_forward_smoke import (
+    _drain_request_state,
     _SystemMemorySampler,
 )
 from run_dense_checkpoint_smoke import (
@@ -14,6 +16,63 @@ from run_dense_checkpoint_smoke import (
 
 
 _GIB = 1024**3
+
+
+class RequestDrainTest(unittest.TestCase):
+    def test_shared_scratch_is_dropped_before_allocator_release(self):
+        class Scratch:
+            pass
+
+        shared = SimpleNamespace(topk_idxs=Scratch())
+        reference = weakref.ref(shared.topk_idxs)
+        events = []
+
+        class Cache:
+            def resize_when_idle(self, capacity, *, after_drop):
+                events.append(("resize", capacity))
+                after_drop()
+
+        def reset():
+            events.append("reset")
+            shared.topk_idxs = None
+
+        def release():
+            events.append("release")
+            self.assertIsNone(reference(), "request scratch survived until session close")
+
+        _drain_request_state(
+            cache=Cache(),
+            fence=lambda: events.append("fence"),
+            reset_runtime_references=reset,
+            release_allocator=release,
+        )
+        self.assertEqual(events, ["fence", "reset", ("resize", 0), "release", "fence"])
+
+    def test_scratch_backing_is_released_even_when_expert_cache_is_empty(self):
+        events = []
+        cache = SimpleNamespace(resize_when_idle=lambda *_args, **_kwargs: None)
+        _drain_request_state(
+            cache=cache,
+            fence=lambda: events.append("fence"),
+            reset_runtime_references=lambda: events.append("reset"),
+            release_allocator=lambda: events.append("release"),
+        )
+        self.assertEqual(events, ["fence", "reset", "release", "fence"])
+
+    def test_failed_initial_fence_keeps_request_references(self):
+        reset = []
+
+        def failed_fence():
+            raise RuntimeError("unfinished GPU work")
+
+        with self.assertRaisesRegex(RuntimeError, "unfinished GPU work"):
+            _drain_request_state(
+                cache=None,
+                fence=failed_fence,
+                reset_runtime_references=lambda: reset.append(True),
+                release_allocator=lambda: self.fail("released before GPU completion"),
+            )
+        self.assertEqual(reset, [])
 
 
 class BoundaryPeakBudgetTest(unittest.TestCase):

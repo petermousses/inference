@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import os
 import threading
 from contextlib import contextmanager
@@ -25,6 +26,25 @@ _HC_QUERY_TILE_ROWS = 1_024
 _BOUNDARY_TOTAL_TOKENS = 220_000
 _BOUNDARY_PROMPT_TOKENS = _BOUNDARY_TOTAL_TOKENS - 1
 _FP8_GEMM_IMPL_ENV = "DS4_HIP_FP8_GEMM_IMPL"
+
+
+def _drain_request_state(*, cache, fence, reset_runtime_references, release_allocator):
+    """Return request backing while its reservation is still held."""
+    fence()
+    reset_runtime_references()
+    gc.collect()
+    released = False
+
+    def release():
+        nonlocal released
+        release_allocator()
+        released = True
+
+    cache.resize_when_idle(0, after_drop=release)
+    if not released:
+        # Scratch can exist even when no expert was loaded by the request.
+        release_allocator()
+    fence()
 
 
 class _SystemMemorySampler:
@@ -446,9 +466,12 @@ def run_checkpoint_forward_smoke(
                     if spec_logits is not None:
                         result["dspark_logits_cpu"] = spec_logits.detach().float().cpu()
                 del main_hidden, logits, output_ids, input_ids
-            request_fence()
-            cache.resize_when_idle(0, after_drop=request_release_allocator)
-            request_fence()
+            _drain_request_state(
+                cache=cache,
+                fence=request_fence,
+                reset_runtime_references=reset_runtime_references,
+                release_allocator=request_release_allocator,
+            )
             torch.cuda.synchronize(device)
             if sampler is not None:
                 result["system_memory"] = sampler.stop()
@@ -491,9 +514,12 @@ def run_checkpoint_forward_smoke(
                     pass
             model_globals["shared_attn"].candidates = None
             if not cache.stats.quarantined:
-                request_fence()
-                cache.resize_when_idle(0, after_drop=request_release_allocator)
-                request_fence()
+                _drain_request_state(
+                    cache=cache,
+                    fence=request_fence,
+                    reset_runtime_references=reset_runtime_references,
+                    release_allocator=request_release_allocator,
+                )
             raise
 
     rmsnorm_class.forward = native_rmsnorm
