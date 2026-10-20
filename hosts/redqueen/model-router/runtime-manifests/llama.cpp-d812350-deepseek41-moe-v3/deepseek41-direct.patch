@@ -1,0 +1,615 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 39c9dac..a46de8e 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2713,10 +2713,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+         {"-lzm", "--lazy-mode"}, "MODE",
+         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
+         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
++        "- on-direct: stage supported DeepSeek-V4.1 Engram rows with explicit pread() calls\n"
+         "- auto: on, but only for tensors larger than 4 GiB\n"
+         "- off: always keep them resident",
+         [](common_params & params, const std::string & value) {
+             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
++            else if (value == "on-direct") { params.lazy_mode = LLAMA_LAZY_MODE_DIRECT; }
+             else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
+             else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
+             else { throw std::invalid_argument("invalid value"); }
+diff --git a/include/llama.h b/include/llama.h
+index 30c95ce..ebcc618 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -219,6 +219,7 @@ extern "C" {
+         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
+         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
++        LLAMA_LAZY_MODE_DIRECT = 3, // stage architecture-selected rows with explicit file reads
+     };
+ 
+     enum llama_context_type {
+diff --git a/src/llama-lazy-reader.h b/src/llama-lazy-reader.h
+new file mode 100644
+index 0000000..9988188
+--- /dev/null
++++ b/src/llama-lazy-reader.h
+@@ -0,0 +1,155 @@
++#pragma once
++
++// Read selected rows of a lazy tensor with explicit pread() calls. The model
++// graph knows the row ids before execution, so no giant mmap page range needs
++// to be faulted into GPU-visible memory.
++
++#include "ggml.h"
++#include "llama-impl.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdint>
++#include <cstring>
++#include <exception>
++#include <limits>
++#include <stdexcept>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#ifndef _WIN32
++#include <fcntl.h>
++#include <unistd.h>
++
++struct llama_lazy_reader {
++    llama_lazy_reader(int fd, size_t base, size_t row_size, int64_t n_rows,
++                      int n_threads, enum ggml_type type, int64_t head_dim)
++        : fd(fd), base(base), row_size(row_size), n_rows(n_rows),
++          n_threads(std::max(1, n_threads)), head_dim(head_dim),
++          to_float(type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(type)->to_float) {
++        if (fd < 0 || row_size == 0 || n_rows <= 0 || head_dim <= 0 ||
++            (type != GGML_TYPE_F32 && to_float == nullptr)) {
++            throw std::runtime_error("invalid lazy direct reader tensor layout");
++        }
++    }
++
++    llama_lazy_reader(const llama_lazy_reader &) = delete;
++    llama_lazy_reader & operator=(const llama_lazy_reader &) = delete;
++
++    ~llama_lazy_reader() {
++        if (fd >= 0) {
++            ::close(fd);
++        }
++    }
++
++    const int      fd;
++    const size_t   base;
++    const size_t   row_size;
++    const int64_t  n_rows;
++    const int      n_threads;
++    const int64_t  head_dim;
++    ggml_to_float_t to_float;
++
++    // Output is row-major F32, matching ggml_get_rows. row_offset selects a
++    // contiguous logical view inside the combined Unsloth Engram tensor.
++    void gather(const int32_t * rows, int64_t n, int64_t row_offset, float * dst) const {
++        if (n < 0 || row_offset < 0 || row_offset > n_rows || (n > 0 && (!rows || !dst))) {
++            throw std::runtime_error("invalid lazy direct gather request");
++        }
++        if (n == 0) {
++            return;
++        }
++
++        std::vector<std::pair<int64_t, int64_t>> pairs;
++        pairs.reserve((size_t) n);
++        for (int64_t i = 0; i < n; ++i) {
++            if (rows[i] < 0 || (int64_t) rows[i] >= n_rows - row_offset) {
++                throw std::runtime_error(format("lazy direct row index %d with offset %lld is outside %lld rows",
++                        rows[i], (long long) row_offset, (long long) n_rows));
++            }
++            pairs.emplace_back((int64_t) rows[i] + row_offset, i);
++        }
++        std::sort(pairs.begin(), pairs.end());
++
++        const int n_workers = (int) std::min<int64_t>(n_threads, std::max<int64_t>(1, n / 32));
++        auto run_chunk = [&](int worker, std::exception_ptr & error) {
++            try {
++                run_range(pairs, n * worker / n_workers, n * (worker + 1) / n_workers, dst);
++            } catch (...) {
++                error = std::current_exception();
++            }
++        };
++
++        std::vector<std::exception_ptr> errors(n_workers);
++        std::vector<std::thread> workers;
++        try {
++            for (int worker = 1; worker < n_workers; ++worker) {
++                workers.emplace_back([&run_chunk, &errors, worker] { run_chunk(worker, errors[worker]); });
++            }
++        } catch (...) {
++            for (auto & worker : workers) {
++                worker.join();
++            }
++            throw;
++        }
++        run_chunk(0, errors[0]);
++        for (auto & worker : workers) {
++            worker.join();
++        }
++        for (const auto & error : errors) {
++            if (error) {
++                std::rethrow_exception(error);
++            }
++        }
++    }
++
++private:
++    void run_range(const std::vector<std::pair<int64_t, int64_t>> & pairs,
++                   int64_t begin, int64_t end, float * dst) const {
++        std::vector<uint8_t> bounce(row_size);
++        for (int64_t i = begin; i < end; ) {
++            int64_t last = i;
++            while (last + 1 < end && pairs[last + 1].first == pairs[i].first) {
++                ++last;
++            }
++
++            const uint64_t row = (uint64_t) pairs[i].first;
++            if (row > (std::numeric_limits<size_t>::max() - base) / row_size) {
++                throw std::runtime_error("lazy direct file offset overflows size_t");
++            }
++            const size_t offset = base + (size_t) row * row_size;
++            size_t done = 0;
++            while (done < row_size) {
++                const ssize_t n_read = ::pread(fd, bounce.data() + done, row_size - done, (off_t) (offset + done));
++                if (n_read < 0 && errno == EINTR) {
++                    continue;
++                }
++                if (n_read <= 0) {
++                    throw std::runtime_error(format("lazy direct read of %zu bytes at file offset %zu failed: %s",
++                            row_size, offset, n_read == 0 ? "unexpected EOF" : strerror(errno)));
++                }
++                done += (size_t) n_read;
++            }
++
++            float * first = dst + (size_t) pairs[i].second * head_dim;
++            if (to_float) {
++                to_float(bounce.data(), first, head_dim);
++            } else {
++                memcpy(first, bounce.data(), (size_t) head_dim * sizeof(float));
++            }
++            for (int64_t slot = i + 1; slot <= last; ++slot) {
++                memcpy(dst + (size_t) pairs[slot].second * head_dim, first, (size_t) head_dim * sizeof(float));
++            }
++            i = last + 1;
++        }
++    }
++};
++#else
++struct llama_lazy_reader {
++    const int64_t head_dim = 0;
++    void gather(const int32_t *, int64_t, int64_t, float *) const {
++        throw std::runtime_error("--lazy-mode on-direct is only supported on POSIX systems");
++    }
++};
++#endif
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 9c9ce0f..ba475a2 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -84,7 +84,7 @@ struct llama_file::impl {
+         return ret;
+     }
+ 
+-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
++    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
+         fp = ggml_fopen(fname, mode);
+         if (fp == NULL) {
+             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+@@ -95,7 +95,7 @@ struct llama_file::impl {
+         seek(0, SEEK_SET);
+     }
+ 
+-    impl(FILE * file) : owns_fp(false) {
++    impl(FILE * file) : fname("(file*)"), owns_fp(false) {
+         fp = file;
+         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
+         seek(0, SEEK_END);
+@@ -395,9 +395,10 @@ struct llama_file::impl {
+         }
+     }
+     int fd = -1;
+-    std::string fname;
+ #endif
+ 
++    std::string fname;
++
+     size_t read_alignment() const {
+         return alignment;
+     }
+@@ -418,6 +419,7 @@ llama_file::~llama_file() = default;
+ 
+ size_t llama_file::tell() const { return pimpl->tell(); }
+ size_t llama_file::size() const { return pimpl->size; }
++const std::string & llama_file::name() const { return pimpl->fname; }
+ 
+ size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
+ bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index 6c6393d..1163867 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstdint>
+ #include <memory>
++#include <string>
+ #include <utility>
+ #include <vector>
+ #include <cstdio>
+@@ -24,6 +25,7 @@ struct llama_file {
+ 
+     size_t tell() const;
+     size_t size() const;
++    const std::string & name() const;
+ 
+     int file_id() const; // fileno overload
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 0e2c956..f50b904 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1097,7 +1097,7 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+ 
+     // do not lazy-read small tensors, it has significant overhead and is not worth it
+     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
+-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
++    if (mode != LLAMA_LAZY_MODE_ON && mode != LLAMA_LAZY_MODE_DIRECT && ggml_nbytes(t) <= auto_min_size) {
+         return false;
+     }
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 656b8e6..214d62b 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -30,7 +30,14 @@
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdint>
++#include <cinttypes>
+ #include <cstring>
++#include <thread>
++
++#ifndef _WIN32
++#include <fcntl.h>
++#include <unistd.h>
++#endif
+ #include <cmath>
+ #include <functional>
+ #include <map>
+@@ -2074,6 +2081,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     return true;
+ }
+ 
++const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * tensor) {
++    if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
++        return nullptr;
++    }
++    if (!tensor) {
++        throw std::runtime_error(format("lazy direct tensor %s was not created", tensor_name));
++    }
++    if (const auto it = lazy_readers.find(tensor_name); it != lazy_readers.end()) {
++        return it->second.get();
++    }
++
++    const auto * weight = ml.get_weight(tensor_name);
++    if (!weight || weight->idx >= ml.files.size()) {
++        throw std::runtime_error(format("lazy direct tensor %s has no file-backed weight", tensor_name));
++    }
++    const std::string & path = ml.files[weight->idx]->name();
++    if (path.empty() || path == "(file*)") {
++        throw std::runtime_error(format("lazy direct tensor %s requires a reopenable model file path", tensor_name));
++    }
++
++#ifndef _WIN32
++    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        throw std::runtime_error(format("could not open %s for lazy direct reads: %s", path.c_str(), strerror(errno)));
++    }
++    struct fd_guard {
++        int fd;
++        ~fd_guard() { if (fd >= 0) ::close(fd); }
++    } guard{fd};
++#ifdef __linux__
++    (void) ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
++#endif
++    const int n_threads = std::min(8, std::max(1, (int) std::thread::hardware_concurrency()));
++    auto reader = std::make_unique<llama_lazy_reader>(fd, weight->offs,
++            ggml_row_size(tensor->type, tensor->ne[0]), tensor->ne[1], n_threads,
++            tensor->type, tensor->ne[0]);
++    guard.fd = -1;
++    LLAMA_LOG_INFO("%s: direct reads enabled for %s: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
++            __func__, tensor_name, reader->n_rows, reader->row_size, weight->offs, n_threads);
++    lazy_readers[tensor_name] = std::move(reader);
++    return lazy_readers.at(tensor_name).get();
++#else
++    throw std::runtime_error("--lazy-mode on-direct requires POSIX pread support");
++#endif
++}
++
+ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     const buft_list_t * buft_list_layer = nullptr;
+     if (tn.bid != -1) {
+diff --git a/src/llama-model.h b/src/llama-model.h
+index ba5de8d..de8cbb0 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -5,6 +5,7 @@
+ #include "llama-graph.h"
+ #include "llama-hparams.h"
+ #include "llama-memory.h"
++#include "llama-lazy-reader.h"
+ #include "llama-vocab.h"
+ 
+ #include <map>
+@@ -869,6 +870,9 @@ struct llama_model_base : public llama_model {
+     void load_arch_hparams(llama_model_loader & ml) override = 0;
+     void load_arch_tensors(llama_model_loader & ml) override = 0;
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override = 0;
++
++    const llama_lazy_reader * load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * tensor);
++    std::map<std::string, std::unique_ptr<llama_lazy_reader>> lazy_readers;
+ };
+ 
+ const char * llm_type_name(llm_type type);
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 86c2702..915850d 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -331,9 +331,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+                 params.load_mode = LLAMA_LOAD_MODE_NONE;
+                 params.lazy_mode = LLAMA_LAZY_MODE_OFF;
+             } else if (params.load_mode == LLAMA_LOAD_MODE_NONE) {
+-                // Explicit lazy=on maps only architecture-marked tensors, such as the
++                // Explicit lazy reads map only architecture-marked tensors, such as the
+                 // DeepSeek4.1 Engram table; ordinary weights still load without mmap.
+-                if (params.lazy_mode != LLAMA_LAZY_MODE_ON) {
++                if (params.lazy_mode != LLAMA_LAZY_MODE_ON && params.lazy_mode != LLAMA_LAZY_MODE_DIRECT) {
+                     params.lazy_mode = LLAMA_LAZY_MODE_OFF;
+                 }
+             } else {
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+index 25c72d3..c5ef01d 100644
+--- a/src/models/deepseek41.cpp
++++ b/src/models/deepseek41.cpp
+@@ -281,6 +281,14 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
+         }
+         engram_embd_all = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                 { hparams.engram_key_length, table->tensor->ne[1] }, TENSOR_READ_LAZY);
++        if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
++            engram_reader = load_lazy_reader(ml, "per_layer_token_embd.weight", engram_embd_all);
++            if (!engram_reader) {
++                throw std::runtime_error("DeepSeek-V4.1 direct Engram reader was not initialized");
++            }
++        }
++    } else if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
++        throw std::runtime_error("--lazy-mode on-direct requires the combined Unsloth DeepSeek-V4.1 Engram table");
+     }
+ 
+     for (int i = 0; i < n_layer; ++i) {
+@@ -441,7 +449,10 @@ class llm_graph_input_engram : public llm_graph_input_i {
+ public:
+     llm_graph_input_engram(const llama_model_deepseek41 & pmodel,
+                            const llama_kv_cache_dsv4_raw_context * mctx,
+-                           int eg) : pmodel(pmodel), mctx(mctx), eg(eg) {}
++                           int eg,
++                           const llama_lazy_reader * reader,
++                           int64_t row_offset)
++        : pmodel(pmodel), mctx(mctx), eg(eg), reader(reader), row_offset(row_offset) {}
+     virtual ~llm_graph_input_engram() = default;
+ 
+     void set_input(const llama_ubatch * ubatch) override;
+@@ -449,10 +460,14 @@ public:
+     bool can_reuse(const llm_graph_params & params) override {
+         mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
+         const int64_t n_cols = (pmodel.hparams.engram_max_ngram_size - 1) * pmodel.hparams.engram_n_head;
+-        return rows->ne[0] == n_cols * params.ubatch.n_tokens;
++        if (reader) {
++            return data && data->ne[1] == n_cols * params.ubatch.n_tokens;
++        }
++        return rows && rows->ne[0] == n_cols * params.ubatch.n_tokens;
+     }
+ 
+-    ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens]
++    ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens], mmap path
++    ggml_tensor * data = nullptr;   // F32 [key_length, n_cols * n_tokens], direct path
+ 
+     const llama_model_deepseek41 & pmodel;
+ 
+@@ -461,9 +476,12 @@ public:
+ 
+     // which engram layer this is, so the right multipliers and buckets are used
+     const int eg;
++    const llama_lazy_reader * reader;
++    const int64_t row_offset;
+ 
+     // scratch, reused across set_input() calls
+     std::vector<llama_token> prev;
++    std::vector<float> staging;
+ };
+ 
+ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+@@ -525,7 +543,13 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+         }
+     }
+ 
+-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
++    if (reader) {
++        staging.resize((size_t) idx.size() * reader->head_dim);
++        reader->gather(idx.data(), (int64_t) idx.size(), row_offset, staging.data());
++        ggml_backend_tensor_set(data, staging.data(), 0, staging.size() * sizeof(float));
++    } else {
++        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
++    }
+ }
+ 
+ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
+@@ -538,11 +562,22 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
+ 
+     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
+ 
+-    auto inp = std::make_unique<llm_graph_input_engram>(pmodel, mctx_cur->get_raw(), pmodel.engram_index(il));
+-
+-    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
+-    ggml_set_input(inp->rows);
+-    ggml_tensor * rows = inp->rows;
++    const int eg = pmodel.engram_index(il);
++    const int64_t row_offset = pmodel.engram_combined_table ? pmodel.engram_table_offsets.at(eg) : 0;
++    auto inp = std::make_unique<llm_graph_input_engram>(pmodel, mctx_cur->get_raw(), eg,
++            pmodel.engram_reader, row_offset);
++
++    ggml_tensor * rows = nullptr;
++    ggml_tensor * direct_data = nullptr;
++    if (pmodel.engram_reader) {
++        inp->data = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, key_len, n_cols * n_tokens);
++        ggml_set_input(inp->data);
++        direct_data = inp->data;
++    } else {
++        inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
++        ggml_set_input(inp->rows);
++        rows = inp->rows;
++    }
+     res->add_input(std::move(inp));
+ 
+     ggml_tensor * table = model.layers[il].engram_embd;
+@@ -555,7 +590,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
+     }
+ 
+     // gather then flatten, laying the buckets out slowest, as the reference does
+-    ggml_tensor * emb = ggml_get_rows(ctx0, table, rows);
++    ggml_tensor * emb = direct_data ? direct_data : ggml_get_rows(ctx0, table, rows);
+     emb = ggml_reshape_2d(ctx0, emb, key_len * n_cols, n_tokens);
+     cb(emb, "engram_embd", il);
+ 
+diff --git a/src/models/models.h b/src/models/models.h
+index 7058e39..4cdd821 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1396,6 +1396,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
+     uint32_t engram_pad_id  = 0;   // already through the token map, as the reference stores it
+     bool engram_combined_table = false;
+     ggml_tensor * engram_embd_all = nullptr; // Unsloth layout: [key_length, rows for every engram layer]
++    const llama_lazy_reader * engram_reader = nullptr;
+     std::vector<int64_t> engram_table_offsets;
+     std::vector<int64_t> engram_table_rows;
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index dab9b90..bb201d2 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -365,3 +365,8 @@ endif()
+ 
+ llama_build_and_test(test-moe-stream.cpp)
+ target_include_directories(test-moe-stream PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/common)
++
++if (NOT WIN32)
++    llama_build_and_test(test-lazy-reader.cpp)
++    target_include_directories(test-lazy-reader PRIVATE ${PROJECT_SOURCE_DIR}/src)
++endif()
+diff --git a/tests/test-lazy-reader.cpp b/tests/test-lazy-reader.cpp
+new file mode 100644
+index 0000000..9be94a9
+--- /dev/null
++++ b/tests/test-lazy-reader.cpp
+@@ -0,0 +1,96 @@
++#include "llama-lazy-reader.h"
++
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include <iterator>
++#include <stdexcept>
++#include <vector>
++
++#ifndef _WIN32
++#include <fcntl.h>
++#include <unistd.h>
++
++static void require(bool value, const char * message) {
++    if (!value) {
++        throw std::runtime_error(message);
++    }
++}
++
++static int temp_file() {
++    char path[] = "/tmp/llama-lazy-reader-XXXXXX";
++    const int fd = ::mkstemp(path);
++    if (fd < 0) {
++        throw std::runtime_error("mkstemp failed");
++    }
++    ::unlink(path);
++    return fd;
++}
++
++static void write_all(int fd, const void * data, size_t size) {
++    const auto * bytes = static_cast<const uint8_t *>(data);
++    size_t done = 0;
++    while (done < size) {
++        const ssize_t written = ::write(fd, bytes + done, size - done);
++        if (written <= 0) {
++            throw std::runtime_error("write failed");
++        }
++        done += (size_t) written;
++    }
++}
++
++int main() {
++    try {
++        constexpr int64_t width = 4;
++        constexpr int64_t n_rows = 6;
++        constexpr size_t base = 16;
++        std::vector<uint8_t> prefix(base, 0xa5);
++        std::vector<ggml_fp16_t> encoded((size_t) width * n_rows);
++        std::vector<float> expected((size_t) width * n_rows);
++        for (int64_t row = 0; row < n_rows; ++row) {
++            for (int64_t col = 0; col < width; ++col) {
++                const float value = (float) (row * 10 + col) / 3.0f - 4.0f;
++                encoded[(size_t) row * width + col] = ggml_fp32_to_fp16(value);
++                expected[(size_t) row * width + col] = ggml_fp16_to_fp32(encoded[(size_t) row * width + col]);
++            }
++        }
++
++        const int fd = temp_file();
++        write_all(fd, prefix.data(), prefix.size());
++        write_all(fd, encoded.data(), encoded.size() * sizeof(ggml_fp16_t));
++
++        llama_lazy_reader reader(fd, base, ggml_row_size(GGML_TYPE_F16, width), n_rows, 4, GGML_TYPE_F16, width);
++        const int32_t rows[] = { 0, 1, 2, 1, 4, 0 };
++        constexpr int64_t row_offset = 1;
++        std::vector<float> gathered(std::size(rows) * width);
++        reader.gather(rows, (int64_t) std::size(rows), row_offset, gathered.data());
++
++        for (size_t slot = 0; slot < std::size(rows); ++slot) {
++            for (int64_t col = 0; col < width; ++col) {
++                const float want = expected[(size_t) (rows[slot] + row_offset) * width + col];
++                require(gathered[slot * width + col] == want, "direct read differs from F16 row dequantization or row-offset gather");
++            }
++        }
++
++        const int short_fd = temp_file();
++        write_all(short_fd, prefix.data(), prefix.size());
++        write_all(short_fd, encoded.data(), ggml_row_size(GGML_TYPE_F16, width));
++        llama_lazy_reader short_reader(short_fd, base, ggml_row_size(GGML_TYPE_F16, width), 2, 1, GGML_TYPE_F16, width);
++        bool rejected_short_read = false;
++        try {
++            const int32_t short_row[] = { 1 };
++            float output[width] = {};
++            short_reader.gather(short_row, 1, 0, output);
++        } catch (const std::runtime_error &) {
++            rejected_short_read = true;
++        }
++        require(rejected_short_read, "short direct read was silently accepted");
++        return 0;
++    } catch (const std::exception & error) {
++        std::fprintf(stderr, "%s\n", error.what());
++        return 1;
++    }
++}
++#else
++int main() { return 0; }
++#endif
