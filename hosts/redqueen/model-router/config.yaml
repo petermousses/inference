@@ -111,7 +111,7 @@ models:
 
   qwen3.6-35b-a3b:
     cmd: >-
-      /usr/bin/llama-server
+      /srv/ai/runtimes/llama.cpp-d812350-moe-v1/bin/llama-server
       --model /srv/ai/models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-Q4_K_M.gguf
       --mmproj /srv/ai/models/qwen3.6-35b-a3b/mmproj-Qwen3.6-35B-A3B-Q8_0.gguf
       --alias qwen3.6-35b-a3b
@@ -120,6 +120,12 @@ models:
       --cache-type-v q8_0
       --gpu-layers 999
       --parallel 1
+      --batch-size 32
+      --ubatch-size 1
+      --moe-stream
+      --moe-stream-direct
+      --moe-stream-cache 4g
+      --moe-stream-io-threads 1
       --cont-batching
       --flash-attn auto
       --jinja
@@ -137,16 +143,20 @@ models:
 
   glm-5.3-flash-abliterated:
     cmd: >-
-      /srv/ai/runtimes/llama.cpp-v0.6.0-d812350/bin/llama-server
+      /srv/ai/runtimes/llama.cpp-d812350-moe-v1/bin/llama-server
       --model /srv/ai/models/huihui-glm-5.3-flash-abliterated-gguf/UD-IQ1_S/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf
       --alias glm-5.3-flash-abliterated
       --ctx-size 220000
       --cache-type-k q8_0
       --cache-type-v q8_0
-      --gpu-layers 38
+      --gpu-layers 999
       --parallel 1
-      --batch-size 128
-      --ubatch-size 32
+      --batch-size 32
+      --ubatch-size 1
+      --moe-stream
+      --moe-stream-direct
+      --moe-stream-cache 4g
+      --moe-stream-io-threads 1
       --cont-batching
       --flash-attn auto
       --jinja

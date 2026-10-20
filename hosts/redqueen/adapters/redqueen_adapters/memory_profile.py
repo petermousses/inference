@@ -19,8 +19,10 @@ import yaml
 MIB = 1024**2
 MEMORY_FLAGS = {
     "--model", "--ctx-size", "--cache-type-k", "--cache-type-v", "--gpu-layers",
-    "--parallel", "--batch-size", "--ubatch-size", "--flash-attn",
+    "--parallel", "--batch-size", "--ubatch-size", "--flash-attn", "--split-mode",
+    "--moe-stream-cache", "--moe-stream-io-threads",
 }
+MEMORY_BOOLEAN_FLAGS = {"--moe-stream", "--moe-stream-direct"}
 
 
 def _loopback_http_url(value: object, *, path: str | None) -> bool:
@@ -266,8 +268,11 @@ def command_request_shapes(name: str, argv: list[str]) -> list[str]:
     shapes = ["openai.chat", "openai.completion", "openai.responses"]
     if "--embedding" in argv:
         shapes.append("openai.embeddings")
-    if "--mmproj" in argv:
-        shapes.append("openai.multimodal_chat")
+    # Vision workspace scales with image crops and resolution. Until the
+    # streamed worker has request-aware vision accounting, keep its public
+    # contract text-only even if a projector is installed.
+    if "--mmproj" in argv and "--moe-stream" not in argv:
+        shapes.extend(("openai.multimodal_chat", "openai.multimodal_responses"))
     if name == "clef" or name.startswith("clef-"):
         shapes.append("systemone.decision")
     return shapes
@@ -291,12 +296,36 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             estimator = Path(policy["estimator"])
         add_source(estimator)
         arguments, flags = [], {}
-        for index, argument in enumerate(argv[:-1]):
+        for index, argument in enumerate(argv):
             if argument in MEMORY_FLAGS:
+                if index + 1 >= len(argv):
+                    raise ValueError(f"{name} is missing a value for {argument}")
                 flags[argument] = argv[index + 1]
                 arguments.extend((argument, argv[index + 1]))
+            elif argument in MEMORY_BOOLEAN_FLAGS:
+                flags[argument] = True
+                arguments.append(argument)
         if "--model" not in flags or int(flags.get("--ctx-size", 0)) <= 0:
             raise ValueError(f"{name} needs an explicit model and context size")
+        streaming = flags.get("--moe-stream", False)
+        if streaming:
+            cache = flags.get("--moe-stream-cache", "")
+            io_threads = flags.get("--moe-stream-io-threads", "1")
+            if (
+                "--moe-stream-direct" not in flags
+                or not re.fullmatch(r"[1-9][0-9]*(?:[gG]|s)", cache)
+                or not io_threads.isdecimal()
+                or int(io_threads) < 1
+                or int(flags.get("--gpu-layers", "0")) < 1
+                or int(flags.get("--parallel", "1")) != 1
+                or int(flags.get("--ubatch-size", "512")) != 1
+                or flags.get("--split-mode", "layer") != "layer"
+                or "--override-tensor" in argv
+                or "-ot" in argv
+            ):
+                raise ValueError(f"{name} has an invalid direct-I/O MoE streaming contract")
+        elif any(flag in flags for flag in ("--moe-stream-cache", "--moe-stream-io-threads", "--moe-stream-direct")):
+            raise ValueError(f"{name} has MoE streaming options without --moe-stream")
         weights = weight_paths(Path(flags["--model"]))
         extras = [Path(argv[argv.index("--mmproj") + 1])] if "--mmproj" in argv else []
         host_weights = [Path(path) for path in metadata.get("host_weights", [])]
@@ -313,13 +342,23 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             raise ValueError(f"{name} memory estimation failed: {result.stderr[-1000:]}")
         rows = memory_rows(result.stdout)
         gpu = sum(sum(values) for device, values in rows.items() if device != "Host")
-        total = sum(sum(values) for values in rows.values())
+        planner_total = sum(sum(values) for values in rows.values())
         extra_bytes = sum(path.stat().st_size for path in extras)
         host_weight_bytes = sum(path.stat().st_size for path in host_weights)
         # Include all shards, even tensors the runtime might lazily map or ignore.
         weight_bytes = sum(path.stat().st_size for path in weights)
-        total = max(total, weight_bytes) + extra_bytes + host_weight_bytes
-        margin, overhead = policy["estimate_margin"], policy["model_overhead_mib"] * MIB
+        # A streamed artifact is a file-backed source, not resident model memory.
+        # The native fit planner includes dense tensors, expert-cache slots,
+        # context/compute state, and its fixed I/O staging overhead.
+        total = planner_total if streaming else max(planner_total, weight_bytes)
+        total += extra_bytes + host_weight_bytes
+        margin = policy["estimate_margin"]
+        overhead = policy["model_overhead_mib"] * MIB
+        if streaming:
+            stream_overhead = policy.get("moe_stream_overhead_mib", 0)
+            if isinstance(stream_overhead, bool) or not isinstance(stream_overhead, int) or stream_overhead < 0:
+                raise ValueError("moe_stream_overhead_mib must be a nonnegative integer")
+            overhead += stream_overhead * MIB
         gpu_bytes = math.ceil((gpu + extra_bytes) * margin) + overhead
         host_bytes = math.ceil(total * margin) + overhead
         return {

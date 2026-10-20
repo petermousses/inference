@@ -670,6 +670,8 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             return web.json_response({"model": payload["model"], "ok": True})
         upstream = web.Application()
         upstream.router.add_post("/v1/chat/completions", handle)
+        upstream.router.add_post("/v1/responses", handle)
+        upstream.router.add_post("/upstream/{model}/v1/chat/completions", handle)
         async def health(_):
             return web.json_response({"ok": True})
         async def ready(_):
@@ -916,6 +918,22 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([value for key, value in pairs if key == "model"], ["a"])
         self.assertEqual(self.runtime.starts, ["a"])
 
+    async def test_upstream_image_guard_and_backend_share_duplicate_key_interpretation(self):
+        response = await self.client.post(
+            "/upstream/a/v1/chat/completions",
+            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+            data=(
+                '{"model":"a","messages":[{"role":"user","content":'
+                '[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}],'
+                '"messages":[{"role":"user","content":"text only"}]}'
+            ),
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.forwarded[-1][1], "application/json")
+        self.assertEqual(self.forwarded[-1][0].count('"messages"'), 1)
+        self.assertEqual(self.runtime.starts, ["a"])
+
     async def test_non_json_content_type_cannot_route_an_unreserved_query_model(self):
         response = await self.client.post("/v1/chat/completions?model=b", headers={"Authorization": "Bearer secret", "Content-Type": "text/plain"}, data='{"model":"a"}')
         self.assertEqual(response.status, 200)
@@ -988,6 +1006,79 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(image_response.status, 400)
         self.assertEqual((await image_response.json())["error"]["code"], "unsupported_request_shape")
         self.assertEqual(self.runtime.starts, [])
+
+    async def test_text_worker_rejects_unaccounted_upstream_image_before_admission(self):
+        self.resources["a"]["supported_request_shapes"] = [
+            "openai.chat", "openai.completion", "openai.responses"
+        ]
+
+        response = await self.client.post(
+            "/upstream/a/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+            json={
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AA=="},
+                    }],
+                }],
+            },
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"]["code"], "unsupported_request_shape")
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
+
+    async def test_text_worker_preserves_responses_images_when_profile_allows_them(self):
+        self.resources["a"]["supported_request_shapes"] = [
+            "openai.chat", "openai.completion", "openai.responses",
+            "openai.multimodal_chat", "openai.multimodal_responses",
+        ]
+
+        response = await self.client.post(
+            "/v1/responses",
+            headers={"Authorization": "Bearer secret"},
+            json={
+                "model": "a",
+                "input": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AA==",
+                    }],
+                }],
+            },
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.runtime.starts, ["a"])
+
+    async def test_text_worker_rejects_unaccounted_image_request_before_admission(self):
+        self.resources["a"]["supported_request_shapes"] = [
+            "openai.chat", "openai.completion", "openai.responses"
+        ]
+
+        response = await self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+            json={
+                "model": "a",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AA=="},
+                    }],
+                }],
+            },
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"]["code"], "unsupported_request_shape")
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
 
     async def test_direct_openai_service_does_not_accept_llama_swap_control_routes(self):
         self.resources["native"] = resource(30, "service")
@@ -1352,11 +1443,87 @@ class ProfileTest(unittest.TestCase):
             self.assertEqual(larger["resources"]["a"]["weights_bytes"], 16)
             self.assertEqual(larger["version"], 1)
             self.assertEqual(larger["worker_profile_version"], 1)
-            self.assertEqual(larger["resources"]["a"]["supported_request_shapes"], ["openai.chat", "openai.completion", "openai.responses", "openai.multimodal_chat"])
+            self.assertEqual(larger["resources"]["a"]["supported_request_shapes"], ["openai.chat", "openai.completion", "openai.responses", "openai.multimodal_chat", "openai.multimodal_responses"])
             self.assertEqual(larger["resources"]["a"]["memory"]["mandatory"]["gpu_bytes"], larger["resources"]["a"]["gpu_bytes"])
             self.assertEqual(larger["resources"]["a"]["concurrency_limit"], 1)
             self.assertEqual(larger["resources"]["a"]["artifact_identity"][0]["revisions"]["gguf_revision"], "1234")
             verify_profiles(larger)
+
+    def test_streamed_moe_profile_uses_resident_fit_not_full_artifact_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "llama-server").write_text("runtime")
+            model_dir = root / "models/a"
+            model_dir.mkdir(parents=True)
+            model_path = model_dir / "weights.gguf"
+            with model_path.open("wb") as model:
+                model.truncate(4 * 1024**3)
+            projector = model_dir / "projector.gguf"
+            projector.write_bytes(b"projector")
+            metadata = root / "metadata/a"
+            metadata.mkdir(parents=True)
+            (metadata / "SOURCE_REVISION").write_text("gguf_repository=test/a\ngguf_revision=1234\n")
+            (metadata / "SHA256SUMS").write_text("0" * 64 + "  weights.gguf\n" + "1" * 64 + "  projector.gguf\n")
+            estimator = root / "llama-fit-params"
+            estimator.write_text(
+                f"#!{sys.executable}\nimport sys\n"
+                "if '--moe-stream' in sys.argv:\n"
+                " assert '--moe-stream-direct' in sys.argv\n"
+                " assert sys.argv[sys.argv.index('--moe-stream-cache') + 1] == '64s'\n"
+                " assert sys.argv[sys.argv.index('--moe-stream-io-threads') + 1] == '1'\n"
+                "print('ROCm0 100 20 10\\nHost 20 0 1')\n"
+            )
+            estimator.chmod(0o700)
+            router_path, policy_path = root / "router.json", root / "policy.json"
+            command = (
+                f"{root}/llama-server --model {model_path} --mmproj {projector} "
+                "--ctx-size 2048 --parallel 1 --batch-size 32 --ubatch-size 1 "
+                "--gpu-layers 999 --moe-stream --moe-stream-direct "
+                "--moe-stream-cache 64s --moe-stream-io-threads 1"
+            )
+            router_path.write_text(json.dumps({"models": {"a": {"cmd": command}}}))
+            policy_path.write_text(json.dumps({
+                "estimator": str(estimator), "model_root": str(root / "models"),
+                "artifact_metadata_root": str(root / "metadata"), "estimate_margin": 1.08,
+                "model_overhead_mib": 512, "moe_stream_overhead_mib": 1536, "services": {},
+            }))
+
+            document = build_profiles(router_path, policy_path)
+            profile = document["resources"]["a"]
+
+            self.assertGreater(profile["weights_bytes"], 4 * 1024**3)
+            self.assertGreater(profile["host_bytes"], 2 * 1024**3)
+            self.assertLess(profile["host_bytes"], model_path.stat().st_size)
+            self.assertEqual(profile["memory"]["mandatory"]["gpu_bytes"], profile["gpu_bytes"])
+            self.assertNotIn("openai.multimodal_chat", profile["supported_request_shapes"])
+            self.assertNotIn("openai.multimodal_responses", profile["supported_request_shapes"])
+            verify_profiles(document)
+
+            policy = json.loads(policy_path.read_text())
+            for invalid_overhead in (-1, True, "1536"):
+                policy["moe_stream_overhead_mib"] = invalid_overhead
+                policy_path.write_text(json.dumps(policy))
+                with self.subTest(overhead=invalid_overhead), self.assertRaisesRegex(
+                    ValueError, "moe_stream_overhead_mib"
+                ):
+                    build_profiles(router_path, policy_path)
+            policy["moe_stream_overhead_mib"] = 1536
+            policy_path.write_text(json.dumps(policy))
+
+            invalid_commands = (
+                command.replace("--moe-stream-direct ", ""),
+                command.replace("--moe-stream-cache 64s", "--moe-stream-cache 0s"),
+                command.replace("--moe-stream-io-threads 1", "--moe-stream-io-threads 0"),
+                command.replace("--parallel 1", "--parallel 2"),
+                command.replace("--ubatch-size 1", "--ubatch-size 2"),
+                command + " --split-mode row",
+                command + " --override-tensor 'blk.*=CPU'",
+                command.replace("--moe-stream ", ""),
+            )
+            for invalid in invalid_commands:
+                router_path.write_text(json.dumps({"models": {"a": {"cmd": invalid}}}))
+                with self.subTest(command=invalid), self.assertRaisesRegex(ValueError, "MoE streaming"):
+                    build_profiles(router_path, policy_path)
 
     def test_comfy_profile_separates_resident_weights_from_peak_workspace(self):
         with tempfile.TemporaryDirectory() as directory:

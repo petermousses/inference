@@ -40,6 +40,15 @@ grep -Fq -- '--ctx-size 220000' "${router_config}"
 grep -Fq -- "--chat-template-kwargs '{\"clear_thinking\":true}'" "${router_config}"
 grep -Fq '          swap: false' "${router_config}"
 grep -Fq '          exclusive: false' "${router_config}"
+for flag in '--moe-stream' '--moe-stream-direct' '--moe-stream-cache 4g' '--moe-stream-io-threads 1'; do
+  count="$(grep -Fxc -- "      ${flag}" "${router_config}")"
+  if [[ "${count}" -ne 2 ]]; then
+    printf 'expected both streamed MoE workers to use %s\n' "${flag}" >&2
+    exit 1
+  fi
+done
+grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v1/bin/llama-fit-params' "${scheduler_policy}"
+grep -Fq '"${source_root}/install-moe-runtime.sh"' "${host_root}/model-router/install.sh"
 python3 - "${scheduler_policy}" <<'PY'
 import json
 import pathlib
@@ -51,6 +60,7 @@ assert policy["gpu_budget_mib"] == 88 * 1024
 assert policy["host_budget_mib"] == 104 * 1024
 assert policy["minimum_host_available_mib"] == 8 * 1024
 assert policy["prefill_headroom_mib"] == 5 * 1024
+assert policy["moe_stream_overhead_mib"] == 1536
 assert policy["public_request_limit"] == 4
 assert policy["model_root"] == "/srv/ai/models"
 assert policy["artifact_metadata_root"].endswith("/hosts/redqueen/models/metadata")
@@ -71,6 +81,7 @@ for file in \
   "${host_root}/model-router/create-env.sh" \
   "${host_root}/model-router/create-venv.sh" \
   "${host_root}/model-router/install-glm53-runtime.sh" \
+  "${host_root}/model-router/install-moe-runtime.sh" \
   "${host_root}/model-router/glm-5.3-flash-abliterated-launcher.sh" \
   "${host_root}/model-router/install.sh" \
   "${host_root}/model-router/deploy-scheduler.sh" \

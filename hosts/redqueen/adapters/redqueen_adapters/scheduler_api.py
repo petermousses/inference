@@ -726,11 +726,14 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
 
     async def proxy(request: web.Request):
         path, model, body = request.path, None, None
+        upstream_path = None
+        passthrough_data = None
         if path.startswith("/upstream/"):
             parts = path.split("/", 3)
             if len(parts) < 4:
                 raise AdmissionError(404, "unknown inference route", "not_found")
             model = parts[2]
+            upstream_path = "/" + parts[3]
             if request.method not in {"GET", "POST"}:
                 raise web.HTTPMethodNotAllowed(request.method, {"GET", "POST"})
         elif path in MODEL_ENDPOINTS:
@@ -753,6 +756,33 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
             model = aliases.get(model, model)
             if path.startswith("/upstream/") and resources.get(model, {}).get("gateway_url"):
                 raise AdmissionError(404, "unknown inference route", "not_found")
+            shape_path = path if path in {"/v1/chat/completions", "/v1/responses"} else upstream_path
+            if shape_path in {"/v1/chat/completions", "/v1/responses"} and model in resources:
+                shape_body = body
+                if shape_body is None:
+                    try:
+                        async with body_timeout():
+                            passthrough_data = await request.read()
+                        shape_body = decode_json(passthrough_data)
+                    except ValueError as error:
+                        raise ValueError("request body must be valid JSON") from error
+                    if not isinstance(shape_body, dict):
+                        raise ValueError("request body must be a JSON object")
+                    # Forward the same duplicate-key interpretation used by
+                    # the image guard; downstream parsers must not see a
+                    # different body than admission inspected.
+                    passthrough_data = json.dumps(
+                        shape_body, allow_nan=False, ensure_ascii=False
+                    ).encode()
+                shape = request_shape(shape_path, shape_body)
+                if shape in {"openai.multimodal_chat", "openai.multimodal_responses"}:
+                    supported_shapes = resources[model].get("supported_request_shapes", [])
+                    if shape not in supported_shapes:
+                        raise AdmissionError(
+                            400,
+                            "worker does not support this request shape",
+                            "unsupported_request_shape",
+                        )
         content_type = request.headers.get("Content-Type", "application/json")
         if body is not None:
             # Python and llama-swap's JSON parser disagree on duplicate keys;
@@ -763,7 +793,9 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
             content_type = "application/json"
         else:
             async with body_timeout():
-                data = await request.read()
+                data = passthrough_data if passthrough_data is not None else await request.read()
+            if passthrough_data is not None:
+                content_type = "application/json"
         upstream_url = policy["upstream_url"].rstrip("/")
         direct_spec = resources.get(model) if model is not None else None
         if path in MODEL_ENDPOINTS and direct_spec and direct_spec.get("gateway_url"):
