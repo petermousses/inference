@@ -19,7 +19,7 @@ from .scheduler_client import ResourceLock
 from . import host_reliability
 
 FRONTS = ["qwen-image-adapter.service", "jevk5-adapter.service", "redqueen-scheduler.service", "llama-swap.service", "comfyui-control.service"]
-MANAGED = ["comfyui.service", "jevk5.service", "clm-api.service", "clm-encoder.service", "comfyui-control.service", "qwen38.service"]
+MANAGED = ["comfyui.service", "deepseek-hip.service", "jevk5.service", "clm-api.service", "clm-encoder.service", "comfyui-control.service", "qwen38.service"]
 SUPPORT = ["redqueen-preflight.service", "redqueen-supervisor.service"]
 
 

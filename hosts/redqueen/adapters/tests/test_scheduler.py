@@ -690,6 +690,12 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         await self.upstream.start_server()
         self.addAsyncCleanup(self.upstream.close)
         self.policy = {"socket_path": str(Path(self.directory.name) / "scheduler.sock"), "upstream_url": str(self.upstream.make_url("")).rstrip("/"), "load_timeout_s": 1, "stop_timeout_s": 1, "response_timeout_s": 1, "request_timeout_s": 5, "idle_timeout_s": 300}
+        self.scheduler = Scheduler(
+            self.resources,
+            self.runtime,
+            Path(self.directory.name) / "leases",
+            self.policy,
+        )
         public, local = create_apps(self.policy, self.resources, "secret", runtime_factory=lambda *args: self.runtime)
         self.public = public
         self.client = TestClient(TestServer(public, handler_cancellation=True))
@@ -746,6 +752,46 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         finally:
             self.release.set()
             await stream.read()
+
+    async def test_exclusive_worker_drains_other_workers_and_blocks_new_execution(self):
+        self.runtime.limit = Memory(200, 200)
+        self.resources["deepseek"] = resource(40, "service")
+        self.resources["deepseek"].update(
+            gateway_url="http://127.0.0.1:8085",
+            exclusive_execution=True,
+        )
+        entered = {name: asyncio.Event() for name in ("a", "deepseek", "b")}
+        release = {name: asyncio.Event() for name in entered}
+
+        async def request(name):
+            async with self.scheduler.request(name):
+                entered[name].set()
+                await release[name].wait()
+
+        tasks = []
+        try:
+            tasks.append(asyncio.create_task(request("a")))
+            await asyncio.wait_for(entered["a"].wait(), 1)
+            tasks.append(asyncio.create_task(request("deepseek")))
+            await asyncio.sleep(0.05)
+            self.assertFalse(entered["deepseek"].is_set())
+
+            release["a"].set()
+            await tasks[0]
+            await asyncio.wait_for(entered["deepseek"].wait(), 1)
+            tasks.append(asyncio.create_task(request("b")))
+            await asyncio.sleep(0.05)
+            self.assertFalse(entered["b"].is_set())
+
+            release["deepseek"].set()
+            await tasks[1]
+            await asyncio.wait_for(entered["b"].wait(), 1)
+            release["b"].set()
+            await tasks[2]
+        finally:
+            for event in release.values():
+                event.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def test_adapter_and_gateway_overlap_when_their_full_peaks_fit(self):
         self.runtime.limit = Memory(200, 200)
@@ -1291,6 +1337,22 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command.await_args.args, ("start", "comfyui.service"))
         self.assertEqual(command.await_args.kwargs["timeout"], 240)
 
+    async def test_direct_worker_readiness_is_bounded_by_startup_deadline(self):
+        self.resources["deepseek"] = resource(40, "service")
+        self.resources["deepseek"].update(
+            units=["deepseek-hip.service"],
+            start_command_timeout_s=1,
+            startup_timeout_s=0.03,
+        )
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+        with patch.object(runtime, "command", new=AsyncMock(return_value="")) as command, patch.object(
+            runtime, "ready", new=AsyncMock(return_value=False)
+        ), patch.object(runtime, "failed", new=AsyncMock(return_value=False)):
+            with self.assertRaisesRegex(TimeoutError, "startup deadline"):
+                await runtime.start("deepseek")
+        self.assertEqual(command.await_args.args, ("start", "deepseek-hip.service"))
+        self.assertEqual(command.await_args.kwargs["timeout"], 0.03)
+
     async def test_image_readiness_requires_installed_workflow_nodes(self):
         self.resources["comfyui"].update(health_url=str(self.upstream.make_url("/health")), nodes_url=str(self.upstream.make_url("/object_info")), required_nodes=["UnetLoaderGGUF"])
         runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
@@ -1557,6 +1619,70 @@ class ProfileTest(unittest.TestCase):
             self.assertEqual(comfy["memory"]["transient_peak"]["gpu_bytes"], 2 * MIB)
             self.assertEqual(comfy["memory"]["reclaimable"], {"gpu_bytes": 0, "host_bytes": 0})
             self.assertEqual(comfy["gpu_bytes"], comfy["memory"]["mandatory"]["gpu_bytes"] + 2 * MIB)
+            verify_profiles(profile)
+
+    def test_deepseek_profile_uses_allocation_free_resident_estimate_and_request_envelope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_root = root / "models"
+            artifact_root = model_root / "deepseek-v4.1-flash-1017"
+            inference_dir = artifact_root / "inference"
+            inference_dir.mkdir(parents=True)
+            artifact = inference_dir / "weights.bin"
+            artifact.write_bytes(b"weights")
+            metadata = root / "metadata/deepseek-v4.1-flash-1017"
+            metadata.mkdir(parents=True)
+            (metadata / "SOURCE_REVISION").write_text(
+                "repository=deepseek-ai/test\nrevision=abcd\n"
+            )
+            digest = __import__("hashlib").sha256(artifact.read_bytes()).hexdigest()
+            (metadata / "SHA256SUMS").write_text(f"{digest}  inference/weights.bin\n")
+            inventory = root / "deepseek.files.tsv"
+            inventory.write_text(f"inference/weights.bin\t{artifact.stat().st_size}\t{digest}\t{'a' * 40}\n")
+            profiler = root / "profile.py"
+            profiler.write_text(
+                "import json; print(json.dumps({'resident_device_bytes': 100, 'resident_host_bytes': 80}))\n"
+            )
+            router_path, policy_path = root / "router.json", root / "policy.json"
+            router_path.write_text(json.dumps({"models": {}}))
+            service = {
+                "units": ["deepseek-hip.service"],
+                "start_command_timeout_s": 1200,
+                "health_url": "http://127.0.0.1:8085/health",
+                "slots_url": "http://127.0.0.1:8085/slots",
+                "gateway_url": "http://127.0.0.1:8085",
+                "bind": "127.0.0.1",
+                "port": 8085,
+                "profile_python": sys.executable,
+                "profile_script": str(profiler),
+                "artifact_root": str(artifact_root),
+                "inference_dir": str(inference_dir),
+                "artifact_inventory": str(inventory),
+                "request_peak_mib": 36864,
+                "expert_cache_mib": 1024,
+                "context_tokens": 220000,
+                "supported_request_shapes": ["openai.chat", "openai.multimodal_chat"],
+                "concurrency_limit": 1,
+                "exclusive_execution": True,
+            }
+            policy_path.write_text(json.dumps({
+                "estimator": str(root / "estimator"),
+                "model_root": str(model_root),
+                "artifact_metadata_root": str(root / "metadata"),
+                "estimate_margin": 1.1,
+                "model_overhead_mib": 1,
+                "services": {"deepseek": service},
+            }))
+
+            profile = build_profiles(router_path, policy_path)
+            deepseek = profile["resources"]["deepseek"]
+            self.assertEqual(deepseek["weights_bytes"], artifact.stat().st_size)
+            self.assertTrue(deepseek["exclusive_execution"])
+            self.assertEqual(deepseek["context_tokens"], 220000)
+            self.assertEqual(deepseek["memory"]["mandatory"]["gpu_bytes"], math.ceil(100 * 1.1) + MIB)
+            self.assertEqual(deepseek["memory"]["mandatory"]["host_bytes"], math.ceil(80 * 1.1) + MIB)
+            self.assertEqual(deepseek["memory"]["transient_peak"]["gpu_bytes"], math.ceil(36864 * MIB * 1.1))
+            self.assertEqual(deepseek["memory"]["transient_peak"]["host_bytes"], math.ceil(36864 * MIB * 1.1))
             verify_profiles(profile)
 
 

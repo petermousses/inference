@@ -38,6 +38,27 @@
       "supported_request_shapes": ["systemone.decision"],
       "concurrency_limit": 1
     },
+    "deepseek": {
+      "units": ["deepseek-hip.service"],
+      "start_command_timeout_s": 1200,
+      "startup_timeout_s": 1200,
+      "health_url": "http://127.0.0.1:8085/health",
+      "slots_url": "http://127.0.0.1:8085/slots",
+      "gateway_url": "http://127.0.0.1:8085",
+      "bind": "127.0.0.1",
+      "port": 8085,
+      "profile_python": "/srv/ai/comfyui/venv/bin/python",
+      "profile_script": "/srv/ai/inference/hosts/redqueen/deepseek-hip/python/profile_memory.py",
+      "artifact_root": "/srv/ai/models/deepseek-v4.1-flash-1017",
+      "inference_dir": "/srv/ai/models/deepseek-v4.1-flash-1017/inference",
+      "artifact_inventory": "/srv/ai/inference/hosts/redqueen/models/deepseek-v4.1-flash-1017.files.tsv",
+      "request_peak_mib": 36864,
+      "expert_cache_mib": 1024,
+      "context_tokens": 220000,
+      "supported_request_shapes": ["openai.chat", "openai.multimodal_chat"],
+      "concurrency_limit": 1,
+      "exclusive_execution": true
+    },
     "comfyui": {
       "units": ["comfyui.service"],
       "start_command_timeout_s": 240,

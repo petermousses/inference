@@ -163,6 +163,7 @@ for unit in \
   clm-encoder.service \
   comfyui-control.service \
   comfyui.service \
+  deepseek-hip.service \
   jevk5-adapter.service \
   jevk5.service \
   llama-swap.service \

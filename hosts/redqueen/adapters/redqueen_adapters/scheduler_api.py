@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -287,11 +288,34 @@ class Runtime:
             or command_timeout <= 0
         ):
             raise RuntimeError("backend start command timeout is invalid")
-        await self.command("start", *spec["units"], timeout=command_timeout)
-        while not await self.ready(name):
-            if await self.failed(name):
+        startup_timeout = spec.get("startup_timeout_s", command_timeout + 30)
+        if (
+            isinstance(startup_timeout, bool)
+            or not isinstance(startup_timeout, (int, float))
+            or not math.isfinite(startup_timeout)
+            or startup_timeout <= 0
+        ):
+            raise RuntimeError("backend startup timeout is invalid")
+        deadline = time.monotonic() + startup_timeout
+        await asyncio.wait_for(
+            self.command(
+                "start", *spec["units"],
+                timeout=min(command_timeout, startup_timeout),
+            ),
+            timeout=startup_timeout,
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("backend did not become ready before its startup deadline")
+            if await asyncio.wait_for(self.ready(name), timeout=remaining):
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("backend did not become ready before its startup deadline")
+            if await asyncio.wait_for(self.failed(name), timeout=remaining):
                 raise RuntimeError("backend process exited during loading")
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(min(0.25, max(0, deadline - time.monotonic())))
 
     async def stop(self, name: str) -> None:
         spec = self.resources[name]
@@ -495,7 +519,12 @@ class Scheduler:
         spec = self.resources.get(name)
         if spec is None or not is_openai_worker(spec):
             raise AdmissionError(404, "model is not configured", "model_not_found")
-        async with self.execution.hold_worker(name) as execution:
+        execution_admission = (
+            self.execution.hold()
+            if spec.get("exclusive_execution") is True
+            else self.execution.hold_worker(name)
+        )
+        async with execution_admission as execution:
             limit = self.resources[name].get(
                 "concurrency_limit", self.resources[name].get("concurrency", 1)
             )
