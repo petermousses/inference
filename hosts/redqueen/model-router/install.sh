@@ -19,6 +19,7 @@ fi
 bash "${host_root}/model-router/create-venv.sh"
 "${source_root}/install-glm53-runtime.sh"
 "${source_root}/install-embeddinggemma2-runtime.sh"
+"${source_root}/install-moe-runtime.sh"
 for command in curl sha256sum tar cmp install systemctl python3; do
   if ! command -v "${command}" >/dev/null; then
     printf 'required command not found: %s\n' "${command}" >&2
