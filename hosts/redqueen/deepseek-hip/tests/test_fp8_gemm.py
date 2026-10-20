@@ -7,6 +7,8 @@ import unittest
 
 import torch
 
+import kernel
+
 REFERENCE_COMMIT = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 
 
@@ -126,6 +128,48 @@ class NativeFp8GemmTest(unittest.TestCase):
                 for column in boundaries:
                     self.assertTrue(torch.equal(actual[:, column], expected[:, column]))
 
+    def test_tiled_exact_matches_scalar_reference_bitwise(self):
+        generator = torch.Generator(device="cpu").manual_seed(4101733)
+        previous_dtype = torch.get_default_dtype()
+        previous_impl = os.environ.get("DS4_HIP_FP8_GEMM_IMPL")
+        try:
+            torch.set_default_dtype(torch.float32)
+            os.environ.pop("DS4_HIP_FP8_GEMM_IMPL", None)
+            for group_size in (32, 128):
+                with self.subTest(group_size=group_size):
+                    m, n, k = 17, 129, 256
+                    a = torch.randn((m, k), generator=generator).to(torch.float8_e4m3fn)
+                    b = torch.randn((n, k), generator=generator).to(torch.float8_e4m3fn)
+                    scale_a_raw = torch.randint(
+                        124, 131, (m, k // group_size), generator=generator, dtype=torch.uint8
+                    )
+                    scale_b_raw = torch.randint(
+                        124,
+                        131,
+                        ((n + group_size - 1) // group_size, k // group_size),
+                        generator=generator,
+                        dtype=torch.uint8,
+                    )
+                    scalar = self.call_gemm(
+                        a.view(torch.uint8), scale_a_raw, b.view(torch.uint8), scale_b_raw, group_size
+                    )
+                    tiled = kernel.fp8_gemm(
+                        a.cuda(),
+                        scale_a_raw.cuda().view(torch.float8_e8m0fnu),
+                        b.cuda(),
+                        scale_b_raw.cuda().view(torch.float8_e8m0fnu),
+                        scale_dtype=torch.float8_e8m0fnu,
+                        block_size=group_size,
+                    )
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(tiled.cpu(), scalar))
+        finally:
+            torch.set_default_dtype(previous_dtype)
+            if previous_impl is None:
+                os.environ.pop("DS4_HIP_FP8_GEMM_IMPL", None)
+            else:
+                os.environ["DS4_HIP_FP8_GEMM_IMPL"] = previous_impl
+
     def test_e4m3_decoder_matches_every_encoding(self):
         group_size = 32
         m, n, k = 256, 1, group_size
@@ -203,6 +247,84 @@ class NativeFp8GemmTest(unittest.TestCase):
         actual = self.call_gemm(a, scale_a, b, scale_b, group_size, guarded=True)
         expected = reference_fp8_gemm(a, scale_a, b, scale_b, group_size)
         torch.testing.assert_close(actual, expected, rtol=3.0e-5, atol=3.0e-5)
+
+    def test_large_flat_output_uses_a_two_dimensional_launch_grid(self):
+        group_size = 32
+        m, n, k = 65_535 * 256 + 1, 1, group_size
+        device = torch.device("cuda")
+        a = torch.ones((m, k), dtype=torch.float8_e4m3fn, device=device).view(torch.uint8)
+        scale_a = torch.full((m, 1), 127, dtype=torch.uint8, device=device)
+        b = torch.ones((n, k), dtype=torch.float8_e4m3fn, device=device).view(torch.uint8)
+        scale_b = torch.full((1, 1), 127, dtype=torch.uint8, device=device)
+        output = torch.empty((m, n), dtype=torch.float32, device=device)
+        result = self.library.redqueen_ds4_fp8_gemm(
+            ctypes.c_void_p(a.data_ptr()),
+            ctypes.c_void_p(scale_a.data_ptr()),
+            ctypes.c_void_p(b.data_ptr()),
+            ctypes.c_void_p(scale_b.data_ptr()),
+            ctypes.c_void_p(output.data_ptr()),
+            m,
+            n,
+            k,
+            group_size,
+            0,
+            ctypes.c_void_p(torch.cuda.current_stream().cuda_stream),
+        )
+        self.assertEqual(result, 0)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.all(output == 32.0).item())
+
+    def test_grouped_fp32_profile_matches_exact_fp8_gemm(self):
+        group_size = 32
+        m, n, k = 4, 128, 512
+        device = torch.device("cuda")
+        generator = torch.Generator(device="cpu").manual_seed(4101732)
+        a = torch.randn((m, k), generator=generator).to(torch.float8_e4m3fn).to(device)
+        b = torch.randn((n, k), generator=generator).to(torch.float8_e4m3fn).to(device)
+        scale_a = torch.randint(
+            124, 131, (m, k // group_size), generator=generator, dtype=torch.uint8
+        ).to(device).view(torch.float8_e8m0fnu)
+        scale_b = torch.randint(
+            124,
+            131,
+            (n // group_size, k // group_size),
+            generator=generator,
+            dtype=torch.uint8,
+        ).to(device).view(torch.float8_e8m0fnu)
+
+        previous_dtype = torch.get_default_dtype()
+        previous_impl = os.environ.get("DS4_HIP_FP8_GEMM_IMPL")
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            os.environ.pop("DS4_HIP_FP8_GEMM_IMPL", None)
+            exact = kernel.fp8_gemm(
+                a,
+                scale_a,
+                b,
+                scale_b,
+                scale_dtype=torch.float8_e8m0fnu,
+                block_size=group_size,
+            )
+            os.environ["DS4_HIP_FP8_GEMM_IMPL"] = "fp32-grouped-matmul"
+            optimized = kernel.fp8_gemm(
+                a,
+                scale_a,
+                b,
+                scale_b,
+                scale_dtype=torch.float8_e8m0fnu,
+                block_size=group_size,
+            )
+            torch.cuda.synchronize()
+        finally:
+            torch.set_default_dtype(previous_dtype)
+            if previous_impl is None:
+                os.environ.pop("DS4_HIP_FP8_GEMM_IMPL", None)
+            else:
+                os.environ["DS4_HIP_FP8_GEMM_IMPL"] = previous_impl
+
+        self.assertEqual(exact.dtype, torch.bfloat16)
+        self.assertEqual(optimized.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(optimized, exact))
 
     def test_rejects_invalid_arguments_without_launching(self):
         m, n, k = 1, 1, 128

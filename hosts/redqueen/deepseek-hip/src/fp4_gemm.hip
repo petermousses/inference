@@ -9,7 +9,11 @@
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kTileM = 16;
+constexpr int kTileN = 16;
 constexpr int kWeightGroupSize = 32;
+constexpr unsigned int kGridXLimit = 65535U;
+constexpr unsigned int kGridYLimit = 65535U;
 
 __device__ __forceinline__ float e4m3_to_float(std::uint8_t value) {
   const float sign = (value & 0x80U) != 0U ? -1.0f : 1.0f;
@@ -100,7 +104,8 @@ __global__ void fp4_gemm_kernel(
     int k,
     int activation_group_size,
     std::size_t output_count) {
-  const std::size_t output_index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const std::size_t block_index = static_cast<std::size_t>(blockIdx.y) * gridDim.x + blockIdx.x;
+  const std::size_t output_index = block_index * blockDim.x + threadIdx.x;
   if (output_index >= output_count) {
     return;
   }
@@ -141,6 +146,93 @@ __global__ void fp4_gemm_kernel(
 }
 
 template <typename Scale, typename Output>
+__global__ void tiled_fp4_gemm_kernel(
+    const std::uint8_t* a,
+    const Scale* scale_a,
+    const std::uint8_t* b,
+    const Scale* scale_b,
+    Output* output,
+    int m,
+    int n,
+    int k,
+    int activation_group_size,
+    std::size_t tile_count_n,
+    std::size_t tile_count_m) {
+  __shared__ float a_tile[kTileM][kWeightGroupSize];
+  __shared__ float b_tile[kTileN][kWeightGroupSize];
+
+  const std::size_t tile_index =
+      static_cast<std::size_t>(blockIdx.y) * gridDim.x + blockIdx.x;
+  const std::size_t tile_m = tile_index / tile_count_n;
+  const std::size_t tile_n = tile_index % tile_count_n;
+  if (tile_m >= tile_count_m) {
+    return;
+  }
+  const std::size_t row_base = tile_m * kTileM;
+  const std::size_t column_base = tile_n * kTileN;
+  const int weight_group_count = k / kWeightGroupSize;
+  const int activation_groups_per_weight_group = activation_group_size / kWeightGroupSize;
+  const int local_row = static_cast<int>(threadIdx.x) / kTileN;
+  const int local_column = static_cast<int>(threadIdx.x) % kTileN;
+  const std::size_t global_row = row_base + static_cast<std::size_t>(local_row);
+  const std::size_t global_column = column_base + static_cast<std::size_t>(local_column);
+  const bool valid_output = global_row < static_cast<std::size_t>(m) &&
+                            global_column < static_cast<std::size_t>(n);
+  float accumulated = 0.0f;
+
+  for (int group = 0; group < weight_group_count; ++group) {
+    for (int index = static_cast<int>(threadIdx.x); index < kTileM * kWeightGroupSize; index += kThreads) {
+      const int row = index / kWeightGroupSize;
+      const int element = index % kWeightGroupSize;
+      const std::size_t global_a_row = row_base + static_cast<std::size_t>(row);
+      a_tile[row][element] = global_a_row < static_cast<std::size_t>(m)
+          ? e4m3_to_float(a[global_a_row * static_cast<std::size_t>(k) +
+                            static_cast<std::size_t>(group) * kWeightGroupSize + element])
+          : 0.0f;
+    }
+    for (int index = static_cast<int>(threadIdx.x); index < kTileN * kWeightGroupSize; index += kThreads) {
+      const int column = index / kWeightGroupSize;
+      const int element = index % kWeightGroupSize;
+      const std::size_t global_b_column = column_base + static_cast<std::size_t>(column);
+      if (global_b_column < static_cast<std::size_t>(n)) {
+        const std::size_t packed_index =
+            global_b_column * static_cast<std::size_t>(k / 2) +
+            static_cast<std::size_t>(group) * (kWeightGroupSize / 2) +
+            static_cast<std::size_t>(element / 2);
+        const std::uint8_t packed = b[packed_index];
+        const std::uint8_t code = (element & 1) == 0 ? packed & 0x0fU : packed >> 4U;
+        b_tile[column][element] = e2m1_to_float(code);
+      } else {
+        b_tile[column][element] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    if (valid_output) {
+      float partial = 0.0f;
+      for (int element = 0; element < kWeightGroupSize; ++element) {
+        partial = partial + a_tile[local_row][element] * b_tile[local_column][element];
+      }
+      const std::size_t activation_group =
+          static_cast<std::size_t>(group / activation_groups_per_weight_group);
+      const std::size_t scale_a_index =
+          global_row * static_cast<std::size_t>(k / activation_group_size) + activation_group;
+      const std::size_t scale_b_index =
+          global_column * static_cast<std::size_t>(weight_group_count) +
+          static_cast<std::size_t>(group);
+      const float scaled = (partial * load_scale(scale_a, scale_a_index)) *
+                           load_scale(scale_b, scale_b_index);
+      accumulated = accumulated + scaled;
+    }
+    __syncthreads();
+  }
+  if (valid_output) {
+    const std::size_t output_index = global_row * static_cast<std::size_t>(n) + global_column;
+    store_output(output, output_index, accumulated);
+  }
+}
+
+template <typename Scale, typename Output>
 int launch_fp4_gemm(
     const std::uint8_t* a,
     const Scale* scale_a,
@@ -154,9 +246,15 @@ int launch_fp4_gemm(
     hipStream_t stream,
     std::size_t output_count,
     unsigned int block_count) {
+  const unsigned int blocks_x = block_count < kGridXLimit ? block_count : kGridXLimit;
+  const std::uint64_t blocks_y =
+      (static_cast<std::uint64_t>(block_count) - 1U) / blocks_x + 1U;
+  if (blocks_y > kGridYLimit) {
+    return static_cast<int>(hipErrorInvalidConfiguration);
+  }
   hipLaunchKernelGGL(
       (fp4_gemm_kernel<Scale, Output>),
-      dim3(block_count),
+      dim3(blocks_x, static_cast<unsigned int>(blocks_y)),
       dim3(kThreads),
       0,
       stream,
@@ -170,6 +268,49 @@ int launch_fp4_gemm(
       k,
       activation_group_size,
       output_count);
+  return static_cast<int>(hipGetLastError());
+}
+
+template <typename Scale, typename Output>
+int launch_tiled_fp4_gemm(
+    const std::uint8_t* a,
+    const Scale* scale_a,
+    const std::uint8_t* b,
+    const Scale* scale_b,
+    void* output,
+    int m,
+    int n,
+    int k,
+    int activation_group_size,
+    hipStream_t stream) {
+  const std::size_t tile_count_m =
+      (static_cast<std::size_t>(m) + kTileM - 1U) / kTileM;
+  const std::size_t tile_count_n =
+      (static_cast<std::size_t>(n) + kTileN - 1U) / kTileN;
+  const std::size_t tile_count = tile_count_m * tile_count_n;
+  const unsigned int grid_x = static_cast<unsigned int>(
+      tile_count < kGridXLimit ? tile_count : kGridXLimit);
+  const std::size_t grid_y_size = (tile_count - 1U) / grid_x + 1U;
+  if (grid_y_size > kGridYLimit) {
+    return static_cast<int>(hipErrorInvalidConfiguration);
+  }
+  hipLaunchKernelGGL(
+      (tiled_fp4_gemm_kernel<Scale, Output>),
+      dim3(grid_x, static_cast<unsigned int>(grid_y_size)),
+      dim3(kThreads),
+      0,
+      stream,
+      a,
+      scale_a,
+      b,
+      scale_b,
+      static_cast<Output*>(output),
+      m,
+      n,
+      k,
+      activation_group_size,
+      tile_count_n,
+      tile_count_m);
   return static_cast<int>(hipGetLastError());
 }
 
@@ -264,4 +405,76 @@ extern "C" int redqueen_ds4_fp4_gemm(
   }
   return launch_fp4_gemm<float, std::uint16_t>(
       a, scale_a_f32, b, scale_b_f32, output, m, n, k, activation_group_size, stream, output_count, block_count);
+}
+
+extern "C" int redqueen_ds4_fp4_gemm_tiled(
+    const void* a_e4m3,
+    const void* scale_a,
+    const void* b_e2m1fn_x2,
+    const void* scale_b,
+    void* output,
+    int m,
+    int n,
+    int k,
+    int activation_group_size,
+    int scale_type,
+    int output_type,
+    void* stream_handle) {
+  if (a_e4m3 == nullptr || scale_a == nullptr || b_e2m1fn_x2 == nullptr || scale_b == nullptr || output == nullptr ||
+      m <= 0 || n <= 0 || k <= 0 || (activation_group_size != 32 && activation_group_size != 128) ||
+      k % kWeightGroupSize != 0 || k % activation_group_size != 0 ||
+      (scale_type != REDQUEEN_DS4_FP4_GEMM_SCALE_E8M0 && scale_type != REDQUEEN_DS4_FP4_GEMM_SCALE_F32) ||
+      (output_type != REDQUEEN_DS4_FP4_GEMM_OUTPUT_F32 && output_type != REDQUEEN_DS4_FP4_GEMM_OUTPUT_BF16)) {
+    return static_cast<int>(hipErrorInvalidValue);
+  }
+
+  std::size_t output_count = 0;
+  std::size_t a_elements = 0;
+  std::size_t b_elements = 0;
+  std::size_t scale_a_elements = 0;
+  std::size_t scale_b_elements = 0;
+  if (!checked_multiply(static_cast<std::size_t>(m), static_cast<std::size_t>(n), &output_count) ||
+      !checked_multiply(static_cast<std::size_t>(m), static_cast<std::size_t>(k), &a_elements) ||
+      !checked_multiply(static_cast<std::size_t>(n), static_cast<std::size_t>(k / 2), &b_elements) ||
+      !checked_multiply(
+          static_cast<std::size_t>(m), static_cast<std::size_t>(k / activation_group_size), &scale_a_elements) ||
+      !checked_multiply(static_cast<std::size_t>(n), static_cast<std::size_t>(k / kWeightGroupSize), &scale_b_elements) ||
+      !fits_pointer_extent(a_elements, sizeof(std::uint8_t)) ||
+      !fits_pointer_extent(b_elements, sizeof(std::uint8_t)) ||
+      !fits_pointer_extent(output_count, output_type == REDQUEEN_DS4_FP4_GEMM_OUTPUT_BF16 ? sizeof(std::uint16_t)
+                                                                                         : sizeof(float))) {
+    return static_cast<int>(hipErrorInvalidValue);
+  }
+  const std::size_t scale_size = scale_type == REDQUEEN_DS4_FP4_GEMM_SCALE_E8M0 ? sizeof(std::uint8_t) : sizeof(float);
+  if (!fits_pointer_extent(scale_a_elements, scale_size) || !fits_pointer_extent(scale_b_elements, scale_size)) {
+    return static_cast<int>(hipErrorInvalidValue);
+  }
+
+  const hipError_t pending_error = hipGetLastError();
+  if (pending_error != hipSuccess && pending_error != hipErrorNotReady) {
+    return static_cast<int>(pending_error);
+  }
+
+  const auto* a = static_cast<const std::uint8_t*>(a_e4m3);
+  const auto* b = static_cast<const std::uint8_t*>(b_e2m1fn_x2);
+  const auto stream = reinterpret_cast<hipStream_t>(stream_handle);
+  if (scale_type == REDQUEEN_DS4_FP4_GEMM_SCALE_E8M0) {
+    const auto* scale_a_e8m0 = static_cast<const std::uint8_t*>(scale_a);
+    const auto* scale_b_e8m0 = static_cast<const std::uint8_t*>(scale_b);
+    if (output_type == REDQUEEN_DS4_FP4_GEMM_OUTPUT_F32) {
+      return launch_tiled_fp4_gemm<std::uint8_t, float>(
+          a, scale_a_e8m0, b, scale_b_e8m0, output, m, n, k, activation_group_size, stream);
+    }
+    return launch_tiled_fp4_gemm<std::uint8_t, std::uint16_t>(
+        a, scale_a_e8m0, b, scale_b_e8m0, output, m, n, k, activation_group_size, stream);
+  }
+
+  const auto* scale_a_f32 = static_cast<const float*>(scale_a);
+  const auto* scale_b_f32 = static_cast<const float*>(scale_b);
+  if (output_type == REDQUEEN_DS4_FP4_GEMM_OUTPUT_F32) {
+    return launch_tiled_fp4_gemm<float, float>(
+        a, scale_a_f32, b, scale_b_f32, output, m, n, k, activation_group_size, stream);
+  }
+  return launch_tiled_fp4_gemm<float, std::uint16_t>(
+      a, scale_a_f32, b, scale_b_f32, output, m, n, k, activation_group_size, stream);
 }

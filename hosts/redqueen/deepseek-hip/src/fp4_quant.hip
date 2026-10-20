@@ -10,6 +10,8 @@
 namespace {
 
 constexpr int kMaxGroupSize = 32;
+constexpr unsigned int kGridXLimit = 65535U;
+constexpr unsigned int kGridYLimit = 65535U;
 constexpr float kFp4Max = 6.0f;
 constexpr float kFp4MaxInverse = 1.0f / kFp4Max;
 constexpr float kE8M0MinimumAmax = 0x1.8p-124f;  // 6 * 2^-126
@@ -111,16 +113,20 @@ __global__ void fp4_quantize_kernel(
     std::uint8_t* output_scales,
     int cols,
     int block_size,
-    bool inplace) {
+    bool inplace,
+    std::size_t group_count) {
   __shared__ float values[kMaxGroupSize];
   __shared__ float max_values[kMaxGroupSize];
   __shared__ float scale;
 
   const unsigned int lane = threadIdx.x;
   const unsigned int groups_per_row = static_cast<unsigned int>(cols / block_size);
-  const unsigned int group = blockIdx.x;
-  const unsigned int row = group / groups_per_row;
-  const unsigned int group_in_row = group % groups_per_row;
+  const std::size_t group = static_cast<std::size_t>(blockIdx.y) * gridDim.x + blockIdx.x;
+  if (group >= group_count) {
+    return;
+  }
+  const std::size_t row = group / groups_per_row;
+  const std::size_t group_in_row = group % groups_per_row;
   const std::size_t group_start = static_cast<std::size_t>(row) * static_cast<std::size_t>(cols) +
                                   static_cast<std::size_t>(group_in_row) * static_cast<std::size_t>(block_size);
   const float value = bf16_bits_to_float(input[group_start + lane]);
@@ -173,9 +179,15 @@ int launch_fp4_quantize(
     bool inplace,
     hipStream_t stream,
     std::uint64_t groups) {
+  const unsigned int grid_x = static_cast<unsigned int>(
+      groups < kGridXLimit ? groups : kGridXLimit);
+  const std::uint64_t grid_y = (groups - 1U) / grid_x + 1U;
+  if (grid_y > kGridYLimit) {
+    return static_cast<int>(hipErrorInvalidConfiguration);
+  }
   hipLaunchKernelGGL(
       (fp4_quantize_kernel<Scale>),
-      dim3(static_cast<unsigned int>(groups)),
+      dim3(grid_x, static_cast<unsigned int>(grid_y)),
       dim3(static_cast<unsigned int>(block_size)),
       0,
       stream,
@@ -184,7 +196,8 @@ int launch_fp4_quantize(
       static_cast<std::uint8_t*>(output_scales),
       cols,
       block_size,
-      inplace);
+      inplace,
+      static_cast<std::size_t>(groups));
   return static_cast<int>(hipGetLastError());
 }
 

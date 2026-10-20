@@ -160,6 +160,14 @@ class NativeFp4QuantizationTest(unittest.TestCase):
                         f"packed bytes differ at {tuple(mismatch[0].tolist()) if mismatch.numel() else None}",
                     )
 
+    def test_large_group_count_uses_two_dimensional_grid(self):
+        values = torch.zeros((65536, 16), dtype=torch.bfloat16)
+        values[-1] = torch.linspace(-12.0, 12.0, 16).to(torch.bfloat16)
+        expected_packed, expected_scales, _ = reference_fp4_quantize(values, 16, SCALE_E8M0)
+        actual_packed, actual_scales = self.quantize(values, 16, SCALE_E8M0)
+        self.assertTrue(torch.equal(actual_scales, expected_scales))
+        self.assertTrue(torch.equal(actual_packed, expected_packed))
+
     def test_inplace_dequantization_matches_reference_for_model_paths(self):
         generator = torch.Generator(device="cpu").manual_seed(41017)
         values = ((torch.rand((9, 128), generator=generator) * 24.0) - 12.0).to(torch.bfloat16)

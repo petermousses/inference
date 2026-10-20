@@ -421,6 +421,50 @@ class SessionState:
     def __exit__(self, exc_type, exc, traceback):
         self.close()
 
+    def reset_for_new_request(self):
+        """Clear mutable sequence state before reusing this session for a new request."""
+        with self._close_lock:
+            if self._closed or self._quarantined:
+                raise RuntimeError("DeepSeek session state is not active")
+            try:
+                _call_sync(self._fence, "pre-request reset GPU fence")
+                reset_kinds = {
+                    "window_kv_cache",
+                    "compress_kv_cache",
+                    "k_cache",
+                    "kv_state",
+                    "score_state",
+                    "engram_hash_cache",
+                }
+                for allocation in self.plan.allocations:
+                    if allocation.kind not in reset_kinds:
+                        continue
+                    values = [
+                        container.get(attribute)
+                        for container, attribute, _original in allocation.locations
+                    ]
+                    if not values or any(
+                        value is None or getattr(value, "is_meta", True)
+                        for value in values
+                    ):
+                        raise RuntimeError(
+                            f"request reset found a missing session buffer: {allocation.names}"
+                        )
+                    if any(value is not values[0] for value in values[1:]):
+                        raise RuntimeError(
+                            f"request reset found split aliases: {allocation.names}"
+                        )
+                    if allocation.kind == "score_state":
+                        values[0].fill_(float("-inf"))
+                    else:
+                        values[0].zero_()
+                _call_sync(self._fence, "post-request reset GPU fence")
+            except BaseException as exc:
+                self._quarantined = True
+                with _LIVE_STATES_LOCK:
+                    _QUARANTINED_STATES.append((self._reservation, self, exc))
+                raise
+
     def close(self):
         """Restore meta buffers only after runtime references and device work are drained."""
         with self._close_lock:
@@ -433,6 +477,9 @@ class SessionState:
                 _call_sync(self._reset_runtime_references, "runtime reference reset")
                 for container, attribute, original in reversed(self._restore_locations):
                     container[attribute] = original
+                # The ownership map is the last strong reference to many buffers.
+                # Drop it before empty_cache/fencing and the reservation release.
+                self._loaded.clear()
                 gc.collect()
                 _call_sync(self._release_allocator, "release_allocator")
                 _call_sync(self._fence, "post-release GPU fence")

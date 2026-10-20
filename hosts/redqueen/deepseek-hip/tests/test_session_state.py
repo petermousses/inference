@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
@@ -225,6 +226,64 @@ class SessionStateTest(unittest.TestCase):
         )
         self.assertEqual(self.events[-1], ("exit", None))
         self.assertLess(self.events.index("reset"), self.events.index("release"))
+
+    def test_reset_for_new_request_clears_mutable_buffers_and_preserves_static_state(self):
+        state = self._state()
+        for layer in self.model.layers:
+            layer.window_kv_cache.fill_(7)
+            if hasattr(layer, "compress_kv_cache"):
+                layer.compress_kv_cache.fill_(7)
+                layer.compressor.kv_state.fill_(7)
+                layer.compressor.score_state.fill_(7)
+                layer.indexer.k_cache.fill_(7)
+        self.model.engram_hash.cache.fill_(7)
+        static_token_map = self.model.engram_hash.token_map.clone()
+
+        fence_count = self.events.count("fence")
+        state.reset_for_new_request()
+
+        self.assertEqual(self.events.count("fence") - fence_count, 2)
+        for layer in self.model.layers:
+            self.assertTrue(torch.count_nonzero(layer.window_kv_cache).item() == 0)
+            if hasattr(layer, "compress_kv_cache"):
+                self.assertTrue(torch.count_nonzero(layer.compress_kv_cache).item() == 0)
+                self.assertTrue(torch.count_nonzero(layer.compressor.kv_state).item() == 0)
+                self.assertTrue(torch.isneginf(layer.compressor.score_state).all().item())
+                self.assertTrue(torch.count_nonzero(layer.indexer.k_cache).item() == 0)
+        self.assertTrue(torch.count_nonzero(self.model.engram_hash.cache).item() == 0)
+        self.assertTrue(torch.equal(self.model.engram_hash.token_map, static_token_map))
+        self.assertNotIn(("exit", None), self.events)
+        state.close()
+
+    def test_close_drops_owned_tensors_before_releasing_backing_and_reservation(self):
+        state = self._state()
+        references = [weakref.ref(value) for value in state._loaded.values()]
+        observed = []
+
+        def release():
+            observed.append(all(reference() is None for reference in references))
+
+        state._release_allocator = release
+        state.close()
+
+        self.assertEqual(observed, [True])
+        self.assertEqual(self.events[-1], ("exit", None))
+
+    def test_reset_fence_failure_quarantines_the_session(self):
+        fence_calls = 0
+
+        def broken_fence():
+            nonlocal fence_calls
+            fence_calls += 1
+            if fence_calls == 2:
+                raise RuntimeError("request reset fence failed")
+
+        state = self._state(fence=broken_fence)
+        with self.assertRaisesRegex(RuntimeError, "request reset fence failed"):
+            state.reset_for_new_request()
+        self.assertTrue(state._quarantined)
+        with self.assertRaisesRegex(RuntimeError, "already has a session load or active session"):
+            self._state()
 
     def test_factory_failure_rolls_back_partial_allocations_and_reservation(self):
         calls = 0

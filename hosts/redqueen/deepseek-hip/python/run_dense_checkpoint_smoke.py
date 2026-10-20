@@ -203,7 +203,11 @@ def _comfyui_smoke_window(restore_marker: Path = _COMFYUI_RESTORE_MARKER):
 
 def _run_with_host_isolation(options: argparse.Namespace) -> int:
     """Build and run while scheduler, deployment, and ComfyUI work is isolated."""
-    if options.forward_smoke and not os.environ.get("DS4_HIP_LIBRARY"):
+    if (
+        options.forward_smoke
+        or options.boundary_prefill_smoke
+        or options.compare_optimized_gemm
+    ) and not os.environ.get("DS4_HIP_LIBRARY"):
         adapter_dir = Path(__file__).resolve().parent
         subprocess.run(
             [str(adapter_dir.parent / "build.sh")], check=True, timeout=600
@@ -235,6 +239,110 @@ def _memory_snapshot() -> tuple[int, int, int]:
     if host_available_kib is None or gtt_used > gtt_total:
         raise RuntimeError("Redqueen memory availability values are invalid")
     return gtt_total - gtt_used, host_available_kib * 1024, gtt_total
+
+
+def _validated_memory_snapshot(snapshot) -> tuple[int, int, int]:
+    free_gtt, host_available, gtt_total = snapshot()
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (free_gtt, host_available, gtt_total)
+    ) or free_gtt > gtt_total:
+        raise RuntimeError("Redqueen memory availability values are invalid")
+    return free_gtt, host_available, gtt_total
+
+
+def _boundary_peak_budget(
+    snapshot=_memory_snapshot,
+    *,
+    managed_physical_resident_bytes: int = 0,
+) -> int:
+    """Admit the remaining safe 220k peak under current host and GTT limits."""
+    free_gtt, host_available, gtt_total = _validated_memory_snapshot(snapshot)
+    if (
+        isinstance(managed_physical_resident_bytes, bool)
+        or not isinstance(managed_physical_resident_bytes, int)
+        or managed_physical_resident_bytes < 0
+    ):
+        raise RuntimeError("managed physical-memory baseline is invalid")
+    used_gtt = gtt_total - free_gtt
+    peak_budget = min(
+        free_gtt - _PREFILL_HEADROOM,
+        _MAX_MANAGED_GTT - used_gtt,
+        host_available - _MIN_HOST_AVAILABLE - _HOST_PREFILL_HEADROOM,
+        _MAX_MANAGED_PHYSICAL - managed_physical_resident_bytes,
+    )
+    if peak_budget <= 0:
+        raise RuntimeError("no 220k prefill capacity remains under managed memory headroom")
+    return peak_budget
+
+
+def _check_boundary_admission(
+    estimate,
+    snapshot=_memory_snapshot,
+    *,
+    managed_physical_resident_bytes: int = 0,
+) -> tuple[int, int, int]:
+    """Recheck live capacity after sizing the boundary request reservation."""
+    free_gtt, host_available, gtt_total = _validated_memory_snapshot(snapshot)
+    if (
+        isinstance(managed_physical_resident_bytes, bool)
+        or not isinstance(managed_physical_resident_bytes, int)
+        or managed_physical_resident_bytes < 0
+        or isinstance(estimate.device_peak_bytes, bool)
+        or not isinstance(estimate.device_peak_bytes, int)
+        or estimate.device_peak_bytes < 0
+        or isinstance(estimate.physical_peak_bytes, bool)
+        or not isinstance(estimate.physical_peak_bytes, int)
+        or estimate.physical_peak_bytes < 0
+    ):
+        raise RuntimeError("220k request memory estimate is invalid")
+    used_gtt = gtt_total - free_gtt
+    if used_gtt + estimate.device_peak_bytes > _MAX_MANAGED_GTT:
+        raise RuntimeError("220k request would exceed the 88 GiB managed GTT ceiling")
+    if (
+        managed_physical_resident_bytes + estimate.physical_peak_bytes
+        > _MAX_MANAGED_PHYSICAL
+    ):
+        raise RuntimeError("220k request would exceed the 104 GiB managed physical-memory ceiling")
+    if free_gtt < estimate.device_peak_bytes + _PREFILL_HEADROOM:
+        raise RuntimeError("220k request would consume the 5 GiB GTT headroom")
+    if host_available - estimate.physical_peak_bytes < _MIN_HOST_AVAILABLE + _HOST_PREFILL_HEADROOM:
+        raise RuntimeError(
+            "220k request would violate the 8 GiB host minimum plus 5 GiB headroom"
+        )
+    return free_gtt, host_available, gtt_total
+
+
+def _check_boundary_memory(system_memory) -> None:
+    """Validate sampled aggregate GTT and host headroom measurements."""
+    required = (
+        "min_free_gtt",
+        "min_host_available",
+        "max_sampled_used_gtt",
+        "gtt_total",
+    )
+    if any(
+        isinstance(system_memory.get(key), bool)
+        or not isinstance(system_memory.get(key), int)
+        or system_memory[key] < 0
+        for key in required
+    ):
+        raise RuntimeError("220k request memory sampler returned invalid measurements")
+    if system_memory["min_free_gtt"] < _PREFILL_HEADROOM:
+        raise RuntimeError("220k request violated the 5 GiB GTT headroom")
+    if system_memory["min_host_available"] < _MIN_HOST_AVAILABLE + _HOST_PREFILL_HEADROOM:
+        raise RuntimeError(
+            "220k request violated the 8 GiB host minimum plus 5 GiB headroom"
+        )
+    if system_memory["max_sampled_used_gtt"] > _MAX_MANAGED_GTT:
+        raise RuntimeError(
+            "220k request sampled above the 88 GiB managed GTT ceiling"
+        )
+    if (
+        system_memory["max_sampled_used_gtt"] > system_memory["gtt_total"]
+        or system_memory["min_free_gtt"] > system_memory["gtt_total"]
+    ):
+        raise RuntimeError("220k request memory sampler returned inconsistent GTT measurements")
 
 
 def _check_admission(estimate) -> tuple[int, int, int]:
@@ -404,6 +512,27 @@ def main() -> int:
         help="run one checkpoint-backed native HIP prefill and DSpark decode step",
     )
     parser.add_argument(
+        "--boundary-prefill-smoke",
+        action="store_true",
+        help="run an exact 220,000-token checkpoint-backed native HIP prefill",
+    )
+    parser.add_argument(
+        "--fp8-gemm-impl",
+        choices=("exact", "fp32-grouped-matmul"),
+        default="exact",
+        help="choose exact HIP FP8 arithmetic or a rocBLAS FP8-input profile",
+    )
+    parser.add_argument(
+        "--compare-optimized-gemm",
+        action="store_true",
+        help="compare checkpoint logits and tokens against exact HIP FP8, or repeat it when exact is selected",
+    )
+    parser.add_argument(
+        "--text-only-forward-smoke",
+        action="store_true",
+        help="skip the image case during a short checkpoint forward comparison",
+    )
+    parser.add_argument(
         "--lease-directory",
         type=Path,
         default=Path(
@@ -415,6 +544,10 @@ def main() -> int:
         help="scheduler lease directory used to drain brokered model work",
     )
     options = parser.parse_args()
+    if options.compare_optimized_gemm and not options.forward_smoke:
+        parser.error("--compare-optimized-gemm requires --forward-smoke")
+    if options.text_only_forward_smoke and not options.forward_smoke:
+        parser.error("--text-only-forward-smoke requires --forward-smoke")
     if options.estimate_only:
         return _run(options)
     options.lease_directory = _validate_lease_directory(options.lease_directory)
@@ -611,6 +744,7 @@ def _run(options: argparse.Namespace) -> int:
 
                 dense_state = None
                 session_state = None
+                engram_hash_states = {}
                 try:
                     dense_state = load_dense_checkpoint(
                         checkpoint,
@@ -636,8 +770,6 @@ def _run(options: argparse.Namespace) -> int:
                         for module in model.modules():
                             if module.__class__.__name__ == "Indexer":
                                 module.freqs_cis = None
-
-                    engram_hash_states = {}
 
                     def engram_hash_factory(module, model_args, target_device):
                         if module.__class__.__name__ != "NgramHashState":
@@ -696,7 +828,7 @@ def _run(options: argparse.Namespace) -> int:
                         torch,
                     )
                     engram_hash_states.clear()
-                    if options.forward_smoke:
+                    if options.forward_smoke or options.boundary_prefill_smoke:
                         run_checkpoint_forward_smoke(
                             kernel=kernel,
                             reference=reference,
@@ -709,8 +841,31 @@ def _run(options: argparse.Namespace) -> int:
                             torch=torch,
                             memory=memory,
                             admission_check=_check_admission,
+                            system_memory_snapshot=_memory_snapshot,
+                            boundary_peak_budget=lambda: _boundary_peak_budget(
+                                managed_physical_resident_bytes=int(
+                                    torch.cuda.memory_reserved(device)
+                                )
+                            ),
+                            boundary_admission_check=lambda estimate: _check_boundary_admission(
+                                estimate,
+                                managed_physical_resident_bytes=int(
+                                    torch.cuda.memory_reserved(device)
+                                ),
+                            ),
+                            boundary_memory_check=_check_boundary_memory,
                             fence=fence,
                             release_allocator=release_allocator,
+                            reset_for_new_request=session_state.reset_for_new_request,
+                            reset_runtime_references=reset_runtime_references,
+                            include_short_cases=options.forward_smoke,
+                            include_images=(
+                                options.forward_smoke
+                                and not options.text_only_forward_smoke
+                            ),
+                            include_boundary=options.boundary_prefill_smoke,
+                            fp8_gemm_impl=options.fp8_gemm_impl,
+                            compare_optimized_gemm=options.compare_optimized_gemm,
                         )
                     session_allocated_before_close = torch.cuda.memory_allocated(device)
                     session_state.close()
@@ -750,7 +905,7 @@ def _run(options: argparse.Namespace) -> int:
                     )
                     gtt_residual_tolerance = (
                         _FORWARD_GTT_RUNTIME_RESIDUAL
-                        if options.forward_smoke
+                        if options.forward_smoke or options.boundary_prefill_smoke
                         else _GTT_RELEASE_TOLERANCE
                     )
                     if free_gtt_before is None or (

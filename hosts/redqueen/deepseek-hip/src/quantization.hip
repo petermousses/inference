@@ -8,6 +8,8 @@
 namespace {
 
 constexpr int kMaxGroupSize = 128;
+constexpr unsigned int kGridXLimit = 65535U;
+constexpr unsigned int kGridYLimit = 65535U;
 constexpr float kFp8Max = 448.0f;
 constexpr float kFp8MaxInverse = 1.0f / kFp8Max;
 
@@ -19,20 +21,49 @@ __device__ __forceinline__ std::uint8_t e8m0_from_pow2_exponent(int exponent) {
   return static_cast<std::uint8_t>(exponent + 127);
 }
 
+__device__ __forceinline__ float e4m3_to_float(std::uint8_t value) {
+  const float sign = (value & 0x80U) != 0U ? -1.0f : 1.0f;
+  const int exponent = (value >> 3U) & 0x0fU;
+  const int mantissa = value & 0x07U;
+  if (exponent == 0) {
+    return sign * static_cast<float>(mantissa) * 0x1.0p-9f;
+  }
+  if (exponent == 0x0f && mantissa == 0x07U) {
+    return __uint_as_float(0x7fc00000U);
+  }
+  return sign * ldexpf(1.0f + static_cast<float>(mantissa) * 0.125f, exponent - 7);
+}
+
+__device__ __forceinline__ std::uint16_t float_to_bf16_rne(float value) {
+  std::uint32_t bits = __float_as_uint(value);
+  const std::uint32_t exponent = bits & 0x7f800000U;
+  const std::uint32_t mantissa = bits & 0x007fffffU;
+  if (exponent == 0x7f800000U && mantissa != 0U) {
+    return static_cast<std::uint16_t>((bits >> 16U) | 0x0040U);
+  }
+  bits += 0x7fffU + ((bits >> 16U) & 1U);
+  return static_cast<std::uint16_t>(bits >> 16U);
+}
+
+template <bool Inplace>
 __global__ void quantize_activation_kernel(
-    const std::uint16_t* input_bf16,
+    std::uint16_t* input_bf16,
     std::uint8_t* output_e4m3,
     std::uint8_t* output_e8m0,
     int cols,
-    int group_size) {
+    int group_size,
+    std::size_t group_count) {
   __shared__ float values[kMaxGroupSize];
   __shared__ float abs_values[kMaxGroupSize];
   __shared__ float scale;
   const int lane = threadIdx.x;
-  const unsigned int group = blockIdx.x;
-  const unsigned int group_count_per_row = static_cast<unsigned int>(cols / group_size);
-  const unsigned int row = group / group_count_per_row;
-  const unsigned int group_in_row = group % group_count_per_row;
+  const std::size_t group = static_cast<std::size_t>(blockIdx.y) * gridDim.x + blockIdx.x;
+  if (group >= group_count) {
+    return;
+  }
+  const std::size_t group_count_per_row = static_cast<std::size_t>(cols / group_size);
+  const std::size_t row = group / group_count_per_row;
+  const std::size_t group_in_row = group % group_count_per_row;
   const std::size_t offset = static_cast<std::size_t>(row) * static_cast<std::size_t>(cols) +
                              static_cast<std::size_t>(group_in_row) * static_cast<std::size_t>(group_size) +
                              static_cast<std::size_t>(lane);
@@ -58,12 +89,19 @@ __global__ void quantize_activation_kernel(
       ++exponent;
     }
     scale = __uint_as_float(static_cast<std::uint32_t>(exponent + 127) << 23);
-    output_e8m0[group] = e8m0_from_pow2_exponent(exponent);
+    if constexpr (!Inplace) {
+      output_e8m0[group] = e8m0_from_pow2_exponent(exponent);
+    }
   }
   __syncthreads();
 
   const float normalized = fminf(fmaxf(values[lane] / scale, -kFp8Max), kFp8Max);
-  output_e4m3[offset] = __hip_cvt_float_to_fp8(normalized, __HIP_SATFINITE, __HIP_E4M3);
+  const std::uint8_t quantized = __hip_cvt_float_to_fp8(normalized, __HIP_SATFINITE, __HIP_E4M3);
+  if constexpr (Inplace) {
+    input_bf16[offset] = float_to_bf16_rne(e4m3_to_float(quantized) * scale);
+  } else {
+    output_e4m3[offset] = quantized;
+  }
 }
 
 __device__ __forceinline__ float e8m0_to_float(std::uint8_t value) {
@@ -87,7 +125,8 @@ __global__ void decode_e8m0_kernel(const std::uint8_t* input, float* output, int
 
 }  // namespace
 
-extern "C" int redqueen_ds4_quantize_activation(
+template <bool Inplace>
+int launch_quantize_activation(
     const void* input_bf16,
     void* output_e4m3,
     void* output_e8m0,
@@ -95,7 +134,10 @@ extern "C" int redqueen_ds4_quantize_activation(
     int cols,
     int group_size,
     void* stream_handle) {
-  if (input_bf16 == nullptr || output_e4m3 == nullptr || output_e8m0 == nullptr || rows <= 0 || cols <= 0 ||
+  const bool invalid_output = Inplace
+                                  ? output_e4m3 != nullptr || output_e8m0 != nullptr
+                                  : output_e4m3 == nullptr || output_e8m0 == nullptr;
+  if (input_bf16 == nullptr || invalid_output || rows <= 0 || cols <= 0 ||
       (group_size != 32 && group_size != 128) || cols % group_size != 0) {
     return static_cast<int>(hipErrorInvalidValue);
   }
@@ -104,19 +146,51 @@ extern "C" int redqueen_ds4_quantize_activation(
   if (groups > std::numeric_limits<int>::max()) {
     return static_cast<int>(hipErrorInvalidValue);
   }
+  const unsigned int grid_x = static_cast<unsigned int>(
+      groups < kGridXLimit ? groups : kGridXLimit);
+  const std::int64_t grid_y = (groups - 1) / grid_x + 1;
+  if (grid_y > kGridYLimit) {
+    return static_cast<int>(hipErrorInvalidConfiguration);
+  }
   const auto stream = reinterpret_cast<hipStream_t>(stream_handle);
   hipLaunchKernelGGL(
-      quantize_activation_kernel,
-      dim3(static_cast<unsigned int>(groups)),
+      (quantize_activation_kernel<Inplace>),
+      dim3(grid_x, static_cast<unsigned int>(grid_y)),
       dim3(static_cast<unsigned int>(group_size)),
       0,
       stream,
-      static_cast<const std::uint16_t*>(input_bf16),
+      const_cast<std::uint16_t*>(static_cast<const std::uint16_t*>(input_bf16)),
       static_cast<std::uint8_t*>(output_e4m3),
       static_cast<std::uint8_t*>(output_e8m0),
       cols,
-      group_size);
+      group_size,
+      static_cast<std::size_t>(groups));
   return static_cast<int>(hipGetLastError());
+}
+
+extern "C" int redqueen_ds4_quantize_activation(
+    const void* input_bf16,
+    void* output_e4m3,
+    void* output_e8m0,
+    int rows,
+    int cols,
+    int group_size,
+    void* stream_handle) {
+  if (output_e4m3 == nullptr || output_e8m0 == nullptr) {
+    return static_cast<int>(hipErrorInvalidValue);
+  }
+  return launch_quantize_activation<false>(
+      input_bf16, output_e4m3, output_e8m0, rows, cols, group_size, stream_handle);
+}
+
+extern "C" int redqueen_ds4_quantize_dequantize_activation_bf16(
+    void* input_bf16,
+    int rows,
+    int cols,
+    int group_size,
+    void* stream_handle) {
+  return launch_quantize_activation<true>(
+      input_bf16, nullptr, nullptr, rows, cols, group_size, stream_handle);
 }
 
 extern "C" int redqueen_ds4_decode_e8m0(
