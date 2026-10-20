@@ -13,6 +13,7 @@ readonly -a text_models=(
   gemma-4-12b-it
   gemma-4-26b-a4b-it
   qwen3.6-35b-a3b
+  deepseek-v4.1-flash-1017-unsloth
   glm-5.3-flash-abliterated
 )
 readonly -a clef_models=(
@@ -42,8 +43,8 @@ grep -Fq '          swap: false' "${router_config}"
 grep -Fq '          exclusive: false' "${router_config}"
 for flag in '--moe-stream' '--moe-stream-direct' '--moe-stream-cache 4g' '--moe-stream-io-threads 1'; do
   count="$(grep -Fxc -- "      ${flag}" "${router_config}")"
-  if [[ "${count}" -ne 2 ]]; then
-    printf 'expected both streamed MoE workers to use %s\n' "${flag}" >&2
+  if [[ "${count}" -ne 3 ]]; then
+    printf 'expected all three streamed MoE workers to use %s\n' "${flag}" >&2
     exit 1
   fi
 done
@@ -76,6 +77,7 @@ fi
 
 for file in \
   "${host_root}/models/download-llama-models.sh" \
+  "${host_root}/models/download-evaluation-models.sh" \
   "${host_root}/models/materialize_deepseek_revision.py" \
   "${host_root}/adapters/install.sh" \
   "${host_root}/create-secrets.sh" \
