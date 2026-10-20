@@ -9,12 +9,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
+from cached_model import install_cached_moe as cached_model_installer
 from deepseek_server import (
     _BYTE_LEVEL_ENCODER,
     DeepSeekEngine,
     RequestError,
     _IncrementalTextDecoder,
     _request_options,
+    install_cached_moe,
 )
 
 
@@ -36,6 +38,9 @@ class FakeTokenizer:
 
 
 class DeepSeekRequestContractTest(unittest.TestCase):
+    def test_cached_moe_installer_is_bound_to_worker_entrypoint(self):
+        self.assertIs(install_cached_moe, cached_model_installer)
+
     def test_malformed_thinking_mode_is_a_client_error(self):
         with self.assertRaises(RequestError):
             _request_options({"thinking_mode": []})
