@@ -424,7 +424,7 @@ def run_checkpoint_forward_smoke(
                                 "pinned boundary prefill returned non-finite DSpark hidden state"
                             )
 
-                spec_ids = spec_logits = None
+                speculative = confidence = spec_ids = spec_logits = None
                 if run_dspark:
                     speculative = model.forward_spec(
                         output_ids, main_hidden[:, -1:], start_pos=input_token_count
@@ -466,6 +466,8 @@ def run_checkpoint_forward_smoke(
                     if spec_logits is not None:
                         result["dspark_logits_cpu"] = spec_logits.detach().float().cpu()
                 del main_hidden, logits, output_ids, input_ids
+                speculative = confidence = spec_ids = spec_logits = None
+                model_kwargs.clear()
             _drain_request_state(
                 cache=cache,
                 fence=request_fence,
