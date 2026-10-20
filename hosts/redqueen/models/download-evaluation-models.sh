@@ -7,19 +7,22 @@ readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly required_bytes=573929568511
 readonly reserve_bytes=100000000000
 readonly deepseek_1017_bytes=510311045295
+readonly unsloth_deepseek_q2_bytes=335765753183
 # the xet resolver rejects open-ended ranges for very large artifacts.
 readonly ranged_download_threshold_bytes=2147483648
 readonly ranged_download_chunk_bytes=1073741824
-
-if [[ "$(id -u)" -eq 0 ]]; then
-  printf 'refusing to download model files as root\n' >&2
-  exit 1
-fi
+unsloth_q2_remaining_bytes=0
+unsloth_q2_verified_destinations=$'\n'
 
 plan() {
+  local unsloth_remaining_bytes
+  unsloth_deepseek_q2_remaining_bytes || return 1
+  unsloth_remaining_bytes="${unsloth_q2_remaining_bytes}"
   printf '%-32s %12s  %s\n' MODEL BYTES FILE
   printf '%-32s %12s  %s\n' deepseek-v4.1-flash-1017 \
     "${deepseek_1017_bytes}" 'official Safetensors checkpoint (48 shards + tokenizer/config/encoding)'
+  printf '%-32s %12s  %s\n' deepseek-v4.1-flash-1017-unsloth \
+    "${unsloth_deepseek_q2_bytes}" 'Unsloth UD-Q2_K_XL GGUF (7 shards + BF16 vision projector; targeted download)'
   printf '%-32s %12s  %s\n' gemma-4-e4b-it 5150682208 \
     'Q4_0 GGUF + Q8_0 vision projector'
   printf '%-32s %12s  %s\n' gemma-4-12b-it 7378660832 \
@@ -31,6 +34,8 @@ plan() {
   printf '%-32s %12s  %s\n' qwen3.6-35b-a3b 21033759872 \
     'Q4_K_M GGUF + Q8_0 vision projector'
   printf 'total model/encoder/projector bytes: %s\n' "${required_bytes}"
+  printf 'additional targeted Unsloth DeepSeek bytes: %s\n' "${unsloth_deepseek_q2_bytes}"
+  printf 'remaining targeted Unsloth DeepSeek bytes: %s\n' "${unsloth_remaining_bytes}"
   printf 'destination root: %s\n' "${model_root}"
 }
 
@@ -67,6 +72,109 @@ validate_deepseek_1017_manifest() {
   }
 }
 
+validate_unsloth_deepseek_q2_manifest() {
+  local manifest="${script_dir}/deepseek-v4.1-flash-1017-unsloth.files.tsv"
+  local source_path expected_size expected_sha256 source_oid
+  local file_count=0 total_bytes=0
+
+  [[ -s "${manifest}" ]] || {
+    printf 'missing Unsloth DeepSeek file inventory: %s\n' "${manifest}" >&2
+    return 1
+  }
+
+  while IFS=$'\t' read -r source_path expected_size expected_sha256 source_oid; do
+    [[ -n "${source_path}" ]] || continue
+    [[ "${source_path}" != /* && "/${source_path}/" != *"/../"* ]] || {
+      printf 'unsafe path in Unsloth DeepSeek file inventory: %s\n' "${source_path}" >&2
+      return 1
+    }
+    [[ "${expected_size}" =~ ^[0-9]+$ \
+      && "${expected_sha256}" =~ ^[0-9a-f]{64}$ \
+      && "${source_oid}" =~ ^[0-9a-f]{40}$ ]] || {
+      printf 'invalid Unsloth DeepSeek inventory row for %s\n' "${source_path}" >&2
+      return 1
+    }
+    file_count=$((file_count + 1))
+    total_bytes=$((total_bytes + expected_size))
+  done <"${manifest}"
+
+  [[ "${file_count}" -eq 8 && "${total_bytes}" -eq "${unsloth_deepseek_q2_bytes}" ]] || {
+    printf 'unexpected Unsloth DeepSeek inventory: expected 8 files / %s bytes, found %s files / %s bytes\n' \
+      "${unsloth_deepseek_q2_bytes}" "${file_count}" "${total_bytes}" >&2
+    return 1
+  }
+}
+
+unsloth_deepseek_q2_remaining_bytes() {
+  local manifest="${script_dir}/deepseek-v4.1-flash-1017-unsloth.files.tsv"
+  local root="${model_root}/deepseek-v4.1-flash-1017-unsloth"
+  local source_path expected_size expected_sha256 source_oid
+  local destination partial artifact_size partial_size remaining_bytes=0
+  local verified_destinations=$'\n'
+
+  while IFS=$'\t' read -r source_path expected_size expected_sha256 source_oid; do
+    [[ -n "${source_path}" ]] || continue
+    destination="${root}/${source_path}"
+    partial="${destination}.part"
+
+    # Completed destinations count only after the pinned size and hash pass.
+    if [[ -e "${destination}" || -L "${destination}" ]]; then
+      [[ -f "${destination}" ]] || {
+        printf 'refusing to estimate non-file destination: %s\n' "${destination}" >&2
+        return 1
+      }
+      artifact_size="$(wc -c <"${destination}" | tr -d '[:space:]')"
+      if [[ "${artifact_size}" != "${expected_size}" ]]; then
+        printf 'existing file has the wrong size; preserving it: %s\n' "${destination}" >&2
+        return 1
+      fi
+      printf '%s  %s\n' "${expected_sha256}" "${destination}" \
+        | sha256sum --check --status || {
+          printf 'existing file has the wrong SHA-256; preserving it: %s\n' \
+            "${destination}" >&2
+          return 1
+        }
+      verified_destinations+="${destination}"$'\n'
+      continue
+    fi
+
+    partial_size=0
+    if [[ -f "${partial}" ]]; then
+      partial_size="$(wc -c <"${partial}" | tr -d '[:space:]')"
+      if (( partial_size > expected_size )); then
+        printf 'partial exceeds expected size; preserving it: %s\n' "${partial}" >&2
+        return 1
+      fi
+    elif [[ -e "${partial}" || -L "${partial}" ]]; then
+      printf 'refusing to estimate non-file partial: %s\n' "${partial}" >&2
+      return 1
+    fi
+    # Only contiguous .part bytes can be credited; range staging files are
+    # deliberately ignored because they may need to be fetched again and are
+    # temporarily duplicated when appended to .part.
+    remaining_bytes=$((remaining_bytes + expected_size - partial_size))
+  done <"${manifest}"
+
+  unsloth_q2_remaining_bytes="${remaining_bytes}"
+  unsloth_q2_verified_destinations="${verified_destinations}"
+}
+
+verify_unsloth_deepseek_q2() {
+  local root="${model_root}/deepseek-v4.1-flash-1017-unsloth"
+  local expected_manifest="${script_dir}/metadata/deepseek-v4.1-flash-1017-unsloth/SHA256SUMS"
+  [[ -s "${root}/SHA256SUMS" ]] || {
+    printf 'missing checksum manifest: %s/SHA256SUMS\n' "${root}" >&2
+    return 1
+  }
+  cmp -s -- "${expected_manifest}" "${root}/SHA256SUMS" || {
+    printf 'downloaded checksum manifest differs from pinned metadata: %s\n' \
+      "${root}/SHA256SUMS" >&2
+    return 1
+  }
+  printf 'verifying deepseek-v4.1-flash-1017-unsloth\n'
+  (cd -- "${root}" && sha256sum --check SHA256SUMS)
+}
+
 verify_all() {
   local model_id root
   for model_id in \
@@ -89,6 +197,8 @@ verify_all() {
 download_scope=all
 case "${1:---plan}" in
   --plan)
+    validate_deepseek_1017_manifest
+    validate_unsloth_deepseek_q2_manifest
     plan
     exit 0
     ;;
@@ -96,16 +206,28 @@ case "${1:---plan}" in
     verify_all
     exit 0
     ;;
+  --verify-unsloth-deepseek-q2)
+    verify_unsloth_deepseek_q2
+    exit 0
+    ;;
   --download)
     ;;
   --download-deepseek-1017)
     download_scope=deepseek-only
     ;;
+  --download-unsloth-deepseek-q2)
+    download_scope=unsloth-only
+    ;;
   *)
-    printf 'usage: %s [--plan|--download|--download-deepseek-1017|--verify-only]\n' "$0" >&2
+    printf 'usage: %s [--plan|--download|--download-deepseek-1017|--download-unsloth-deepseek-q2|--verify-only|--verify-unsloth-deepseek-q2]\n' "$0" >&2
     exit 2
     ;;
 esac
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  printf 'refusing to download model files as root\n' >&2
+  exit 1
+fi
 
 mkdir -p -- "${model_root}"
 exec 9>"${model_root}/.evaluation-models-download.lock"
@@ -115,11 +237,15 @@ flock -n 9 || {
 }
 
 validate_deepseek_1017_manifest
+validate_unsloth_deepseek_q2_manifest
 
 available_bytes="$(df -B1 --output=avail "${model_root}" | tail -n 1 | tr -d ' ')"
 required_download_bytes="${required_bytes}"
 if [[ "${download_scope}" == "deepseek-only" ]]; then
   required_download_bytes="${deepseek_1017_bytes}"
+elif [[ "${download_scope}" == "unsloth-only" ]]; then
+  unsloth_deepseek_q2_remaining_bytes || exit 1
+  required_download_bytes="${unsloth_q2_remaining_bytes}"
 fi
 if (( available_bytes < required_download_bytes + reserve_bytes )); then
   printf 'need at least %s bytes plus %s bytes of free-space reserve; found %s\n' \
@@ -153,11 +279,14 @@ download_artifact() {
 
   mkdir -p -- "$(dirname -- "${destination}")"
   if [[ -f "${destination}" ]]; then
-    printf '%s  %s\n' "${expected_sha256}" "${destination}" | sha256sum --check --status || {
-      printf 'existing file has the wrong SHA-256; preserving it: %s\n' \
-        "${destination}" >&2
-      return 1
-    }
+    if [[ "${unsloth_q2_verified_destinations}" != *$'\n'"${destination}"$'\n'* ]]; then
+      printf '%s  %s\n' "${expected_sha256}" "${destination}" \
+        | sha256sum --check --status || {
+          printf 'existing file has the wrong SHA-256; preserving it: %s\n' \
+            "${destination}" >&2
+          return 1
+        }
+    fi
     printf 'verified existing %s\n' "${destination}"
   else
     [[ ! -e "${destination}" ]] || {
@@ -425,6 +554,40 @@ download_deepseek_1017() {
   finish_snapshot_model "${model_id}"
 }
 
+download_unsloth_deepseek_q2() {
+  local model_id=deepseek-v4.1-flash-1017-unsloth
+  local source_path expected_size expected_sha256 source_oid
+  local gguf_repository=unsloth/DeepSeek-V4.1-Flash-1017-GGUF
+  local gguf_revision=f2e5a380fc945842d9783292315307eeab418684
+
+  prepare_manifest "${model_id}"
+  while IFS=$'\t' read -r source_path expected_size expected_sha256 source_oid; do
+    [[ -n "${source_path}" ]] || continue
+    download_artifact "${model_id}" "${gguf_repository}" "${gguf_revision}" \
+      "${source_path}" "${source_path}" "${expected_size}" "${expected_sha256}"
+  done <"${script_dir}/deepseek-v4.1-flash-1017-unsloth.files.tsv"
+  download_text "${model_id}" \
+    'https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/resolve/1bae0e1088993b9b82de08f59de5be5a34e42170/LICENSE?download=true' \
+    LICENSE
+  fetch_model_docs "${model_id}" "${gguf_repository}" "${gguf_revision}"
+  write_source_revision "${model_id}" \
+    "repository=${gguf_repository}" \
+    "revision=${gguf_revision}" \
+    'source_model_repository=deepseek-ai/DeepSeek-V4.1-Flash-1017' \
+    'source_model_revision=1bae0e1088993b9b82de08f59de5be5a34e42170' \
+    'quantization=UD-Q2_K_XL; BF16 vision projector' \
+    "files=8; bytes=${unsloth_deepseek_q2_bytes}" \
+    'file_inventory=deepseek-v4.1-flash-1017-unsloth.files.tsv' \
+    'license=MIT'
+  finish_model "${model_id}"
+  cmp -s -- "${script_dir}/metadata/${model_id}/SHA256SUMS" \
+    "${model_root}/${model_id}/SHA256SUMS" || {
+    printf 'downloaded checksum manifest differs from pinned metadata: %s\n' \
+      "${model_root}/${model_id}/SHA256SUMS" >&2
+    return 1
+  }
+}
+
 prepare_manifest() {
   local model_id="$1"
   local root="${model_root}/${model_id}"
@@ -479,6 +642,12 @@ download_gemma() {
 if [[ "${download_scope}" == "deepseek-only" ]]; then
   download_deepseek_1017
   printf 'DeepSeek-V4.1-Flash-1017 downloaded and SHA-256 verified\n'
+  exit 0
+fi
+
+if [[ "${download_scope}" == "unsloth-only" ]]; then
+  download_unsloth_deepseek_q2
+  printf 'DeepSeek-V4.1-Flash-1017 Unsloth UD-Q2_K_XL downloaded and SHA-256 verified\n'
   exit 0
 fi
 

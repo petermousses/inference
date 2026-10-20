@@ -13,6 +13,7 @@ readonly -a text_models=(
   gemma-4-12b-it
   gemma-4-26b-a4b-it
   qwen3.6-35b-a3b
+  deepseek-v4.1-flash-1017-unsloth
   glm-5.3-flash-abliterated
 )
 readonly -a clef_models=(
@@ -40,10 +41,70 @@ grep -Fq -- '--ctx-size 220000' "${router_config}"
 grep -Fq -- "--chat-template-kwargs '{\"clear_thinking\":true}'" "${router_config}"
 grep -Fq '          swap: false' "${router_config}"
 grep -Fq '          exclusive: false' "${router_config}"
+
+download_test_root="$(mktemp -d)"
+trap 'rm -rf -- "${download_test_root}"' EXIT
+download_test_bin="${download_test_root}/bin"
+mkdir -p -- "${download_test_bin}"
+cat >"${download_test_bin}/sha256sum" <<'SH'
+#!/bin/sh
+[ "${MODEL_ROUTER_TEST_SHA256SUM_OK:-0}" = 1 ]
+SH
+chmod +x "${download_test_bin}/sha256sum"
+expected_unsloth_remaining_bytes="$(python3 - "${download_test_root}" \
+  "${host_root}/models/deepseek-v4.1-flash-1017-unsloth.files.tsv" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]) / "deepseek-v4.1-flash-1017-unsloth"
+manifest = pathlib.Path(sys.argv[2])
+rows = [line.split("\t") for line in manifest.read_text().splitlines() if line]
+assert len(rows) == 8
+
+completed_path = root / rows[0][0]
+completed_path.parent.mkdir(parents=True, exist_ok=True)
+with completed_path.open("wb") as completed:
+    completed.truncate(int(rows[0][1]))
+
+partial_bytes = 1 << 30
+partial_path = root / (rows[1][0] + ".part")
+partial_path.parent.mkdir(parents=True, exist_ok=True)
+with partial_path.open("wb") as partial:
+    partial.truncate(partial_bytes)
+
+# Range staging bytes are intentionally not credited: they may need to be
+# fetched again and are duplicated briefly when appended to the contiguous part.
+range_path = pathlib.Path(str(partial_path) + ".range." + str(partial_bytes))
+with range_path.open("wb") as staged_range:
+    staged_range.truncate(512 << 20)
+
+print(sum(int(row[1]) for row in rows) - int(rows[0][1]) - partial_bytes)
+PY
+)"
+unsloth_plan="$(MODEL_ROOT="${download_test_root}" \
+  MODEL_ROUTER_TEST_SHA256SUM_OK=1 PATH="${download_test_bin}:${PATH}" \
+  bash "${host_root}/models/download-evaluation-models.sh" --plan)"
+if [[ "${unsloth_plan}" != *"remaining targeted Unsloth DeepSeek bytes: ${expected_unsloth_remaining_bytes}"* ]]; then
+  printf 'Unsloth download plan did not account for completed and resumable bytes\n%s\n' \
+    "${unsloth_plan}" >&2
+  exit 1
+fi
+if invalid_unsloth_plan="$(MODEL_ROOT="${download_test_root}" \
+  MODEL_ROUTER_TEST_SHA256SUM_OK=0 PATH="${download_test_bin}:${PATH}" \
+  bash "${host_root}/models/download-evaluation-models.sh" --plan 2>&1)"; then
+  printf 'Unsloth download plan accepted a completed file with the wrong SHA-256\n' >&2
+  exit 1
+fi
+if [[ "${invalid_unsloth_plan}" != *'existing file has the wrong SHA-256'* ]]; then
+  printf 'unexpected failure while rejecting an invalid completed shard\n%s\n' \
+    "${invalid_unsloth_plan}" >&2
+  exit 1
+fi
+
 for flag in '--moe-stream' '--moe-stream-direct' '--moe-stream-cache 4g' '--moe-stream-io-threads 1'; do
   count="$(grep -Fxc -- "      ${flag}" "${router_config}")"
-  if [[ "${count}" -ne 2 ]]; then
-    printf 'expected both streamed MoE workers to use %s\n' "${flag}" >&2
+  if [[ "${count}" -ne 3 ]]; then
+    printf 'expected all three streamed MoE workers to use %s\n' "${flag}" >&2
     exit 1
   fi
 done
@@ -76,6 +137,7 @@ fi
 
 for file in \
   "${host_root}/models/download-llama-models.sh" \
+  "${host_root}/models/download-evaluation-models.sh" \
   "${host_root}/models/materialize_deepseek_revision.py" \
   "${host_root}/adapters/install.sh" \
   "${host_root}/create-secrets.sh" \

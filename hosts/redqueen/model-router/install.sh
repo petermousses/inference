@@ -38,6 +38,7 @@ for model_id in \
   gemma-4-12b-it \
   gemma-4-26b-a4b-it \
   qwen3.6-35b-a3b \
+  deepseek-v4.1-flash-1017-unsloth \
   huihui-glm-5.3-flash-abliterated-gguf \
   embeddinggemma-2 \
   clef-flash \

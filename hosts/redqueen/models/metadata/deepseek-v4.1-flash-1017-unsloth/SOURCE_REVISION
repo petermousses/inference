@@ -1,0 +1,8 @@
+repository=unsloth/DeepSeek-V4.1-Flash-1017-GGUF
+revision=f2e5a380fc945842d9783292315307eeab418684
+source_model_repository=deepseek-ai/DeepSeek-V4.1-Flash-1017
+source_model_revision=1bae0e1088993b9b82de08f59de5be5a34e42170
+quantization=UD-Q2_K_XL; BF16 vision projector
+files=8; bytes=335765753183
+file_inventory=deepseek-v4.1-flash-1017-unsloth.files.tsv
+license=MIT

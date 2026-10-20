@@ -141,6 +141,38 @@ models:
     ttl: 0
     concurrencyLimit: 1
 
+  deepseek-v4.1-flash-1017-unsloth:
+    cmd: >-
+      /srv/ai/runtimes/llama.cpp-d812350-moe-v1/bin/llama-server
+      --model /srv/ai/models/deepseek-v4.1-flash-1017-unsloth/UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf
+      --mmproj /srv/ai/models/deepseek-v4.1-flash-1017-unsloth/mmproj-BF16.gguf
+      --alias deepseek-v4.1-flash-1017-unsloth
+      --ctx-size 220000
+      --cache-type-k q8_0
+      --cache-type-v q8_0
+      --gpu-layers 999
+      --parallel 1
+      --batch-size 32
+      --ubatch-size 1
+      --moe-stream
+      --moe-stream-direct
+      --moe-stream-cache 4g
+      --moe-stream-io-threads 1
+      --cont-batching
+      --flash-attn auto
+      --jinja
+      --metrics
+      --slots
+      --no-ui
+      --threads 28
+      --threads-http 8
+      --api-key-file /srv/ai/secrets/qwen38-api-keys
+      --timeout -1
+      --host 127.0.0.1
+      --port ${PORT}
+    ttl: 0
+    concurrencyLimit: 1
+
   glm-5.3-flash-abliterated:
     cmd: >-
       /srv/ai/runtimes/llama.cpp-d812350-moe-v1/bin/llama-server
@@ -314,6 +346,7 @@ routing:
             - gemma-4-12b-it
             - gemma-4-26b-a4b-it
             - qwen3.6-35b-a3b
+            - deepseek-v4.1-flash-1017-unsloth
             - glm-5.3-flash-abliterated
             - embeddinggemma-2
             - clef-flash-bf16
