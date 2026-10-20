@@ -20,7 +20,7 @@ MIB = 1024**2
 MEMORY_FLAGS = {
     "--model", "--ctx-size", "--cache-type-k", "--cache-type-v", "--gpu-layers",
     "--parallel", "--batch-size", "--ubatch-size", "--flash-attn", "--split-mode",
-    "--moe-stream-cache", "--moe-stream-io-threads",
+    "--moe-stream-cache", "--moe-stream-io-threads", "--load-mode", "--lazy-mode",
 }
 MEMORY_BOOLEAN_FLAGS = {"--moe-stream", "--moe-stream-direct"}
 
@@ -192,6 +192,20 @@ def memory_rows(output: str) -> dict[str, tuple[int, int, int]]:
     return rows
 
 
+def lazy_tensor_sizes(output: str) -> dict[str, int]:
+    """Read exact file-backed tensor sizes emitted by the pinned fit planner."""
+    tensors: dict[str, int] = {}
+    for line in output.splitlines():
+        match = re.search(r"fit-lazy-tensor bytes=(\d+) name=(\S+)", line)
+        if match is None:
+            continue
+        size, name = int(match[1]), match[2]
+        if name in tensors and tensors[name] != size:
+            raise ValueError(f"fit planner reported conflicting lazy sizes for {name}")
+        tensors[name] = size
+    return tensors
+
+
 def artifact_identity(paths: list[Path], policy: dict, add_source) -> tuple[list[dict], str]:
     """Bind a worker profile to tracked model revisions and checksum manifests."""
     model_root = Path(policy["model_root"]).resolve()
@@ -343,6 +357,48 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
         if result.returncode:
             raise ValueError(f"{name} memory estimation failed: {result.stderr[-1000:]}")
         rows = memory_rows(result.stdout)
+        lazy_tensors = lazy_tensor_sizes(result.stdout + "\n" + result.stderr)
+        lazy_bytes = sum(lazy_tensors.values())
+        lazy_profiles = policy.get("lazy_tensor_profiles", {})
+        if not isinstance(lazy_profiles, dict):
+            raise ValueError("lazy_tensor_profiles must be an object")
+        lazy_profile = lazy_profiles.get(name)
+        lazy_working_set_estimate_mib = 0
+        if lazy_profile is not None:
+            if not isinstance(lazy_profile, dict):
+                raise ValueError(f"{name} has an invalid lazy tensor profile")
+            expected_tensors = lazy_profile.get("expected_tensors")
+            lazy_working_set_estimate_mib = lazy_profile.get("working_set_estimate_mib")
+            if (
+                not isinstance(expected_tensors, list)
+                or not expected_tensors
+                or any(not isinstance(tensor, str) or not tensor for tensor in expected_tensors)
+                or len(set(expected_tensors)) != len(expected_tensors)
+                or isinstance(lazy_working_set_estimate_mib, bool)
+                or not isinstance(lazy_working_set_estimate_mib, int)
+                or lazy_working_set_estimate_mib <= 0
+            ):
+                raise ValueError(f"{name} has an invalid lazy tensor profile")
+            if set(expected_tensors) != set(lazy_tensors):
+                missing_tensors = set(expected_tensors) - set(lazy_tensors)
+                unexpected_tensors = set(lazy_tensors) - set(expected_tensors)
+                raise ValueError(
+                    f"{name} lazy tensor set does not match policy; missing={sorted(missing_tensors)}, "
+                    f"unexpected={sorted(unexpected_tensors)}"
+                )
+        elif lazy_tensors:
+            raise ValueError(f"{name} has lazy tensors but no page-cache working-set estimate")
+        if lazy_bytes:
+            if flags.get("--lazy-mode") == "off" or flags.get("--load-mode") not in {"none", "auto"}:
+                raise ValueError(f"{name} planner found lazy tensors without a file-backed serving mode")
+            if lazy_working_set_estimate_mib <= 0:
+                raise ValueError(f"{name} has lazy tensors but no page-cache working-set estimate")
+            host_rows = rows["Host"]
+            if lazy_bytes > host_rows[0]:
+                raise ValueError(f"{name} lazy tensor bytes exceed the planner's host model allocation")
+            # The fit row is converted to a conservative byte bound, while the
+            # lazy tensor record carries its exact byte size.
+            rows["Host"] = (host_rows[0] - lazy_bytes, *host_rows[1:])
         gpu = sum(sum(values) for device, values in rows.items() if device != "Host")
         planner_total = sum(sum(values) for values in rows.values())
         extra_bytes = sum(path.stat().st_size for path in extras)
@@ -352,7 +408,8 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
         # A streamed artifact is a file-backed source, not resident model memory.
         # The native fit planner includes dense tensors, expert-cache slots,
         # context/compute state, and its fixed I/O staging overhead.
-        total = planner_total if streaming else max(planner_total, weight_bytes)
+        resident_weight_bytes = max(0, weight_bytes - lazy_bytes)
+        total = planner_total if streaming else max(planner_total, resident_weight_bytes)
         total += extra_bytes + host_weight_bytes
         margin = policy["estimate_margin"]
         overhead = policy["model_overhead_mib"] * MIB
@@ -363,12 +420,17 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             overhead += stream_overhead * MIB
         gpu_bytes = math.ceil((gpu + extra_bytes) * margin) + overhead
         host_bytes = math.ceil(total * margin) + overhead
+        # This is an admission estimate for clean, file-backed pages, not an
+        # enforced residency ceiling. Linux can reclaim those pages; cold
+        # prefill latency and peak cache use still need workload measurement.
+        lazy_cache_bytes = math.ceil(lazy_working_set_estimate_mib * MIB * margin) if lazy_bytes else 0
+        memory = memory_contract((gpu_bytes, host_bytes), transient_peak=(0, lazy_cache_bytes))
         return {
             **metadata, "weights_bytes": weight_bytes + extra_bytes + host_weight_bytes,
             "model_paths": [str(path) for path in weights],
             "context_tokens": int(flags["--ctx-size"]), "planner": str(estimator),
-            "gpu_bytes": gpu_bytes, "host_bytes": host_bytes,
-            "memory": memory_contract((gpu_bytes, host_bytes)),
+            "gpu_bytes": memory["gpu_bytes"], "host_bytes": memory["host_bytes"],
+            "memory": memory,
             "artifact_identity": artifacts,
             "artifact_fingerprint": artifact_fingerprint,
             "runtime_identity": file_signature(runtime),

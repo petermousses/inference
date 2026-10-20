@@ -1,0 +1,14 @@
+repository=https://github.com/ggml-org/llama.cpp.git
+revision=d81235049384534c167caea52b85a694f6103d14
+moe_patch_revision=1fc70345a167cc0f4771f9ab7ec45b7e1d16c41d
+architecture_pull_request=28696
+architecture_pull_request_revision=2076412598e99127ea2554467b2b7530856895d3
+architecture_candidate_mask=DeepSeek-V4.1-Flash-1017 two-level index mask
+architecture_topk_reuse=carry per-source top-k indices through reuse layers
+architecture_unity_compatibility=rename GLM5-local dsv4_view_2d helper to avoid unity-build collision
+architecture_candidate_block_size_limit=1024
+architecture_unsloth_engram=combine the per-layer tables from per_layer_token_embd.weight using validated prime-bucket offsets
+architecture_engram_staging_recovery=remove marked temporary conversion directories only after their creator process exits
+architecture_lazy_fit_report=exact byte count for lazy tensors in no-allocation fit planning
+architecture_engram_metadata=emit raw vocabulary sizes and raw pad token id with the mapped pad id
+architecture_lazy_cache=5GiB is an admission estimate for reclaimable file-backed pages, not a residency cap; cold 220k latency is not qualified

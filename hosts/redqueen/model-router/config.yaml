@@ -143,9 +143,8 @@ models:
 
   deepseek-v4.1-flash-1017-unsloth:
     cmd: >-
-      /srv/ai/runtimes/llama.cpp-d812350-moe-v1/bin/llama-server
+      /srv/ai/runtimes/llama.cpp-d812350-deepseek41-moe-v2/bin/llama-server
       --model /srv/ai/models/deepseek-v4.1-flash-1017-unsloth/UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf
-      --mmproj /srv/ai/models/deepseek-v4.1-flash-1017-unsloth/mmproj-BF16.gguf
       --alias deepseek-v4.1-flash-1017-unsloth
       --ctx-size 220000
       --cache-type-k q8_0
@@ -158,6 +157,8 @@ models:
       --moe-stream-direct
       --moe-stream-cache 4g
       --moe-stream-io-threads 1
+      --load-mode none
+      --lazy-mode on
       --cont-batching
       --flash-attn auto
       --jinja
