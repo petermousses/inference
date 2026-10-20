@@ -18,6 +18,8 @@ if [[ "$(id -u)" -eq 0 ]]; then
 fi
 
 plan() {
+  local unsloth_remaining_bytes
+  unsloth_remaining_bytes="$(unsloth_deepseek_q2_remaining_bytes)" || return 1
   printf '%-32s %12s  %s\n' MODEL BYTES FILE
   printf '%-32s %12s  %s\n' deepseek-v4.1-flash-1017 \
     "${deepseek_1017_bytes}" 'official Safetensors checkpoint (48 shards + tokenizer/config/encoding)'
@@ -35,6 +37,7 @@ plan() {
     'Q4_K_M GGUF + Q8_0 vision projector'
   printf 'total model/encoder/projector bytes: %s\n' "${required_bytes}"
   printf 'additional targeted Unsloth DeepSeek bytes: %s\n' "${unsloth_deepseek_q2_bytes}"
+  printf 'remaining targeted Unsloth DeepSeek bytes: %s\n' "${unsloth_remaining_bytes}"
   printf 'destination root: %s\n' "${model_root}"
 }
 
@@ -102,6 +105,46 @@ validate_unsloth_deepseek_q2_manifest() {
       "${unsloth_deepseek_q2_bytes}" "${file_count}" "${total_bytes}" >&2
     return 1
   }
+}
+
+unsloth_deepseek_q2_remaining_bytes() {
+  local manifest="${script_dir}/deepseek-v4.1-flash-1017-unsloth.files.tsv"
+  local root="${model_root}/deepseek-v4.1-flash-1017-unsloth"
+  local source_path expected_size expected_sha256 source_oid
+  local destination partial partial_size remaining_bytes=0
+
+  while IFS=$'\t' read -r source_path expected_size expected_sha256 source_oid; do
+    [[ -n "${source_path}" ]] || continue
+    destination="${root}/${source_path}"
+    partial="${destination}.part"
+
+    # Existing destinations are validated before use by download_artifact.
+    # Only contiguous .part bytes can be credited; range staging files are
+    # deliberately ignored because they may need to be fetched again and are
+    # temporarily duplicated when appended to .part.
+    if [[ -f "${destination}" ]]; then
+      continue
+    fi
+    if [[ -e "${destination}" || -L "${destination}" ]]; then
+      printf 'refusing to estimate non-file destination: %s\n' "${destination}" >&2
+      return 1
+    fi
+
+    partial_size=0
+    if [[ -f "${partial}" ]]; then
+      partial_size="$(wc -c <"${partial}" | tr -d '[:space:]')"
+      if (( partial_size > expected_size )); then
+        printf 'partial exceeds expected size; preserving it: %s\n' "${partial}" >&2
+        return 1
+      fi
+    elif [[ -e "${partial}" || -L "${partial}" ]]; then
+      printf 'refusing to estimate non-file partial: %s\n' "${partial}" >&2
+      return 1
+    fi
+    remaining_bytes=$((remaining_bytes + expected_size - partial_size))
+  done <"${manifest}"
+
+  printf '%s\n' "${remaining_bytes}"
 }
 
 verify_unsloth_deepseek_q2() {
@@ -184,7 +227,7 @@ required_download_bytes="${required_bytes}"
 if [[ "${download_scope}" == "deepseek-only" ]]; then
   required_download_bytes="${deepseek_1017_bytes}"
 elif [[ "${download_scope}" == "unsloth-only" ]]; then
-  required_download_bytes="${unsloth_deepseek_q2_bytes}"
+  required_download_bytes="$(unsloth_deepseek_q2_remaining_bytes)"
 fi
 if (( available_bytes < required_download_bytes + reserve_bytes )); then
   printf 'need at least %s bytes plus %s bytes of free-space reserve; found %s\n' \
