@@ -358,12 +358,17 @@ index ba5de8d..de8cbb0 100644
  
  const char * llm_type_name(llm_type type);
 diff --git a/src/llama.cpp b/src/llama.cpp
-index 86c2702..915850d 100644
+index 86c2702..b836556 100644
 --- a/src/llama.cpp
 +++ b/src/llama.cpp
-@@ -331,9 +331,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+@@ -329,11 +329,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+             // existing behavior for callers that use auto/none.
+             if (params.load_mode == LLAMA_LOAD_MODE_AUTO) {
                  params.load_mode = LLAMA_LOAD_MODE_NONE;
-                 params.lazy_mode = LLAMA_LAZY_MODE_OFF;
+-                params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++                if (params.lazy_mode != LLAMA_LAZY_MODE_DIRECT) {
++                    params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++                }
              } else if (params.load_mode == LLAMA_LOAD_MODE_NONE) {
 -                // Explicit lazy=on maps only architecture-marked tensors, such as the
 +                // Explicit lazy reads map only architecture-marked tensors, such as the
@@ -373,6 +378,17 @@ index 86c2702..915850d 100644
                      params.lazy_mode = LLAMA_LAZY_MODE_OFF;
                  }
              } else {
+@@ -343,6 +345,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+ 
++        if (params.lazy_mode == LLAMA_LAZY_MODE_DIRECT && ml.get_arch_name() != "deepseek41") {
++            throw std::runtime_error("--lazy-mode on-direct is only supported for DeepSeek-V4.1 combined Engram tables");
++        }
++
+         ml.lazy.mode = params.lazy_mode;
+ 
+         ml.print_info();
 diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
 index 25c72d3..c5ef01d 100644
 --- a/src/models/deepseek41.cpp
