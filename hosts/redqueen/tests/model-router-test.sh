@@ -76,6 +76,7 @@ fi
 
 for file in \
   "${host_root}/models/download-llama-models.sh" \
+  "${host_root}/models/materialize_deepseek_revision.py" \
   "${host_root}/adapters/install.sh" \
   "${host_root}/create-secrets.sh" \
   "${host_root}/model-router/create-env.sh" \
@@ -99,6 +100,8 @@ PY
     bash -n "${file}"
   fi
 done
+
+python3 -m unittest discover -s "${test_root}" -p 'test_deepseek_revision_materialization.py'
 
 grep -Fq -- '--listen 127.0.0.1:8084' "${host_root}/systemd/llama-swap.service"
 grep -Fq 'ProtectHome=read-only' "${host_root}/systemd/redqueen-scheduler.service"

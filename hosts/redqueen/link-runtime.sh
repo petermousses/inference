@@ -145,7 +145,12 @@ for metadata in "$host_root"/models/metadata/*/*; do
   [[ -f "$metadata" ]] || continue
   model_id="$(basename -- "$(dirname -- "$metadata")")"
   name="$(basename -- "$metadata")"
-  link_path "$metadata" "/srv/ai/models/$model_id/$name" file no
+  if [[ "$model_id" == deepseek-v4.1-flash-1017 && "$name" == SOURCE_REVISION ]]; then
+    /usr/bin/python3 "$host_root/models/materialize_deepseek_revision.py" \
+      "$metadata" "/srv/ai/models/$model_id/$name"
+  else
+    link_path "$metadata" "/srv/ai/models/$model_id/$name" file no
+  fi
 done
 
 for runtime in \
