@@ -33,6 +33,55 @@ OPENAI_REQUEST_SHAPES = {
     "/v1/responses": "openai.responses",
     "/v1/embeddings": "openai.embeddings",
 }
+MULTIMODAL_REQUEST_ENDPOINTS = {
+    "/completion",
+    "/v1/completions",
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/chat/completions/input_tokens",
+    "/v1/responses/input_tokens",
+    "/v1/messages/count_tokens",
+    "/v1/messages",
+    "/v1/audio/transcriptions",
+}
+LLAMA_CPP_REQUEST_ALIASES = {
+    "/chat/completions": "/v1/chat/completions",
+    "/completions": "/completion",
+    "/responses": "/v1/responses",
+    "/chat/completions/input_tokens": "/v1/chat/completions/input_tokens",
+    "/responses/input_tokens": "/v1/responses/input_tokens",
+    "/audio/transcriptions": "/v1/audio/transcriptions",
+}
+MULTIMODAL_REQUEST_SHAPES = {
+    "openai.multimodal_chat",
+    "openai.multimodal_completion",
+    "openai.multimodal_responses",
+    "openai.multimodal_audio",
+    "openai.multimodal_video",
+    "openai.multimodal_token_count",
+    "openai.multimodal_file",
+    "anthropic.multimodal_messages",
+}
+TOKEN_COUNT_ENDPOINTS = {
+    "/v1/chat/completions/input_tokens",
+    "/v1/responses/input_tokens",
+    "/v1/messages/count_tokens",
+}
+AUDIO_TRANSCRIPTION_ENDPOINTS = {
+    "/v1/audio/transcriptions",
+}
+NON_IMAGE_MEDIA_TYPES = {
+    "audio",
+    "audio_url",
+    "input_audio",
+    "file",
+    "input_file",
+    "document",
+    "input_document",
+    "input_video",
+    "video",
+    "video_url",
+}
 SSE_BOUNDARY = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 MAX_SSE_FRAME = 256 * 1024
 
@@ -74,8 +123,9 @@ def is_openai_worker(spec: dict) -> bool:
     )
 
 
-def contains_image_input(value: object) -> bool:
-    """Recognize OpenAI chat and responses image content before admission."""
+def count_image_inputs(value: object) -> int:
+    """Count OpenAI image parts and llama.cpp multimodal prompt items."""
+    count = 0
     pending = [iter((value,))]
     while pending:
         try:
@@ -86,21 +136,66 @@ def contains_image_input(value: object) -> bool:
         if isinstance(item, dict):
             content_type = item.get("type")
             if isinstance(content_type, str) and content_type in {"image", "image_url", "input_image"}:
-                return True
+                count += 1
+            if "multimodal_data" in item:
+                media = item["multimodal_data"]
+                count += len(media) if isinstance(media, list) else 1
             pending.append(
-                iter(item[key] for key in ("messages", "input", "content") if key in item)
+                iter(
+                    item[key]
+                    for key in ("messages", "input", "content", "prompt")
+                    if key in item
+                )
             )
         elif isinstance(item, list):
             pending.append(iter(item))
-    return False
+    return count
+
+
+def contains_image_input(value: object) -> bool:
+    return count_image_inputs(value) > 0
+
+
+def non_image_media_kind(value: object) -> str | None:
+    """Find media inputs without an image admission profile, such as audio or video."""
+    pending = [iter((value,))]
+    while pending:
+        try:
+            item = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        if isinstance(item, dict):
+            content_type = item.get("type")
+            if isinstance(content_type, str) and content_type in NON_IMAGE_MEDIA_TYPES:
+                if "audio" in content_type:
+                    return "audio"
+                if "video" in content_type:
+                    return "video"
+                return "file"
+            pending.append(
+                iter(item[key] for key in ("messages", "input", "content", "prompt") if key in item)
+            )
+        elif isinstance(item, list):
+            pending.append(iter(item))
+    return None
 
 
 def request_shape(path: str, body: object) -> str | None:
     shape = OPENAI_REQUEST_SHAPES.get(path)
+    media_kind = non_image_media_kind(body)
+    if path in TOKEN_COUNT_ENDPOINTS and (media_kind is not None or contains_image_input(body)):
+        return "openai.multimodal_token_count"
+    if path == "/v1/messages" and (media_kind is not None or contains_image_input(body)):
+        return "anthropic.multimodal_messages"
+    if path in {"/v1/chat/completions", "/v1/responses"} and media_kind is not None:
+        return f"openai.multimodal_{media_kind}"
     if path == "/v1/chat/completions" and contains_image_input(body):
         return "openai.multimodal_chat"
     if path == "/v1/responses" and contains_image_input(body):
         return "openai.multimodal_responses"
+    if path in {"/completion", "/v1/completions"} and count_image_inputs(body):
+        return "openai.multimodal_completion"
     return shape
 
 
@@ -785,8 +880,15 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
             model = aliases.get(model, model)
             if path.startswith("/upstream/") and resources.get(model, {}).get("gateway_url"):
                 raise AdmissionError(404, "unknown inference route", "not_found")
-            shape_path = path if path in {"/v1/chat/completions", "/v1/responses"} else upstream_path
-            if shape_path in {"/v1/chat/completions", "/v1/responses"} and model in resources:
+            shape_path = upstream_path if path.startswith("/upstream/") else path
+            shape_path = LLAMA_CPP_REQUEST_ALIASES.get(shape_path, shape_path)
+            if shape_path in MULTIMODAL_REQUEST_ENDPOINTS and model in resources:
+                if shape_path in AUDIO_TRANSCRIPTION_ENDPOINTS:
+                    raise AdmissionError(
+                        400,
+                        "worker does not support this request shape",
+                        "unsupported_request_shape",
+                    )
                 shape_body = body
                 if shape_body is None:
                     try:
@@ -804,13 +906,20 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                         shape_body, allow_nan=False, ensure_ascii=False
                     ).encode()
                 shape = request_shape(shape_path, shape_body)
-                if shape in {"openai.multimodal_chat", "openai.multimodal_responses"}:
+                if shape in MULTIMODAL_REQUEST_SHAPES:
                     supported_shapes = resources[model].get("supported_request_shapes", [])
                     if shape not in supported_shapes:
                         raise AdmissionError(
                             400,
                             "worker does not support this request shape",
                             "unsupported_request_shape",
+                        )
+                    max_images = resources[model].get("max_image_inputs")
+                    if max_images is not None and count_image_inputs(shape_body) > max_images:
+                        raise AdmissionError(
+                            400,
+                            "request exceeds this model's image input limit",
+                            "image_input_limit_exceeded",
                         )
         content_type = request.headers.get("Content-Type", "application/json")
         if body is not None:

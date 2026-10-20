@@ -1101,6 +1101,256 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(self.runtime.starts, ["a"])
 
+    async def test_multimodal_image_count_limit_rejects_before_admission(self):
+        self.resources["a"].update(
+            supported_request_shapes=["openai.chat", "openai.multimodal_chat"],
+            max_image_inputs=1,
+        )
+
+        response = await self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+            json={
+                "model": "a",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                    ],
+                }],
+            },
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"]["code"], "image_input_limit_exceeded")
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
+
+    async def test_legacy_completion_multimodal_image_limit_rejects_before_admission(self):
+        self.resources["a"].update(
+            supported_request_shapes=["openai.completion", "openai.multimodal_completion"],
+            max_image_inputs=1,
+        )
+        for path in ("/completion", "/v1/completions"):
+            with self.subTest(path=path):
+                response = await self.client.post(
+                    path,
+                    headers={"Authorization": "Bearer secret"},
+                    json={
+                        "model": "a",
+                        "prompt": {
+                            "prompt_string": "<__media__><__media__>",
+                            "multimodal_data": ["YQ==", "Yg=="],
+                        },
+                    },
+                )
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(
+                    (await response.json())["error"]["code"],
+                    "image_input_limit_exceeded",
+                )
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
+
+    async def test_legacy_completion_rejects_multimodal_input_without_profile(self):
+        for path, body in (
+            (
+                "/completion",
+                {
+                    "model": "a",
+                    "prompt": {
+                        "prompt_string": "<__media__>",
+                        "multimodal_data": ["YQ=="],
+                    },
+                },
+            ),
+            (
+                "/upstream/a/completions",
+                {
+                    "prompt": {
+                        "prompt_string": "<__media__>",
+                        "multimodal_data": ["YQ=="],
+                    },
+                },
+            ),
+        ):
+            with self.subTest(path=path):
+                response = await self.client.post(
+                    path,
+                    headers={"Authorization": "Bearer secret"},
+                    json=body,
+                )
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(
+                    (await response.json())["error"]["code"],
+                    "unsupported_request_shape",
+                )
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
+
+    async def test_audio_and_video_inputs_require_explicit_request_profiles(self):
+        self.resources["a"]["supported_request_shapes"] = [
+            "openai.chat", "openai.responses",
+            "openai.multimodal_chat", "openai.multimodal_responses",
+        ]
+        cases = (
+            (
+                "/v1/chat/completions",
+                {
+                    "model": "a",
+                    "messages": [{"role": "user", "content": [{
+                        "type": "video_url",
+                        "video_url": {"url": "data:video/mp4;base64,AA=="},
+                    }]}],
+                },
+            ),
+            (
+                "/v1/responses",
+                {
+                    "model": "a",
+                    "input": [{"role": "user", "content": [{
+                        "type": "input_audio",
+                        "input_audio": {"data": "AA==", "format": "wav"},
+                    }]}],
+                },
+            ),
+            (
+                "/v1/responses",
+                {
+                    "model": "a",
+                    "input": [{"role": "user", "content": [{
+                        "type": "input_file",
+                        "file_data": "data:application/pdf;base64,AA==",
+                    }]}],
+                },
+            ),
+            (
+                "/upstream/a/chat/completions",
+                {
+                    "messages": [{"role": "user", "content": [{
+                        "type": "input_video",
+                        "video_url": "data:video/mp4;base64,AA==",
+                    }]}],
+                },
+            ),
+            (
+                "/upstream/a/responses",
+                {
+                    "input": [{"role": "user", "content": [{
+                        "type": "audio_url",
+                        "audio_url": {"url": "data:audio/wav;base64,AA=="},
+                    }]}],
+                },
+            ),
+        )
+        for path, body in cases:
+            with self.subTest(path=path):
+                response = await self.client.post(
+                    path,
+                    headers={"Authorization": "Bearer secret"},
+                    json=body,
+                )
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(
+                    (await response.json())["error"]["code"],
+                    "unsupported_request_shape",
+                )
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
+
+    async def test_upstream_chat_alias_enforces_image_limit(self):
+        self.resources["a"].update(
+            supported_request_shapes=["openai.chat", "openai.multimodal_chat"],
+            max_image_inputs=1,
+        )
+        response = await self.client.post(
+            "/upstream/a/chat/completions",
+            headers={"Authorization": "Bearer secret"},
+            json={"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+            ]}]},
+        )
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"]["code"], "image_input_limit_exceeded")
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
+
+    async def test_upstream_media_token_count_routes_fail_closed(self):
+        cases = (
+            (
+                "/upstream/a/chat/completions/input_tokens",
+                {"messages": [{"role": "user", "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA=="},
+                }]}]},
+            ),
+            (
+                "/upstream/a/responses/input_tokens",
+                {"input": [{"role": "user", "content": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AA==",
+                }]}]},
+            ),
+            (
+                "/upstream/a/v1/messages/count_tokens",
+                {"messages": [{"role": "user", "content": [{
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "AA=="},
+                }]}]},
+            ),
+            (
+                "/upstream/a/v1/messages",
+                {"messages": [{"role": "user", "content": [{
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": "AA=="},
+                }]}]},
+            ),
+        )
+        for path, body in cases:
+            with self.subTest(path=path):
+                response = await self.client.post(
+                    path,
+                    headers={"Authorization": "Bearer secret"},
+                    json=body,
+                )
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(
+                    (await response.json())["error"]["code"],
+                    "unsupported_request_shape",
+                )
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
+
+    async def test_upstream_audio_transcription_routes_fail_closed(self):
+        for path in (
+            "/upstream/a/audio/transcriptions",
+            "/upstream/a/v1/audio/transcriptions",
+        ):
+            with self.subTest(path=path):
+                response = await self.client.post(
+                    path,
+                    headers={
+                        "Authorization": "Bearer secret",
+                        "Content-Type": "multipart/form-data; boundary=unused",
+                    },
+                    data=b"audio payload",
+                )
+
+                self.assertEqual(response.status, 400)
+                self.assertEqual(
+                    (await response.json())["error"]["code"],
+                    "unsupported_request_shape",
+                )
+        self.assertEqual(self.runtime.starts, [])
+        self.assertEqual(self.forwarded, [])
+
     async def test_text_worker_rejects_unaccounted_image_request_before_admission(self):
         self.resources["a"]["supported_request_shapes"] = [
             "openai.chat", "openai.completion", "openai.responses"
@@ -1505,7 +1755,13 @@ class ProfileTest(unittest.TestCase):
             self.assertEqual(larger["resources"]["a"]["weights_bytes"], 16)
             self.assertEqual(larger["version"], 1)
             self.assertEqual(larger["worker_profile_version"], 1)
-            self.assertEqual(larger["resources"]["a"]["supported_request_shapes"], ["openai.chat", "openai.completion", "openai.responses", "openai.multimodal_chat", "openai.multimodal_responses"])
+            self.assertEqual(
+                larger["resources"]["a"]["supported_request_shapes"],
+                [
+                    "openai.chat", "openai.completion", "openai.responses",
+                    "openai.multimodal_chat", "openai.multimodal_responses",
+                ],
+            )
             self.assertEqual(larger["resources"]["a"]["memory"]["mandatory"]["gpu_bytes"], larger["resources"]["a"]["gpu_bytes"])
             self.assertEqual(larger["resources"]["a"]["concurrency_limit"], 1)
             self.assertEqual(larger["resources"]["a"]["artifact_identity"][0]["revisions"]["gguf_revision"], "1234")
@@ -1559,6 +1815,7 @@ class ProfileTest(unittest.TestCase):
             self.assertEqual(profile["memory"]["mandatory"]["gpu_bytes"], profile["gpu_bytes"])
             self.assertNotIn("openai.multimodal_chat", profile["supported_request_shapes"])
             self.assertNotIn("openai.multimodal_responses", profile["supported_request_shapes"])
+            self.assertNotIn("openai.multimodal_completion", profile["supported_request_shapes"])
             verify_profiles(document)
 
             policy = json.loads(policy_path.read_text())
@@ -1586,6 +1843,31 @@ class ProfileTest(unittest.TestCase):
                 router_path.write_text(json.dumps({"models": {"a": {"cmd": invalid}}}))
                 with self.subTest(command=invalid), self.assertRaisesRegex(ValueError, "MoE streaming"):
                     build_profiles(router_path, policy_path)
+
+            vision_command = command + " --image-max-tokens 4096"
+            router_path.write_text(json.dumps({"models": {"a": {"cmd": vision_command}}}))
+            policy["multimodal_profiles"] = {"a": {"workspace_mib": 2, "max_images": 1}}
+            policy_path.write_text(json.dumps(policy))
+            vision_document = build_profiles(router_path, policy_path)
+            vision_profile = vision_document["resources"]["a"]
+            self.assertIn("openai.multimodal_chat", vision_profile["supported_request_shapes"])
+            self.assertIn("openai.multimodal_responses", vision_profile["supported_request_shapes"])
+            self.assertNotIn("openai.multimodal_completion", vision_profile["supported_request_shapes"])
+            self.assertEqual(vision_profile["max_image_inputs"], 1)
+            self.assertEqual(vision_profile["multimodal_workspace_mib"], 2)
+            self.assertEqual(
+                vision_profile["memory"]["transient_peak"]["gpu_bytes"],
+                math.ceil(2 * MIB * 1.08),
+            )
+            self.assertEqual(
+                vision_profile["memory"]["transient_peak"]["host_bytes"],
+                math.ceil(2 * MIB * 1.08),
+            )
+            verify_profiles(vision_document)
+
+            router_path.write_text(json.dumps({"models": {"a": {"cmd": command}}}))
+            with self.assertRaisesRegex(ValueError, "needs --image-max-tokens"):
+                build_profiles(router_path, policy_path)
 
     def test_comfy_profile_separates_resident_weights_from_peak_workspace(self):
         with tempfile.TemporaryDirectory() as directory:

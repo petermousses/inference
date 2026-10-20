@@ -178,6 +178,12 @@ def verify_profiles(document: dict, *, verify_sources: bool = True) -> None:
             raise ValueError(f"{name} has an invalid concurrency limit")
         if "exclusive_execution" in profile and type(profile["exclusive_execution"]) is not bool:
             raise ValueError(f"{name} has an invalid exclusive execution policy")
+        for key in ("max_image_inputs", "multimodal_workspace_mib"):
+            value = profile.get(key)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise ValueError(f"{name} has an invalid {key}")
     sources = document.get("sources")
     if not isinstance(sources, list) or not sources:
         raise ValueError("invalid memory profile sources")
@@ -296,15 +302,37 @@ def memory_contract(
     }
 
 
-def command_request_shapes(name: str, argv: list[str]) -> list[str]:
+def command_request_shapes(
+    name: str,
+    argv: list[str],
+    *,
+    multimodal_profile: dict | None = None,
+) -> list[str]:
     shapes = ["openai.chat", "openai.completion", "openai.responses"]
     if "--embedding" in argv:
         shapes.append("openai.embeddings")
-    # Vision workspace scales with image crops and resolution. Until the
-    # streamed worker has request-aware vision accounting, keep its public
-    # contract text-only even if a projector is installed.
-    if "--mmproj" in argv and "--moe-stream" not in argv:
-        shapes.extend(("openai.multimodal_chat", "openai.multimodal_responses"))
+    has_projector = "--mmproj" in argv
+    is_streamed = "--moe-stream" in argv
+    image_token_limit = None
+    if "--image-max-tokens" in argv:
+        index = argv.index("--image-max-tokens")
+        if index + 1 < len(argv) and argv[index + 1].isdecimal():
+            image_token_limit = int(argv[index + 1])
+    # Streamed vision workers are opt-in: their projector weights and a
+    # bounded image-workspace reservation must both be present in the profile.
+    bounded_streamed_vision = (
+        not is_streamed
+        or (
+            multimodal_profile is not None
+            and image_token_limit is not None
+            and image_token_limit > 0
+        )
+    )
+    if has_projector and bounded_streamed_vision:
+        shapes.extend((
+            "openai.multimodal_chat",
+            "openai.multimodal_responses",
+        ))
     if name == "clef" or name.startswith("clef-"):
         shapes.append("systemone.decision")
     return shapes
@@ -313,6 +341,23 @@ def command_request_shapes(name: str, argv: list[str]) -> list[str]:
 def build_profiles(router_path: Path, policy_path: Path) -> dict:
     policy = json.loads(policy_path.read_text())
     router = yaml.safe_load(router_path.read_text())
+    multimodal_profiles = policy.get("multimodal_profiles", {})
+    if not isinstance(multimodal_profiles, dict):
+        raise ValueError("multimodal_profiles must be an object")
+    for name, profile in multimodal_profiles.items():
+        if not isinstance(name, str) or not name or not isinstance(profile, dict):
+            raise ValueError("invalid multimodal profile")
+        workspace_mib = profile.get("workspace_mib")
+        max_images = profile.get("max_images")
+        if (
+            isinstance(workspace_mib, bool)
+            or not isinstance(workspace_mib, int)
+            or workspace_mib <= 0
+            or isinstance(max_images, bool)
+            or not isinstance(max_images, int)
+            or max_images <= 0
+        ):
+            raise ValueError(f"{name} has an invalid multimodal memory profile")
     sources = {str(path): file_signature(path, content=True) for path in (router_path, policy_path, Path(__file__).resolve())}
     resources = {}
 
@@ -360,6 +405,19 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             raise ValueError(f"{name} has MoE streaming options without --moe-stream")
         weights = weight_paths(Path(flags["--model"]))
         extras = [Path(argv[argv.index("--mmproj") + 1])] if "--mmproj" in argv else []
+        multimodal_profile = multimodal_profiles.get(name)
+        if multimodal_profile is not None and not extras:
+            raise ValueError(f"{name} has multimodal memory policy without --mmproj")
+        if multimodal_profile is not None and "--moe-stream" in argv:
+            if "--image-max-tokens" not in argv:
+                raise ValueError(f"{name} needs --image-max-tokens for streamed vision admission")
+            image_limit_index = argv.index("--image-max-tokens")
+            if (
+                image_limit_index + 1 >= len(argv)
+                or not argv[image_limit_index + 1].isdecimal()
+                or int(argv[image_limit_index + 1]) <= 0
+            ):
+                raise ValueError(f"{name} has an invalid --image-max-tokens limit")
         host_weights = [Path(path) for path in metadata.get("host_weights", [])]
         artifacts, artifact_fingerprint = artifact_identity(
             weights + extras + host_weights, policy, add_source
@@ -440,7 +498,14 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
         # enforced residency ceiling. Linux can reclaim those pages; cold
         # prefill latency and peak cache use still need workload measurement.
         lazy_cache_bytes = math.ceil(lazy_working_set_estimate_mib * MIB * margin) if lazy_bytes else 0
-        memory = memory_contract((gpu_bytes, host_bytes), transient_peak=(0, lazy_cache_bytes))
+        vision_workspace_bytes = (
+            math.ceil(multimodal_profile["workspace_mib"] * MIB * margin)
+            if multimodal_profile is not None else 0
+        )
+        memory = memory_contract(
+            (gpu_bytes, host_bytes),
+            transient_peak=(vision_workspace_bytes, lazy_cache_bytes + vision_workspace_bytes),
+        )
         return {
             **metadata, "weights_bytes": weight_bytes + extra_bytes + host_weight_bytes,
             "model_paths": [str(path) for path in weights],
@@ -451,7 +516,15 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             "artifact_fingerprint": artifact_fingerprint,
             "runtime_identity": file_signature(runtime),
             "supported_request_shapes": metadata.get(
-                "supported_request_shapes", command_request_shapes(name, argv)
+                "supported_request_shapes",
+                command_request_shapes(name, argv, multimodal_profile=multimodal_profile),
+            ),
+            **(
+                {
+                    "max_image_inputs": multimodal_profile["max_images"],
+                    "multimodal_workspace_mib": multimodal_profile["workspace_mib"],
+                }
+                if multimodal_profile is not None else {}
             ),
             "concurrency_limit": metadata["concurrency_limit"],
         }
@@ -550,6 +623,9 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             "aliases": model.get("aliases", []),
             "concurrency_limit": model.get("concurrencyLimit", 1) or 1,
         })
+    unused_multimodal_profiles = set(multimodal_profiles) - set(router["models"])
+    if unused_multimodal_profiles:
+        raise ValueError(f"multimodal profiles reference unknown router models: {sorted(unused_multimodal_profiles)}")
     for name, service in policy["services"].items():
         metadata = {"kind": "service", **service}
         unit_root = Path(__file__).resolve().parents[2] / "systemd"

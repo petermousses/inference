@@ -19,6 +19,12 @@
       "working_set_estimate_mib": 5120
     }
   },
+  "multimodal_profiles": {
+    "deepseek-v4.1-flash-1017-unsloth": {
+      "workspace_mib": 4096,
+      "max_images": 1
+    }
+  },
   "heartbeat_s": 15,
   "recovery_failures": 3,
   "stop_timeout_s": 35,
