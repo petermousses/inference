@@ -1,0 +1,5 @@
+repository=deepseek-ai/DeepSeek-V4.1-Flash-1017
+revision=1bae0e1088993b9b82de08f59de5be5a34e42170
+files=83; bytes=510311045295; safetensors_shards=48
+file_inventory=deepseek-v4.1-flash-1017.files.tsv
+license=MIT

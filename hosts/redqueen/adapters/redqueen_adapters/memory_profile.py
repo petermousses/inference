@@ -163,6 +163,8 @@ def verify_profiles(document: dict) -> None:
         concurrency = profile.get("concurrency_limit")
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
             raise ValueError(f"{name} has an invalid concurrency limit")
+        if "exclusive_execution" in profile and type(profile["exclusive_execution"]) is not bool:
+            raise ValueError(f"{name} has an invalid exclusive execution policy")
     sources = document.get("sources")
     if not isinstance(sources, list) or not sources:
         raise ValueError("invalid memory profile sources")
@@ -376,6 +378,94 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             "concurrency_limit": metadata["concurrency_limit"],
         }
 
+    def profile_deepseek(name: str, service: dict, metadata: dict, unit_paths: list[Path]) -> dict:
+        """Build an exact resident profile and bounded request envelope for DeepSeek HIP."""
+        required = (
+            "profile_python", "profile_script", "artifact_root", "inference_dir",
+            "artifact_inventory", "request_peak_mib",
+        )
+        if any(key not in service for key in required):
+            raise ValueError(f"{name} has an incomplete DeepSeek memory profile contract")
+        peak_mib = service["request_peak_mib"]
+        if isinstance(peak_mib, bool) or not isinstance(peak_mib, int) or peak_mib <= 0:
+            raise ValueError(f"{name} request_peak_mib must be a positive integer")
+        python = Path(service["profile_python"])
+        script = Path(service["profile_script"])
+        inventory_path = Path(service["artifact_inventory"])
+        artifact_root = Path(service["artifact_root"])
+        inference_dir = Path(service["inference_dir"])
+        add_source(python)
+        add_source(script, content=True)
+        add_source(inventory_path, content=True)
+        for path in unit_paths:
+            text = path.read_text()
+            match = re.search(r"^Environment=DS4_REQUEST_PEAK_MIB=([0-9]+)$", text, re.MULTILINE)
+            if match is None or int(match[1]) != peak_mib:
+                raise ValueError(f"{name} unit request peak does not match scheduler.json")
+        try:
+            inference_dir.resolve(strict=True).relative_to(artifact_root.resolve(strict=True))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"{name} inference source must be inside its artifact root") from error
+
+        result = subprocess.run(
+            [str(python), str(script), "--checkpoint-root", str(artifact_root), "--inference-dir", str(inference_dir)],
+            capture_output=True, text=True, timeout=900, check=False,
+        )
+        if result.returncode:
+            raise ValueError(f"{name} memory profiling failed: {result.stderr[-1000:]}")
+        try:
+            estimate = json.loads(result.stdout)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError(f"{name} memory profiler returned invalid JSON") from error
+        resident_device = estimate.get("resident_device_bytes") if isinstance(estimate, dict) else None
+        resident_host = estimate.get("resident_host_bytes") if isinstance(estimate, dict) else None
+        for value in (resident_device, resident_host):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} memory profiler returned invalid resident bytes")
+
+        artifact_paths = []
+        for line_number, line in enumerate(inventory_path.read_text().splitlines(), 1):
+            fields = line.split("\t")
+            if len(fields) != 4:
+                raise ValueError(f"invalid {name} artifact inventory row {line_number}")
+            relative = Path(fields[0])
+            if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                raise ValueError(f"unsafe {name} artifact path on row {line_number}")
+            artifact_paths.append(artifact_root / relative)
+        if not artifact_paths:
+            raise ValueError(f"{name} artifact inventory is empty")
+        artifacts, artifact_fingerprint = artifact_identity(artifact_paths, policy, add_source)
+        for path in artifact_paths:
+            add_source(path)
+
+        margin = policy["estimate_margin"]
+        overhead = policy["model_overhead_mib"] * MIB
+        mandatory = (
+            math.ceil(resident_device * margin) + overhead,
+            math.ceil(resident_host * margin) + overhead,
+        )
+        transient = (
+            math.ceil(peak_mib * MIB * margin),
+            math.ceil(peak_mib * MIB * margin),
+        )
+        memory = memory_contract(mandatory, transient_peak=transient)
+        weight_bytes = sum(path.stat().st_size for path in artifact_paths)
+        return {
+            **metadata,
+            "weights_bytes": weight_bytes,
+            "model_paths": [str(artifact_root)],
+            "context_tokens": service.get("context_tokens", 220000),
+            "planner": str(script),
+            "gpu_bytes": memory["gpu_bytes"],
+            "host_bytes": memory["host_bytes"],
+            "memory": memory,
+            "artifact_identity": artifacts,
+            "artifact_fingerprint": artifact_fingerprint,
+            "runtime_identity": {"service_units": service.get("units", [])},
+            "supported_request_shapes": service["supported_request_shapes"],
+            "concurrency_limit": service["concurrency_limit"],
+        }
+
     for name, model in router["models"].items():
         resources[name] = profile_command(name, model["cmd"], {
             "kind": "text", "concurrency": model.get("concurrencyLimit", 1) or 1,
@@ -385,9 +475,11 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
     for name, service in policy["services"].items():
         metadata = {"kind": "service", **service}
         unit_root = Path(__file__).resolve().parents[2] / "systemd"
+        unit_paths = []
         for unit_name in service.get("units", []):
             unit_path = unit_root / unit_name
             add_source(unit_path, content=True)
+            unit_paths.append(unit_path)
         if "command_unit" in service:
             unit = Path(service["command_unit"])
             add_source(unit, content=True)
@@ -395,6 +487,8 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             if not match:
                 raise ValueError(f"missing ExecStart in {unit}")
             resources[name] = profile_command(name, match[1], metadata)
+        elif "profile_script" in service:
+            resources[name] = profile_deepseek(name, service, metadata, unit_paths)
         else:
             weights = [Path(path) for path in service["weights"]]
             artifacts, artifact_fingerprint = artifact_identity(weights, policy, add_source)
