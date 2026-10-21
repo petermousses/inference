@@ -215,6 +215,14 @@ def capacity_limits(policy: dict, *, gpu_total: int, host_total: int) -> Memory:
     return Memory(min(gpu_total, gpu_budget), min(host_budget, host_total - host_reserve))
 
 
+class ExpertCacheResizeError(RuntimeError):
+    """A worker rejected an expert-cache resize over HTTP."""
+
+    def __init__(self, status_code: int):
+        super().__init__("expert-cache resize was not accepted")
+        self.status_code = status_code
+
+
 class Runtime:
     def __init__(self, policy: dict, resources: dict, session: aiohttp.ClientSession, api_key: str):
         self.policy, self.resources, self.session = policy, resources, session
@@ -311,8 +319,10 @@ class Runtime:
                 body = decode_json(await read_limited(response, 64 * 1024, check_status=False))
             except (ValueError, UnicodeDecodeError) as error:
                 raise RuntimeError("invalid expert-cache resize response") from error
-            if response.status != 200 or not isinstance(body, dict):
-                raise RuntimeError("expert-cache resize was not accepted")
+            if response.status != 200:
+                raise ExpertCacheResizeError(response.status)
+            if not isinstance(body, dict):
+                raise RuntimeError("expert-cache resize returned an invalid response")
         info = await self.expert_cache_info(name)
         if info["capacity_bytes"] > capacity_bytes:
             raise RuntimeError("expert-cache resize exceeded its requested capacity")
@@ -507,6 +517,7 @@ class Scheduler:
             if isinstance(spec.get("adaptive_cache"), dict)
         }
         self.cache_unready: set[str] = set()
+        self.cache_fallback_caps: dict[str, int] = {}
         self.cache_rebalance_tasks: set[asyncio.Task] = set()
         self.transition = asyncio.Lock()
         self.execution = SerializedExecution(lock_dir)
@@ -523,6 +534,7 @@ class Scheduler:
             if name not in self.states:
                 self.cache_allocations.pop(name, None)
                 self.cache_unready.discard(name)
+                self.cache_fallback_caps.pop(name, None)
                 continue
             try:
                 info = await self.runtime.expert_cache_info(name)
@@ -609,6 +621,13 @@ class Scheduler:
             warm = [name for name in adjustable_names if name in self.states]
             if warm:
                 demand_names = [max(warm, key=lambda name: (self.last_used.get(name, 0), name))]
+        for name in adjustable_names:
+            if name not in demand_names:
+                self.cache_fallback_caps.pop(name, None)
+        if len(demand_names) == 1:
+            # A lone active/warm model gets a fresh chance at its full profile
+            # ceiling. Any failed ceiling is re-established from live state.
+            self.cache_fallback_caps.pop(demand_names[0], None)
 
         def fixed_reservation() -> Memory:
             fixed = Memory(0, 0)
@@ -654,25 +673,34 @@ class Scheduler:
                 for name in uncapped:
                     limits = self.resources[name]["adaptive_cache"]
                     minimum = limits["minimum_capacity_bytes"]
+                    maximum = min(
+                        limits["maximum_capacity_bytes"],
+                        self.cache_fallback_caps.get(name, limits["maximum_capacity_bytes"]),
+                    )
                     maximum_extra = math.ceil(
-                        (limits["maximum_capacity_bytes"] - minimum)
+                        (maximum - minimum)
                         * limits["reservation_multiplier"]
                     )
                     if maximum_extra <= share:
-                        targets[name] = limits["maximum_capacity_bytes"]
+                        targets[name] = maximum
                         remaining -= maximum_extra
                         capped.append(name)
                 if not capped:
                     for name in uncapped:
                         limits = self.resources[name]["adaptive_cache"]
+                        maximum = min(
+                            limits["maximum_capacity_bytes"],
+                            self.cache_fallback_caps.get(name, limits["maximum_capacity_bytes"]),
+                        )
                         targets[name] = limits["minimum_capacity_bytes"] + math.floor(
                             share / limits["reservation_multiplier"]
                         )
+                        targets[name] = min(targets[name], maximum)
                     break
                 uncapped = [name for name in uncapped if name not in capped]
             return targets
 
-        async def resize(name: str, target: int) -> tuple[bool, Memory, Memory]:
+        async def issue_resize(name: str, target: int) -> tuple[bool, dict]:
             task = asyncio.create_task(self.runtime.resize_expert_cache(name, target))
             try:
                 info = await asyncio.shield(task)
@@ -698,6 +726,25 @@ class Scheduler:
                     self.cache_allocations[name] = info["capacity_bytes"]
                     self.cache_unready.discard(name)
                 raise
+            except ExpertCacheResizeError as error:
+                if error.status_code != 503:
+                    self.cache_allocations[name] = self.resources[name]["adaptive_cache"]["maximum_capacity_bytes"]
+                    self.cache_unready.add(name)
+                    LOG.error("cache rebalance failed model=%s target_bytes=%d status=%d", name, target, error.status_code)
+                    raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed") from error
+                try:
+                    # A rejected resize may have rolled back to the prior
+                    # backing. Only retry after the worker proves its current
+                    # allocation is settled and not quarantined.
+                    info = await self.runtime.expert_cache_info(name)
+                except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError) as state_error:
+                    self.cache_allocations[name] = self.resources[name]["adaptive_cache"]["maximum_capacity_bytes"]
+                    self.cache_unready.add(name)
+                    LOG.error("cache rebalance state unknown model=%s target_bytes=%d", name, target)
+                    raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed") from state_error
+                self.cache_allocations[name] = info["capacity_bytes"]
+                self.cache_unready.discard(name)
+                return False, info
             except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError) as error:
                 self.cache_allocations[name] = self.resources[name]["adaptive_cache"]["maximum_capacity_bytes"]
                 self.cache_unready.add(name)
@@ -705,6 +752,10 @@ class Scheduler:
                 raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed") from error
             self.cache_allocations[name] = info["capacity_bytes"]
             self.cache_unready.discard(name)
+
+            return True, info
+
+        def measured_fit() -> tuple[bool, Memory, Memory]:
             capacity_now, usage_now = self.runtime.capacity()
             reserved_now = self.reserved()
             unknown_now = Memory(
@@ -712,6 +763,88 @@ class Scheduler:
                 max(0, usage_now.host - reserved_now.host),
             )
             return (reserved_now + unknown_now).fits(capacity_now), capacity_now, unknown_now
+
+        async def resize(name: str, target: int) -> tuple[bool, Memory, Memory]:
+            limits = self.resources[name]["adaptive_cache"]
+            initial = self.cache_allocations.get(name, limits["maximum_capacity_bytes"])
+            accepted, info = await issue_resize(name, target)
+            actual = info["capacity_bytes"]
+            fits, capacity_now, unknown_now = measured_fit()
+            if accepted or (
+                target < initial and actual <= target
+            ) or (
+                target > initial and actual >= target
+            ):
+                if actual < target:
+                    # The runtime rounds byte budgets down to whole expert
+                    # slots. Remember that representable limit for this demand
+                    # set so a later pass does not repeat the same resize.
+                    self.cache_fallback_caps[name] = min(
+                        self.cache_fallback_caps.get(name, actual), actual
+                    )
+                return fits, capacity_now, unknown_now
+
+            # A failed growth can safely remain at the verified current size.
+            # A failed shrink needs a smaller proven allocation before another
+            # model can borrow those bytes.
+            if target >= initial:
+                self.cache_fallback_caps[name] = actual
+                LOG.warning(
+                    "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d",
+                    name,
+                    target,
+                    actual,
+                )
+                return fits, capacity_now, unknown_now
+
+            minimum = limits["minimum_capacity_bytes"]
+            lower = minimum
+            upper = min(target, actual) if actual < initial else target
+            candidate = minimum
+            if candidate >= upper:
+                LOG.error(
+                    "cache shrink rejected model=%s minimum_bytes=%d requested_bytes=%d current_bytes=%d",
+                    name,
+                    minimum,
+                    target,
+                    actual,
+                )
+                raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed")
+
+            accepted, info = await issue_resize(name, candidate)
+            actual = info["capacity_bytes"]
+            if not accepted and actual > candidate:
+                LOG.error(
+                    "cache minimum shrink rejected model=%s minimum_bytes=%d current_bytes=%d",
+                    name,
+                    candidate,
+                    actual,
+                )
+                raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed")
+            lower = min(actual, candidate)
+
+            # Refine the largest verified lower capacity with bounded probes.
+            # The failed requested target is the upper bound.
+            for _ in range(4):
+                candidate = lower + (upper - lower) // 2
+                if candidate <= lower or candidate >= upper:
+                    break
+                _accepted, info = await issue_resize(name, candidate)
+                actual = info["capacity_bytes"]
+                if lower < actual <= candidate:
+                    lower = actual
+                else:
+                    upper = candidate
+
+            self.cache_fallback_caps[name] = lower
+            fits, capacity_now, unknown_now = measured_fit()
+            LOG.warning(
+                "cache resize reduced model=%s requested_bytes=%d capacity_bytes=%d",
+                name,
+                target,
+                lower,
+            )
+            return fits, capacity_now, unknown_now
 
         # Shrink, read actual usage again, and recompute before any expansion.
         # A freed logical cache that the allocator still owns stays in `unknown`
@@ -891,6 +1024,7 @@ class Scheduler:
                     self.states.pop(victim, None)
                     self.cache_allocations.pop(victim, None)
                     self.cache_unready.discard(victim)
+                    self.cache_fallback_caps.pop(victim, None)
                 # Recheck real allocations after confirmed stops. Unknown GPU
                 # users and delayed frees must never become imaginary capacity.
                 capacity, usage = self.runtime.capacity()
@@ -949,6 +1083,7 @@ class Scheduler:
             self.states.pop(name, None)
             self.cache_allocations.pop(name, None)
             self.cache_unready.discard(name)
+            self.cache_fallback_caps.pop(name, None)
         except Exception:
             self.states[name] = "quarantined"
         failure = self.recovery.setdefault(name, {})
@@ -1131,6 +1266,9 @@ class Scheduler:
                             continue
                     await asyncio.wait_for(self.runtime.stop(name), self.policy["stop_timeout_s"])
                     self.states.pop(name, None)
+                    self.cache_allocations.pop(name, None)
+                    self.cache_unready.discard(name)
+                    self.cache_fallback_caps.pop(name, None)
                     if not ready:
                         failure["attempts"] += 1
                         failure.update(state="cooling-down", next_retry=self.clock() + min(60, 5 * 2 ** min(failure["attempts"] - 1, 4)))
