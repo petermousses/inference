@@ -35,6 +35,29 @@ def resource(size: int, kind: str = "text") -> dict:
     return {"gpu_bytes": size, "host_bytes": size, "kind": kind, "concurrency": 1, "context_tokens": 32768}
 
 
+def adaptive_resource() -> dict:
+    minimum, maximum = 10, 130
+    memory = {
+        "mandatory": {"gpu_bytes": minimum, "host_bytes": minimum},
+        "reclaimable": {"gpu_bytes": maximum - minimum, "host_bytes": maximum - minimum},
+        "transient_peak": {"gpu_bytes": 20, "host_bytes": 20},
+    }
+    return {
+        "kind": "service",
+        "gateway_url": "http://127.0.0.1:8085",
+        "gpu_bytes": maximum + 20,
+        "host_bytes": maximum + 20,
+        "memory": memory,
+        "adaptive_cache": {
+            "minimum_capacity_bytes": minimum,
+            "maximum_capacity_bytes": maximum,
+            "reservation_multiplier": 1,
+        },
+        "expert_cache_url": "http://127.0.0.1:8085/expert-cache",
+        "concurrency_limit": 1,
+    }
+
+
 class FakeRuntime:
     def __init__(self, resources: dict, *, capacity: int = 100):
         self.resources = resources
@@ -83,6 +106,52 @@ class FakeRuntime:
         return self.limit, used
 
 
+class FakeAdaptiveRuntime(FakeRuntime):
+    def __init__(self, resources: dict, *, capacity: int = 100):
+        super().__init__(resources, capacity=capacity)
+        self.cache_capacities = {
+            name: spec["adaptive_cache"]["minimum_capacity_bytes"]
+            for name, spec in resources.items()
+            if spec.get("adaptive_cache")
+        }
+        self.resize_calls: list[tuple[str, int]] = []
+        self.scheduler = None
+        self.sticky_cache_backing = False
+        self.physical_cache_capacities = dict(self.cache_capacities)
+
+    async def expert_cache_info(self, name):
+        limits = self.resources[name]["adaptive_cache"]
+        return {
+            **limits,
+            "capacity_bytes": self.cache_capacities[name],
+            "pending_backing_release": False,
+            "quarantined": False,
+        }
+
+    async def resize_expert_cache(self, name, capacity_bytes):
+        self.resize_calls.append((name, capacity_bytes))
+        self.cache_capacities[name] = capacity_bytes
+        if not self.sticky_cache_backing or capacity_bytes > self.physical_cache_capacities[name]:
+            self.physical_cache_capacities[name] = capacity_bytes
+        return await self.expert_cache_info(name)
+
+    def capacity(self):
+        used = self.external
+        for name in self.loaded:
+            spec = self.resources[name]
+            profile = spec["memory"]
+            mandatory = profile["mandatory"]
+            peak = profile["transient_peak"]
+            limits = spec["adaptive_cache"]
+            extra = max(0, self.physical_cache_capacities[name] - limits["minimum_capacity_bytes"])
+            active = self.scheduler is not None and self.scheduler.active.get(name, 0) > 0
+            used += Memory(
+                mandatory["gpu_bytes"] + extra + (peak["gpu_bytes"] if active else 0),
+                mandatory["host_bytes"] + extra + (peak["host_bytes"] if active else 0),
+            )
+        return self.limit, used
+
+
 class SchedulerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -111,6 +180,118 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.runtime.loaded, {"a": "ready", "b": "ready"})
         self.assertEqual(self.runtime.stops, [])
 
+    async def test_active_moes_share_cache_and_idle_model_returns_its_share(self):
+        resources = {name: adaptive_resource() for name in ("deepseek", "qwen")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=150)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "adaptive-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        entered = {name: asyncio.Event() for name in resources}
+        release = {name: asyncio.Event() for name in resources}
+
+        async def serve(name):
+            async with scheduler.request(name):
+                runtime.occupied.add(name)
+                entered[name].set()
+                try:
+                    await release[name].wait()
+                finally:
+                    runtime.occupied.discard(name)
+
+        deepseek_task = asyncio.create_task(serve("deepseek"))
+        qwen_task = None
+        try:
+            await asyncio.wait_for(entered["deepseek"].wait(), 1)
+            self.assertEqual(runtime.cache_capacities["deepseek"], 130)
+
+            qwen_task = asyncio.create_task(serve("qwen"))
+            await asyncio.wait_for(entered["qwen"].wait(), 1)
+            self.assertFalse(deepseek_task.done())
+            self.assertEqual(runtime.loaded, {"deepseek": "ready", "qwen": "ready"})
+            self.assertEqual(runtime.cache_capacities["deepseek"], 55)
+            self.assertEqual(runtime.cache_capacities["qwen"], 55)
+            self.assertIn(("deepseek", 55), runtime.resize_calls)
+
+            release["qwen"].set()
+            await asyncio.wait_for(qwen_task, 1)
+            deadline = asyncio.get_running_loop().time() + 1
+            while runtime.cache_capacities["deepseek"] != 120:
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail("active DeepSeek did not reclaim the idle Qwen cache share")
+                await asyncio.sleep(0.01)
+            self.assertEqual(runtime.cache_capacities["qwen"], 10)
+            self.assertEqual(scheduler.active.get("deepseek"), 1)
+        finally:
+            release["deepseek"].set()
+            release["qwen"].set()
+            await asyncio.gather(deepseek_task, *([qwen_task] if qwen_task else []), return_exceptions=True)
+            if scheduler.cache_rebalance_tasks:
+                await asyncio.gather(*list(scheduler.cache_rebalance_tasks), return_exceptions=True)
+
+    async def test_cache_transfers_shrink_before_growing_another_model(self):
+        resources = {name: adaptive_resource() for name in ("a", "m", "z")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=180)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "transfer-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"a": "ready", "z": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        scheduler.active = {"a": 1, "z": 1}
+        runtime.cache_capacities.update(a=10, z=130)
+        runtime.physical_cache_capacities.update(a=10, z=130)
+        scheduler.cache_allocations.update(a=10, z=130)
+
+        self.assertTrue(await scheduler._rebalance_caches("m", runtime.limit, Memory(0, 0)))
+        self.assertEqual(runtime.resize_calls, [("z", 40), ("a", 40)])
+        self.assertEqual(runtime.capacity()[1], Memory(120, 120))
+
+    async def test_rebalance_finishes_all_shrinks_when_first_release_is_not_enough(self):
+        resources = {name: adaptive_resource() for name in ("a", "m", "z")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=180)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "multi-shrink-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"a": "ready", "z": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        scheduler.active = {"a": 1, "z": 1}
+        runtime.cache_capacities.update(a=130, z=130)
+        runtime.physical_cache_capacities.update(a=130, z=130)
+        scheduler.cache_allocations.update(a=130, z=130)
+
+        fits = await scheduler._rebalance_caches("m", runtime.limit, Memory(0, 0))
+
+        self.assertTrue(fits)
+        self.assertEqual(runtime.cache_capacities["a"], 40)
+        self.assertEqual(runtime.cache_capacities["z"], 40)
+        self.assertEqual(runtime.resize_calls, [("a", 40), ("z", 40)])
+        self.assertTrue(runtime.capacity()[1].fits(runtime.limit))
+
+    async def test_unreturned_cache_backing_is_not_spent_on_another_worker(self):
+        resources = {name: adaptive_resource() for name in ("a", "m", "z")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=180)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "sticky-cache-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"a": "ready", "z": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        scheduler.active = {"a": 1, "z": 1}
+        runtime.cache_capacities.update(a=10, z=130)
+        runtime.physical_cache_capacities.update(a=10, z=130)
+        scheduler.cache_allocations.update(a=10, z=130)
+        runtime.sticky_cache_backing = True
+
+        fits = await scheduler._rebalance_caches("m", runtime.limit, Memory(0, 0))
+
+        self.assertFalse(fits)
+        self.assertEqual(runtime.cache_capacities["z"], 10)
+        self.assertEqual(runtime.cache_capacities["m"], 10)
+        self.assertEqual(runtime.physical_cache_capacities["z"], 130)
+        self.assertEqual(runtime.resize_calls, [("z", 40), ("z", 10)])
+
     async def test_lru_stops_after_reclaiming_enough_memory(self):
         self.resources["large"] = resource(50)
         self.runtime.loaded = {"a": "ready", "b": "ready"}
@@ -125,6 +306,25 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             await self.scheduler.admit("large")
         self.assertEqual(caught.exception.code, "model_exceeds_budget")
         self.assertEqual(self.runtime.starts, [])
+
+    async def test_adapter_only_worker_keeps_its_full_transient_peak_reserved(self):
+        service = {
+            "kind": "service",
+            "gpu_bytes": 50,
+            "host_bytes": 50,
+            "memory": {
+                "mandatory": {"gpu_bytes": 10, "host_bytes": 10},
+                "reclaimable": {"gpu_bytes": 0, "host_bytes": 0},
+                "transient_peak": {"gpu_bytes": 40, "host_bytes": 40},
+            },
+        }
+        resources = {"comfyui": service}
+        runtime = FakeRuntime(resources)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "adapter-leases", self.policy
+        )
+        scheduler.states["comfyui"] = "ready"
+        self.assertEqual(scheduler.reserved(), Memory(50, 50))
 
     async def test_active_model_cannot_be_evicted_and_idle_models_are_not_pointlessly_stopped(self):
         self.runtime.loaded = {"a": "ready", "b": "ready"}
@@ -1575,6 +1775,19 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.api_ready = True
         self.assertTrue(await runtime.ready("comfyui"))
 
+    async def test_native_expert_cache_url_works_before_running_proxy_is_discovered(self):
+        native = adaptive_resource()
+        native.pop("expert_cache_url")
+        native["kind"] = "text"
+        native.pop("gateway_url")
+        self.resources["native-moe"] = native
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        self.assertEqual(
+            runtime.expert_cache_url("native-moe"),
+            f"{self.policy['upstream_url']}/upstream/native-moe/expert-cache",
+        )
+
     async def test_comfy_start_command_waits_past_systemd_readiness_deadline(self):
         self.resources["comfyui"].update(
             units=["comfyui.service"], start_command_timeout_s=240
@@ -1708,6 +1921,7 @@ class ProfileTest(unittest.TestCase):
                 "gateway_url": "http://127.0.0.1:8085",
                 "slots_url": "http://127.0.0.1:8085/slots",
                 "health_url": "http://127.0.0.1:8085/health",
+                "units": ["native.service"],
                 "runtime_identity": {"service_units": ["native.service"]},
             })
             verify_profiles(document)
@@ -1869,6 +2083,55 @@ class ProfileTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "needs --image-max-tokens"):
                 build_profiles(router_path, policy_path)
 
+    def test_adaptive_stream_profile_reserves_minimum_and_reclaimable_growth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "llama-server").write_text("runtime")
+            model_dir = root / "models/a"
+            model_dir.mkdir(parents=True)
+            model_path = model_dir / "weights.gguf"
+            model_path.write_bytes(b"weights")
+            metadata = root / "metadata/a"
+            metadata.mkdir(parents=True)
+            (metadata / "SOURCE_REVISION").write_text("gguf_repository=test/a\ngguf_revision=1234\n")
+            (metadata / "SHA256SUMS").write_text("0" * 64 + "  weights.gguf\n")
+            estimator = root / "llama-fit-params"
+            estimator.write_text(
+                f"#!{sys.executable}\nimport sys\n"
+                "cache = sys.argv[sys.argv.index('--moe-stream-cache') + 1]\n"
+                "if cache == '4g':\n"
+                " print('ROCm0 100 20 10\\nHost 20 0 1\\nMoEStreamCache 4294967296 4294967296 68719476736')\n"
+                "else:\n"
+                " print('ROCm0 200 20 10\\nHost 40 0 1\\nMoEStreamCache 68719476736 68719476736 68719476736')\n"
+            )
+            estimator.chmod(0o700)
+            router_path, policy_path = root / "router.json", root / "policy.json"
+            command = (
+                f"{root}/llama-server --model {model_path} --alias a --ctx-size 2048 "
+                "--parallel 1 --batch-size 32 --ubatch-size 1 --gpu-layers 999 "
+                "--moe-stream --moe-stream-direct --moe-stream-cache 4g "
+                "--moe-stream-cache-max 64g --moe-stream-io-threads 1"
+            )
+            router_path.write_text(json.dumps({"models": {"a": {"cmd": command}}}))
+            policy_path.write_text(json.dumps({
+                "estimator": str(estimator), "model_root": str(root / "models"),
+                "artifact_metadata_root": str(root / "metadata"), "estimate_margin": 1.1,
+                "model_overhead_mib": 1, "moe_stream_overhead_mib": 0, "services": {},
+            }))
+
+            profile = build_profiles(router_path, policy_path)["resources"]["a"]
+            self.assertEqual(profile["adaptive_cache"], {
+                "minimum_capacity_bytes": 4 * 1024**3,
+                "maximum_capacity_bytes": 64 * 1024**3,
+                "reservation_multiplier": 1.1,
+            })
+            self.assertEqual(
+                profile["memory"]["reclaimable"]["gpu_bytes"], math.ceil(100 * MIB * 1.1)
+            )
+            self.assertEqual(
+                profile["memory"]["reclaimable"]["host_bytes"], math.ceil(120 * MIB * 1.1)
+            )
+
     def test_comfy_profile_separates_resident_weights_from_peak_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1942,10 +2205,11 @@ class ProfileTest(unittest.TestCase):
                 "artifact_inventory": str(inventory),
                 "request_peak_mib": 36864,
                 "expert_cache_mib": 1024,
+                "expert_cache_max_mib": 65536,
+                "expert_cache_url": "http://127.0.0.1:8085/expert-cache",
                 "context_tokens": 220000,
                 "supported_request_shapes": ["openai.chat", "openai.multimodal_chat"],
                 "concurrency_limit": 1,
-                "exclusive_execution": True,
             }
             policy_path.write_text(json.dumps({
                 "estimator": str(root / "estimator"),
@@ -1959,10 +2223,13 @@ class ProfileTest(unittest.TestCase):
             profile = build_profiles(router_path, policy_path)
             deepseek = profile["resources"]["deepseek"]
             self.assertEqual(deepseek["weights_bytes"], artifact.stat().st_size)
-            self.assertTrue(deepseek["exclusive_execution"])
+            self.assertNotIn("exclusive_execution", deepseek)
             self.assertEqual(deepseek["context_tokens"], 220000)
-            self.assertEqual(deepseek["memory"]["mandatory"]["gpu_bytes"], math.ceil(100 * 1.1) + MIB)
-            self.assertEqual(deepseek["memory"]["mandatory"]["host_bytes"], math.ceil(80 * 1.1) + MIB)
+            cache_minimum = math.ceil(1024 * MIB * 1.1)
+            self.assertEqual(deepseek["memory"]["mandatory"]["gpu_bytes"], math.ceil(100 * 1.1) + MIB + cache_minimum)
+            self.assertEqual(deepseek["memory"]["mandatory"]["host_bytes"], math.ceil(80 * 1.1) + MIB + cache_minimum)
+            self.assertEqual(deepseek["memory"]["reclaimable"]["gpu_bytes"], math.ceil((65536 - 1024) * MIB * 1.1))
+            self.assertEqual(deepseek["adaptive_cache"]["maximum_capacity_bytes"], 65536 * MIB)
             self.assertEqual(deepseek["memory"]["transient_peak"]["gpu_bytes"], math.ceil(36864 * MIB * 1.1))
             self.assertEqual(deepseek["memory"]["transient_peak"]["host_bytes"], math.ceil(36864 * MIB * 1.1))
             verify_profiles(profile)

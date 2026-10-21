@@ -371,6 +371,7 @@ def install_cached_moe(
     linear: Callable,
     *,
     fence: Callable[[], None] | None = None,
+    after_moe: Callable[[], None] | None = None,
 ) -> CachedMoEInstallation:
     """Route every backbone and MTP MoE through one lease-aware expert cache.
 
@@ -384,6 +385,8 @@ def install_cached_moe(
         raise TypeError("linear must be callable")
     if fence is not None and not callable(fence):
         raise TypeError("fence must be callable")
+    if after_moe is not None and not callable(after_moe):
+        raise TypeError("after_moe must be callable")
     if not callable(getattr(cache, "acquire", None)) or not callable(
         getattr(cache, "quarantine", None)
     ):
@@ -429,7 +432,7 @@ def install_cached_moe(
                 _layer_id=cache_layer_id,
                 _mtp_layer=mtp_layer,
             ):
-                return execute_cached_moe(
+                result = execute_cached_moe(
                     cache,
                     activations,
                     _moe.gate,
@@ -440,8 +443,10 @@ def install_cached_moe(
                     swiglu_limit=_moe.shared_experts.swiglu_limit,
                     image_mask=image_mask,
                     fence=fence,
+                    after_moe=after_moe,
                     mtp_layer=_mtp_layer,
                 )
+                return result
 
             cached_forward.__name__ = (
                 f"cached_{name.replace('[', '_').replace(']', '')}_forward"

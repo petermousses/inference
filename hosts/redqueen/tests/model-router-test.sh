@@ -106,19 +106,21 @@ qwen36_command="$(awk '
   /^  [^ ]/ { if (in_model) exit }
   in_model { print }
 ' "${router_config}")"
-if [[ "${qwen36_command}" != *'--ubatch-size 32'* ]] || [[ "${qwen36_command}" == *'--moe-stream'* ]]; then
-  printf 'Qwen3.6 must use the qualified resident prefill configuration\n' >&2
+if [[ "${qwen36_command}" != *'--ubatch-size 1'* ]] || \
+  [[ "${qwen36_command}" != *'--moe-stream'* ]] || \
+  [[ "${qwen36_command}" != *'--moe-stream-cache-max 64g'* ]]; then
+  printf 'Qwen3.6 must use the adaptive streamed expert-cache configuration\n' >&2
   exit 1
 fi
 
-for flag in '--moe-stream' '--moe-stream-direct' '--moe-stream-cache 4g' '--moe-stream-io-threads 1'; do
+for flag in '--moe-stream' '--moe-stream-direct' '--moe-stream-cache 4g' '--moe-stream-cache-max 64g' '--moe-stream-io-threads 1'; do
   count="$(grep -Fxc -- "      ${flag}" "${router_config}")"
-  if [[ "${count}" -ne 2 ]]; then
-    printf 'expected both remaining streamed MoE workers to use %s\n' "${flag}" >&2
+  if [[ "${count}" -ne 3 ]]; then
+    printf 'expected all streamed MoE workers to use %s\n' "${flag}" >&2
     exit 1
   fi
 done
-grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v1/bin/llama-fit-params' "${scheduler_policy}"
+grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v2/bin/llama-fit-params' "${scheduler_policy}"
 grep -Fq '"${source_root}/install-moe-runtime.sh"' "${host_root}/model-router/install.sh"
 python3 - "${scheduler_policy}" <<'PY'
 import json
@@ -139,6 +141,10 @@ assert policy["services"]["jevk5"]["supported_request_shapes"] == ["systemone.de
 assert policy["services"]["jevk5"]["concurrency_limit"] == 4
 assert policy["services"]["clm"]["supported_request_shapes"] == ["systemone.decision"]
 assert policy["services"]["comfyui"]["supported_request_shapes"] == ["openai.image_generation", "openai.image_edit"]
+assert policy["services"]["deepseek"]["expert_cache_mib"] == 1024
+assert policy["services"]["deepseek"]["expert_cache_max_mib"] == 65536
+assert policy["services"]["deepseek"]["expert_cache_url"] == "http://127.0.0.1:8085/expert-cache"
+assert policy["services"]["deepseek"].get("exclusive_execution") is not True
 PY
 if grep -Fq 'deepseek-v4.1-flash-q2' "${router_config}"; then
   printf 'DeepSeek is not eligible for registration until its weights verify\n' >&2

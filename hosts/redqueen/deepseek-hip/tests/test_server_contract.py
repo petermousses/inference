@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from aiohttp.test_utils import TestClient, TestServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
@@ -16,6 +17,7 @@ from deepseek_server import (
     RequestError,
     _IncrementalTextDecoder,
     _request_options,
+    create_app,
     install_cached_moe,
 )
 
@@ -153,6 +155,107 @@ class DeepSeekStreamBackpressureTest(unittest.IsolatedAsyncioTestCase):
         with patch("deepseek_server.STREAM_WRITE_TIMEOUT_S", 0.01):
             with self.assertRaises(ConnectionResetError):
                 await engine._write_stream_bytes(StalledResponse(), b"chunk")
+
+
+class DeepSeekExpertCacheEndpointTest(unittest.IsolatedAsyncioTestCase):
+    class Engine:
+        def __init__(self):
+            self._closed = False
+            self._active_requests = 0
+            self._request_guard = asyncio.Lock()
+            self.cache_min_capacity = 10
+            self.cache_max_capacity = 100
+            self.capacity = 10
+            self.resizes = []
+
+        def _cache_info(self):
+            return {
+                "minimum_capacity_bytes": self.cache_min_capacity,
+                "maximum_capacity_bytes": self.cache_max_capacity,
+                "capacity_bytes": self.capacity,
+                "resident_bytes": 0,
+                "loading_bytes": 0,
+                "releasing_bytes": 0,
+                "leased_bytes": 0,
+                "pending_loads": 0,
+                "pending_backing_release": False,
+                "quarantined": False,
+            }
+
+        def _resize_idle_cache(self, capacity):
+            self.resizes.append(("idle", capacity))
+            self.capacity = capacity
+            return self._cache_info()
+
+        def _request_cache_resize(self, capacity):
+            self.resizes.append(("active", capacity))
+            self.capacity = capacity
+            return self._cache_info()
+
+        async def chat(self, _request):
+            raise AssertionError("chat route is not used in cache endpoint tests")
+
+        async def close(self):
+            pass
+
+    async def asyncSetUp(self):
+        self.engine = self.Engine()
+        self.client = TestClient(TestServer(create_app(self.engine, "secret")))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+
+    async def test_cache_state_requires_authentication(self):
+        response = await self.client.get("/expert-cache")
+        self.assertEqual(response.status, 401)
+        response = await self.client.get(
+            "/expert-cache", headers={"Authorization": "Bearer secret"}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["capacity_bytes"], 10)
+
+    async def test_resize_rejects_malformed_and_out_of_range_requests(self):
+        headers = {"Authorization": "Bearer secret"}
+        for body in (
+            {"capacity_bytes": True},
+            {"capacity_bytes": 9},
+            {"capacity_bytes": 101},
+            {"capacity_bytes": 50, "unexpected": 1},
+        ):
+            with self.subTest(body=body):
+                response = await self.client.post("/expert-cache", json=body, headers=headers)
+                self.assertEqual(response.status, 400)
+        response = await self.client.post(
+            "/expert-cache", data="not-json", headers={**headers, "Content-Type": "text/plain"}
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual(self.engine.resizes, [])
+
+    async def test_idle_resize_uses_idle_worker_path(self):
+        response = await self.client.post(
+            "/expert-cache",
+            json={"capacity_bytes": 64},
+            headers={"Authorization": "Bearer secret"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["capacity_bytes"], 64)
+        self.assertEqual(self.engine.resizes, [("idle", 64)])
+
+    async def test_active_resize_uses_safe_point_path(self):
+        self.engine._active_requests = 1
+        await self.engine._request_guard.acquire()
+        try:
+            response = await self.client.post(
+                "/expert-cache",
+                json={"capacity_bytes": 64},
+                headers={"Authorization": "Bearer secret"},
+            )
+        finally:
+            self.engine._request_guard.release()
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["capacity_bytes"], 64)
+        self.assertEqual(self.engine.resizes, [("active", 64)])
 
 
 if __name__ == "__main__":

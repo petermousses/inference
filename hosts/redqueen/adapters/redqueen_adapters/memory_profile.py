@@ -20,7 +20,7 @@ MIB = 1024**2
 MEMORY_FLAGS = {
     "--model", "--ctx-size", "--cache-type-k", "--cache-type-v", "--gpu-layers",
     "--parallel", "--batch-size", "--ubatch-size", "--flash-attn", "--split-mode",
-    "--moe-stream-cache", "--moe-stream-io-threads", "--load-mode", "--lazy-mode",
+    "--moe-stream-cache", "--moe-stream-cache-max", "--moe-stream-io-threads", "--load-mode", "--lazy-mode",
 }
 MEMORY_BOOLEAN_FLAGS = {"--moe-stream", "--moe-stream-direct"}
 
@@ -166,6 +166,7 @@ def verify_profiles(document: dict, *, verify_sources: bool = True) -> None:
             "health_url": None,
             "ready_url": None,
             "slots_url": "/slots",
+            "expert_cache_url": "/expert-cache",
             "queue_url": None,
             "nodes_url": None,
             "gateway_url": "",
@@ -178,6 +179,26 @@ def verify_profiles(document: dict, *, verify_sources: bool = True) -> None:
             raise ValueError(f"{name} has an invalid concurrency limit")
         if "exclusive_execution" in profile and type(profile["exclusive_execution"]) is not bool:
             raise ValueError(f"{name} has an invalid exclusive execution policy")
+        adaptive_cache = profile.get("adaptive_cache")
+        if adaptive_cache is not None and (
+            not isinstance(adaptive_cache, dict)
+            or isinstance(adaptive_cache.get("minimum_capacity_bytes"), bool)
+            or not isinstance(adaptive_cache.get("minimum_capacity_bytes"), int)
+            or isinstance(adaptive_cache.get("maximum_capacity_bytes"), bool)
+            or not isinstance(adaptive_cache.get("maximum_capacity_bytes"), int)
+            or adaptive_cache["minimum_capacity_bytes"] <= 0
+            or adaptive_cache["maximum_capacity_bytes"] < adaptive_cache["minimum_capacity_bytes"]
+            or isinstance(adaptive_cache.get("reservation_multiplier"), bool)
+            or not isinstance(adaptive_cache.get("reservation_multiplier"), (int, float))
+            or not math.isfinite(adaptive_cache["reservation_multiplier"])
+            or adaptive_cache["reservation_multiplier"] < 1
+            or (
+                profile.get("expert_cache_url") is not None
+                and not _loopback_http_url(profile.get("expert_cache_url"), path="/expert-cache")
+            )
+            or (profile.get("kind") == "service" and profile.get("expert_cache_url") is None)
+        ):
+            raise ValueError(f"{name} has an invalid adaptive expert-cache contract")
         for key in ("max_image_inputs", "multimodal_workspace_mib"):
             value = profile.get(key)
             if value is not None and (
@@ -207,11 +228,21 @@ def memory_rows(output: str) -> dict[str, tuple[int, int, int]]:
     rows = {}
     for line in output.splitlines():
         match = re.fullmatch(r"(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s*", line)
-        if match:
+        if match and (match[1] == "Host" or match[1].startswith("ROCm")):
             rows[match[1]] = tuple((int(value) + 1) * MIB for value in match.groups()[1:])
     if "Host" not in rows or not any(name.startswith("ROCm") for name in rows):
         raise ValueError("memory estimator did not report Host and ROCm memory")
     return rows
+
+
+def moe_stream_cache_info(output: str) -> tuple[int, int, int]:
+    matches = re.findall(r"^MoEStreamCache\s+(\d+)\s+(\d+)\s+(\d+)\s*$", output, re.MULTILINE)
+    if len(matches) != 1:
+        raise ValueError("memory estimator did not report exactly one MoE cache capacity row")
+    capacity, minimum, maximum = (int(value) for value in matches[0])
+    if minimum <= 0 or maximum < minimum or not minimum <= capacity <= maximum:
+        raise ValueError("memory estimator reported invalid MoE cache bounds")
+    return capacity, minimum, maximum
 
 
 def lazy_tensor_sizes(output: str) -> dict[str, int]:
@@ -385,12 +416,15 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
         if "--model" not in flags or int(flags.get("--ctx-size", 0)) <= 0:
             raise ValueError(f"{name} needs an explicit model and context size")
         streaming = flags.get("--moe-stream", False)
+        adaptive_streaming = streaming and "--moe-stream-cache-max" in flags
         if streaming:
             cache = flags.get("--moe-stream-cache", "")
             io_threads = flags.get("--moe-stream-io-threads", "1")
+            cache_max = flags.get("--moe-stream-cache-max", "")
             if (
                 "--moe-stream-direct" not in flags
                 or not re.fullmatch(r"[1-9][0-9]*(?:[gG]|s)", cache)
+                or (adaptive_streaming and not re.fullmatch(r"[1-9][0-9]*(?:[gG](?:[bB]|[iI][bB])?)?", cache_max))
                 or not io_threads.isdecimal()
                 or int(io_threads) < 1
                 or int(flags.get("--gpu-layers", "0")) < 1
@@ -401,7 +435,7 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
                 or "-ot" in argv
             ):
                 raise ValueError(f"{name} has an invalid direct-I/O MoE streaming contract")
-        elif any(flag in flags for flag in ("--moe-stream-cache", "--moe-stream-io-threads", "--moe-stream-direct")):
+        elif any(flag in flags for flag in ("--moe-stream-cache", "--moe-stream-cache-max", "--moe-stream-io-threads", "--moe-stream-direct")):
             raise ValueError(f"{name} has MoE streaming options without --moe-stream")
         weights = weight_paths(Path(flags["--model"]))
         extras = [Path(argv[argv.index("--mmproj") + 1])] if "--mmproj" in argv else []
@@ -431,6 +465,27 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
         if result.returncode:
             raise ValueError(f"{name} memory estimation failed: {result.stderr[-1000:]}")
         rows = memory_rows(result.stdout)
+        cache_bounds = moe_stream_cache_info(result.stdout) if adaptive_streaming else None
+        max_rows = None
+        if adaptive_streaming:
+            if cache_bounds[0] != cache_bounds[1]:
+                raise ValueError(f"{name} startup expert cache does not match its configured minimum")
+            max_arguments = list(arguments)
+            min_index = max_arguments.index("--moe-stream-cache")
+            max_arguments[min_index + 1] = flags["--moe-stream-cache-max"]
+            max_result = subprocess.run(
+                [str(estimator), "--fit-print", "on", *max_arguments],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+            if max_result.returncode:
+                raise ValueError(f"{name} maximum-cache memory estimation failed: {max_result.stderr[-1000:]}")
+            max_rows = memory_rows(max_result.stdout)
+            max_cache_info = moe_stream_cache_info(max_result.stdout)
+            if (
+                max_cache_info[0] != cache_bounds[2]
+                or max_cache_info[1] != max_cache_info[2]
+            ):
+                raise ValueError(f"{name} maximum expert cache does not match its configured bound")
         lazy_tensors = lazy_tensor_sizes(result.stdout + "\n" + result.stderr)
         lazy_bytes = sum(lazy_tensors.values())
         lazy_profiles = policy.get("lazy_tensor_profiles", {})
@@ -473,8 +528,25 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             # The fit row is converted to a conservative byte bound, while the
             # lazy tensor record carries its exact byte size.
             rows["Host"] = (host_rows[0] - lazy_bytes, *host_rows[1:])
+            if adaptive_streaming:
+                max_lazy_tensors = lazy_tensor_sizes(max_result.stdout + "\n" + max_result.stderr)
+                if max_lazy_tensors != lazy_tensors:
+                    raise ValueError(f"{name} lazy tensor allocation changed with expert-cache capacity")
+                max_host_rows = max_rows["Host"]
+                if lazy_bytes > max_host_rows[0]:
+                    raise ValueError(f"{name} lazy tensor bytes exceed the maximum planner host allocation")
+                max_rows["Host"] = (max_host_rows[0] - lazy_bytes, *max_host_rows[1:])
         gpu = sum(sum(values) for device, values in rows.items() if device != "Host")
         planner_total = sum(sum(values) for values in rows.values())
+        gpu_growth = 0
+        planner_growth = 0
+        if adaptive_streaming:
+            gpu_max = sum(sum(values) for device, values in max_rows.items() if device != "Host")
+            planner_total_max = sum(sum(values) for values in max_rows.values())
+            gpu_growth = gpu_max - gpu
+            planner_growth = planner_total_max - planner_total
+            if gpu_growth < 0 or planner_growth < 0:
+                raise ValueError(f"{name} maximum expert cache reduced its planned memory reservation")
         extra_bytes = sum(path.stat().st_size for path in extras)
         host_weight_bytes = sum(path.stat().st_size for path in host_weights)
         # Include all shards, even tensors the runtime might lazily map or ignore.
@@ -494,6 +566,10 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             overhead += stream_overhead * MIB
         gpu_bytes = math.ceil((gpu + extra_bytes) * margin) + overhead
         host_bytes = math.ceil(total * margin) + overhead
+        reclaimable = (
+            math.ceil(gpu_growth * margin),
+            math.ceil(planner_growth * margin),
+        ) if adaptive_streaming else (0, 0)
         # This is an admission estimate for clean, file-backed pages, not an
         # enforced residency ceiling. Linux can reclaim those pages; cold
         # prefill latency and peak cache use still need workload measurement.
@@ -504,6 +580,7 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
         )
         memory = memory_contract(
             (gpu_bytes, host_bytes),
+            reclaimable=reclaimable,
             transient_peak=(vision_workspace_bytes, lazy_cache_bytes + vision_workspace_bytes),
         )
         return {
@@ -512,6 +589,16 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             "context_tokens": int(flags["--ctx-size"]), "planner": str(estimator),
             "gpu_bytes": memory["gpu_bytes"], "host_bytes": memory["host_bytes"],
             "memory": memory,
+            **(
+                {
+                    "adaptive_cache": {
+                        "minimum_capacity_bytes": cache_bounds[1],
+                        "maximum_capacity_bytes": cache_bounds[2],
+                        "reservation_multiplier": margin,
+                    },
+                }
+                if adaptive_streaming else {}
+            ),
             "artifact_identity": artifacts,
             "artifact_fingerprint": artifact_fingerprint,
             "runtime_identity": file_signature(runtime),
@@ -540,6 +627,16 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
         peak_mib = service["request_peak_mib"]
         if isinstance(peak_mib, bool) or not isinstance(peak_mib, int) or peak_mib <= 0:
             raise ValueError(f"{name} request_peak_mib must be a positive integer")
+        cache_min_mib = service.get("expert_cache_mib")
+        cache_max_mib = service.get("expert_cache_max_mib")
+        if (
+            isinstance(cache_min_mib, bool) or not isinstance(cache_min_mib, int) or cache_min_mib <= 0
+            or isinstance(cache_max_mib, bool) or not isinstance(cache_max_mib, int)
+            or cache_max_mib < cache_min_mib
+        ):
+            raise ValueError(f"{name} has an invalid adaptive expert-cache budget")
+        if not _loopback_http_url(service.get("expert_cache_url"), path="/expert-cache"):
+            raise ValueError(f"{name} has an invalid expert-cache control endpoint")
         python = Path(service["profile_python"])
         script = Path(service["profile_script"])
         inventory_path = Path(service["artifact_inventory"])
@@ -591,15 +688,20 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
 
         margin = policy["estimate_margin"]
         overhead = policy["model_overhead_mib"] * MIB
+        cache_min = cache_min_mib * MIB
+        cache_max = cache_max_mib * MIB
+        cache_min_reservation = math.ceil(cache_min * margin)
+        cache_reclaimable = math.ceil((cache_max - cache_min) * margin)
         mandatory = (
-            math.ceil(resident_device * margin) + overhead,
-            math.ceil(resident_host * margin) + overhead,
+            math.ceil(resident_device * margin) + overhead + cache_min_reservation,
+            math.ceil(resident_host * margin) + overhead + cache_min_reservation,
         )
+        reclaimable = (cache_reclaimable, cache_reclaimable)
         transient = (
             math.ceil(peak_mib * MIB * margin),
             math.ceil(peak_mib * MIB * margin),
         )
-        memory = memory_contract(mandatory, transient_peak=transient)
+        memory = memory_contract(mandatory, reclaimable=reclaimable, transient_peak=transient)
         weight_bytes = sum(path.stat().st_size for path in artifact_paths)
         return {
             **metadata,
@@ -610,6 +712,12 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             "gpu_bytes": memory["gpu_bytes"],
             "host_bytes": memory["host_bytes"],
             "memory": memory,
+            "adaptive_cache": {
+                "minimum_capacity_bytes": cache_min,
+                "maximum_capacity_bytes": cache_max,
+                "reservation_multiplier": margin,
+            },
+            "expert_cache_url": service["expert_cache_url"],
             "artifact_identity": artifacts,
             "artifact_fingerprint": artifact_fingerprint,
             "runtime_identity": {"service_units": service.get("units", [])},

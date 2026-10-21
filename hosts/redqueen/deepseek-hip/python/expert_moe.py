@@ -20,6 +20,7 @@ def execute_cached_moe(
     swiglu_limit: float,
     image_mask=None,
     fence: Callable[[], None] | None = None,
+    after_moe: Callable[[], None] | None = None,
     mtp_layer: bool = False,
 ):
     """Run one single-rank MoE block using the official gate and shared expert.
@@ -39,6 +40,8 @@ def execute_cached_moe(
         raise TypeError("gate, shared_expert, and linear must be callable")
     if fence is not None and not callable(fence):
         raise TypeError("fence must be callable")
+    if after_moe is not None and not callable(after_moe):
+        raise TypeError("after_moe must be callable")
     if type(n_routed_experts) is not int or n_routed_experts <= 0:
         raise ValueError("n_routed_experts must be a positive integer")
     # Validate the layer id even when no token selects a routed expert.
@@ -65,6 +68,7 @@ def execute_cached_moe(
         if flat_image_mask.numel() != flat.shape[0]:
             raise ValueError("image_mask must contain one value per token")
 
+    result = None
     try:
         weights, indices = gate(flat, flat_image_mask)
         if not isinstance(weights, torch.Tensor) or not isinstance(indices, torch.Tensor):
@@ -97,10 +101,13 @@ def execute_cached_moe(
         if not isinstance(shared_output, torch.Tensor) or shared_output.shape != flat.shape:
             raise ValueError("shared expert output must match the flattened activation shape")
         output += shared_output
-        return output.type_as(flat).view(shape)
+        result = output.type_as(flat).view(shape)
     finally:
         try:
             fence()
         except BaseException:
             cache.quarantine()
             raise
+    if after_moe is not None:
+        after_moe()
+    return result
