@@ -128,6 +128,7 @@ models:
       --moe-stream-io-threads 1
       --cont-batching
       --flash-attn auto
+      --image-max-tokens 1024
       --jinja
       --metrics
       --slots
@@ -180,6 +181,7 @@ models:
     cmd: >-
       /srv/ai/runtimes/llama.cpp-d812350-moe-v1/bin/llama-server
       --model /srv/ai/models/huihui-glm-5.3-flash-abliterated-gguf/UD-IQ1_S/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf
+      --mmproj /srv/ai/models/huihui-glm-5.3-flash-abliterated-gguf/mmproj-model-bf16.gguf
       --alias glm-5.3-flash-abliterated
       --ctx-size 220000
       --cache-type-k q8_0
@@ -194,6 +196,7 @@ models:
       --moe-stream-io-threads 1
       --cont-batching
       --flash-attn auto
+      --image-max-tokens 1024
       --jinja
       --chat-template-kwargs '{"clear_thinking":true}'
       --metrics
