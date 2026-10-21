@@ -119,6 +119,7 @@ class FakeAdaptiveRuntime(FakeRuntime):
         self.sticky_cache_backing = False
         self.physical_cache_capacities = dict(self.cache_capacities)
         self.reject_cache_above: dict[str, int] = {}
+        self.cache_rounding_quantum = 1
 
     async def expert_cache_info(self, name):
         limits = self.resources[name]["adaptive_cache"]
@@ -134,6 +135,11 @@ class FakeAdaptiveRuntime(FakeRuntime):
         reject_above = self.reject_cache_above.get(name)
         if reject_above is not None and capacity_bytes > reject_above:
             raise ExpertCacheResizeError(503)
+        minimum = self.resources[name]["adaptive_cache"]["minimum_capacity_bytes"]
+        capacity_bytes = max(
+            minimum,
+            capacity_bytes // self.cache_rounding_quantum * self.cache_rounding_quantum,
+        )
         self.cache_capacities[name] = capacity_bytes
         if not self.sticky_cache_backing or capacity_bytes > self.physical_cache_capacities[name]:
             self.physical_cache_capacities[name] = capacity_bytes
@@ -276,6 +282,27 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         scheduler.active.pop("deepseek")
         self.assertTrue(await scheduler._rebalance_caches(None, runtime.limit, Memory(0, 0)))
         self.assertNotIn("deepseek", scheduler.cache_fallback_caps)
+
+    async def test_cache_rounding_caps_unrepresentable_capacity_for_current_demand(self):
+        resources = {name: adaptive_resource() for name in ("deepseek", "qwen")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=150)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "adaptive-rounding-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"deepseek": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        scheduler.active = {"deepseek": 1}
+        runtime.cache_capacities["deepseek"] = 130
+        runtime.physical_cache_capacities["deepseek"] = 130
+        scheduler.cache_allocations["deepseek"] = 130
+        runtime.cache_rounding_quantum = 7
+
+        self.assertTrue(await scheduler._rebalance_caches("qwen", runtime.limit, Memory(0, 0)))
+
+        self.assertEqual(runtime.cache_capacities["deepseek"], 49)
+        self.assertEqual(scheduler.cache_fallback_caps["deepseek"], 49)
+        self.assertEqual(runtime.resize_calls, [("deepseek", 55)])
 
     async def test_cache_transfers_shrink_before_growing_another_model(self):
         resources = {name: adaptive_resource() for name in ("a", "m", "z")}

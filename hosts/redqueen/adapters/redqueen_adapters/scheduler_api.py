@@ -775,6 +775,13 @@ class Scheduler:
             ) or (
                 target > initial and actual >= target
             ):
+                if actual < target:
+                    # The runtime rounds byte budgets down to whole expert
+                    # slots. Remember that representable limit for this demand
+                    # set so a later pass does not repeat the same resize.
+                    self.cache_fallback_caps[name] = min(
+                        self.cache_fallback_caps.get(name, actual), actual
+                    )
                 return fits, capacity_now, unknown_now
 
             # A failed growth can safely remain at the verified current size.
@@ -783,7 +790,7 @@ class Scheduler:
             if target >= initial:
                 self.cache_fallback_caps[name] = actual
                 LOG.warning(
-                    "cache resize capped model=%s requested_bytes=%d available_bytes=%d",
+                    "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d",
                     name,
                     target,
                     actual,
@@ -816,23 +823,15 @@ class Scheduler:
                 raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed")
             lower = min(actual, candidate)
 
-            # Find the highest lower capacity the allocator will accept. The
-            # failed requested target is the upper bound; each accepted step
-            # becomes the next verified lower bound.
+            # Refine the largest verified lower capacity with bounded probes.
+            # The failed requested target is the upper bound.
             for _ in range(4):
                 candidate = lower + (upper - lower) // 2
                 if candidate <= lower or candidate >= upper:
                     break
-                before_candidate = self.cache_allocations.get(name, lower)
-                accepted, info = await issue_resize(name, candidate)
+                _accepted, info = await issue_resize(name, candidate)
                 actual = info["capacity_bytes"]
-                if actual > lower and actual <= candidate:
-                    lower = actual
-                elif actual <= lower:
-                    upper = candidate
-                elif not accepted:
-                    upper = candidate
-                elif before_candidate > candidate and actual <= candidate:
+                if lower < actual <= candidate:
                     lower = actual
                 else:
                     upper = candidate
@@ -840,7 +839,7 @@ class Scheduler:
             self.cache_fallback_caps[name] = lower
             fits, capacity_now, unknown_now = measured_fit()
             LOG.warning(
-                "cache resize reduced model=%s requested_bytes=%d available_bytes=%d",
+                "cache resize reduced model=%s requested_bytes=%d capacity_bytes=%d",
                 name,
                 target,
                 lower,
