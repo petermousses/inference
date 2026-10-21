@@ -121,11 +121,7 @@ models:
       --gpu-layers 999
       --parallel 1
       --batch-size 32
-      --ubatch-size 1
-      --moe-stream
-      --moe-stream-direct
-      --moe-stream-cache 4g
-      --moe-stream-io-threads 1
+      --ubatch-size 32
       --cont-batching
       --flash-attn auto
       --image-max-tokens 1024
