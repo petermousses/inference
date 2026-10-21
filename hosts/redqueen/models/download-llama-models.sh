@@ -447,9 +447,51 @@ download_clm() {
   (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
 }
 
-download_qwen
-download_jevk5
-download_embeddinggemma
-download_clef_flash
-download_clef
-download_clm
+download_glm53_mmproj() {
+  local model_root="${GLM53_MODEL_ROOT:-/srv/ai/models/huihui-glm-5.3-flash-abliterated-gguf}"
+  local revision="06f66b01ee15bc22b326f733fcc1518ec472e373"
+  local repository="huihui-ai/Huihui-GLM-5.3-Flash-abliterated-GGUF"
+  local filename="mmproj-model-bf16.gguf"
+  local sha256="82b7adb44411dbb298b1c689567804e5ed0790d80f308ed8b5b6b8ac0527d2ac"
+
+  mkdir -p -- "${model_root}"
+  exec 3>"${model_root}/.download.lock"
+  flock -n 3 || {
+    printf 'another GLM-5.3 model download is already running\n' >&2
+    return 1
+  }
+
+  download "${model_root}" \
+    "https://huggingface.co/${repository}/resolve/${revision}/${filename}?download=true" \
+    "${filename}" "${sha256}"
+  install_metadata \
+    "${script_dir}/metadata/huihui-glm-5.3-flash-abliterated-gguf/SOURCE_REVISION" \
+    "${model_root}/SOURCE_REVISION"
+  install_metadata \
+    "${script_dir}/metadata/huihui-glm-5.3-flash-abliterated-gguf/SHA256SUMS" \
+    "${model_root}/SHA256SUMS"
+  (cd -- "${model_root}" && sha256sum --check SHA256SUMS)
+}
+
+case "${1:-}" in
+  "")
+    download_qwen
+    download_jevk5
+    download_embeddinggemma
+    download_clef_flash
+    download_clef
+    download_clm
+    download_glm53_mmproj
+    ;;
+  --glm53-mmproj)
+    [[ "$#" -eq 1 ]] || {
+      printf 'usage: %s [--glm53-mmproj]\n' "$0" >&2
+      exit 2
+    }
+    download_glm53_mmproj
+    ;;
+  *)
+    printf 'usage: %s [--glm53-mmproj]\n' "$0" >&2
+    exit 2
+    ;;
+esac
