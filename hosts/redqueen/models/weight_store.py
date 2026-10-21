@@ -275,9 +275,19 @@ def parse_gguf(path: Path) -> dict:
             )
 
         header_end = reader.tell()
-        data_start = ((header_end + alignment - 1) // alignment) * alignment
-        if data_start > file_size:
-            raise ValueError("GGUF aligned tensor data section starts past end of file")
+        aligned_data_start = ((header_end + alignment - 1) // alignment) * alignment
+        if tensor_count:
+            data_start = aligned_data_start
+            if data_start > file_size:
+                raise ValueError("GGUF aligned tensor data section starts past end of file")
+        else:
+            if file_size > aligned_data_start:
+                raise ValueError("GGUF shard with no tensors contains unindexed trailing data")
+            stream.seek(header_end)
+            trailing_padding = stream.read(file_size - header_end)
+            if any(trailing_padding):
+                raise ValueError("GGUF metadata-only shard has nonzero alignment padding")
+            data_start = aligned_data_start if file_size == aligned_data_start else header_end
 
     occupied = []
     for tensor in tensors:
@@ -604,12 +614,15 @@ def build_store(
             verified = True
 
         suffix = resolved.suffix.lower()
-        if suffix == ".gguf":
-            layout = parse_gguf(resolved)
-        elif suffix == ".safetensors":
-            layout = parse_safetensors(resolved)
-        else:
-            layout = {"container": "opaque", "tensor_layout": "opaque", "tensors": []}
+        try:
+            if suffix == ".gguf":
+                layout = parse_gguf(resolved)
+            elif suffix == ".safetensors":
+                layout = parse_safetensors(resolved)
+            else:
+                layout = {"container": "opaque", "tensor_layout": "opaque", "tensors": []}
+        except ValueError as error:
+            raise ValueError(f"invalid {suffix or 'opaque'} artifact {relative}: {error}") from error
         tensors = layout["tensors"]
         total_size += size_bytes
         tensor_count += len(tensors)
