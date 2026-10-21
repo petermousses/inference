@@ -16,7 +16,7 @@ from redqueen_adapters.memory_profile import fingerprint_artifacts
 
 
 class DeployedProfileVerificationTests(unittest.TestCase):
-    def test_accepts_generated_multimodal_model_fields(self):
+    def test_accepts_generated_adaptive_cache_and_multimodal_fields(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             repo = root / "inference"
@@ -113,6 +113,11 @@ class DeployedProfileVerificationTests(unittest.TestCase):
                         "supported_request_shapes": ["openai.multimodal_chat"],
                         "max_image_inputs": 1,
                         "multimodal_workspace_mib": 4096,
+                        "adaptive_cache": {
+                            "minimum_capacity_bytes": 1,
+                            "maximum_capacity_bytes": 2,
+                            "reservation_multiplier": 1.0,
+                        },
                     }
                 },
                 "sources": sources,
