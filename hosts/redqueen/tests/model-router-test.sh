@@ -101,10 +101,20 @@ if [[ "${invalid_unsloth_plan}" != *'existing file has the wrong SHA-256'* ]]; t
   exit 1
 fi
 
+qwen36_command="$(awk '
+  /^  qwen3\.6-35b-a3b:$/ { in_model = 1; next }
+  /^  [^ ]/ { if (in_model) exit }
+  in_model { print }
+' "${router_config}")"
+if [[ "${qwen36_command}" != *'--ubatch-size 32'* ]] || [[ "${qwen36_command}" == *'--moe-stream'* ]]; then
+  printf 'Qwen3.6 must use the qualified resident prefill configuration\n' >&2
+  exit 1
+fi
+
 for flag in '--moe-stream' '--moe-stream-direct' '--moe-stream-cache 4g' '--moe-stream-io-threads 1'; do
   count="$(grep -Fxc -- "      ${flag}" "${router_config}")"
-  if [[ "${count}" -ne 3 ]]; then
-    printf 'expected all three streamed MoE workers to use %s\n' "${flag}" >&2
+  if [[ "${count}" -ne 2 ]]; then
+    printf 'expected both remaining streamed MoE workers to use %s\n' "${flag}" >&2
     exit 1
   fi
 done
