@@ -3,7 +3,7 @@ set -euo pipefail
 umask 0027
 
 readonly revision=d81235049384534c167caea52b85a694f6103d14
-readonly runtime=llama.cpp-d812350-deepseek41-moe-v5
+readonly runtime=llama.cpp-d812350-deepseek41-moe-v6
 readonly target="/srv/ai/runtimes/${runtime}"
 readonly repository=https://github.com/ggml-org/llama.cpp.git
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -12,6 +12,7 @@ readonly patch_file="${runtime_metadata}/moe-stream.patch"
 readonly architecture_patch_file="${runtime_metadata}/deepseek41.patch"
 readonly direct_patch_file="${runtime_metadata}/deepseek41-direct.patch"
 readonly vision_patch_file="${runtime_metadata}/deepseek41v.patch"
+readonly adaptive_patch_file="${runtime_metadata}/adaptive-cache.patch"
 (cd -- "${runtime_metadata}" && sha256sum --check PATCH_SHA256)
 readonly patch_sha="$(sha256sum "${runtime_metadata}/PATCH_SHA256" | cut -d ' ' -f 1)"
 
@@ -33,11 +34,15 @@ if [[ -e "${target}" ]]; then
     exit 1
   fi
   fit_help="$("${target}/bin/llama-fit-params" --help 2>&1)"
-  if [[ "${fit_help}" != *"--moe-stream"* || "${fit_help}" != *"--fit-print"* || "${fit_help}" != *"on-direct"* ]]; then
-    printf 'pinned memory-fit planner lacks MoE streaming or direct Engram support\n' >&2
+  if [[ "${fit_help}" != *"--moe-stream"* || "${fit_help}" != *"--moe-stream-cache-max"* || "${fit_help}" != *"--fit-print"* || "${fit_help}" != *"on-direct"* ]]; then
+    printf 'pinned memory-fit planner lacks adaptive MoE streaming or direct Engram support\n' >&2
     exit 1
   fi
   server_help="$("${target}/bin/llama-server" --help 2>&1)"
+  if [[ "${server_help}" != *"--moe-stream-cache-max"* ]]; then
+    printf 'pinned llama-server lacks adaptive MoE streaming support\n' >&2
+    exit 1
+  fi
   if [[ "${server_help}" != *"on-direct"* ]]; then
     printf 'pinned llama-server lacks direct Engram row support\n' >&2
     exit 1
@@ -140,6 +145,8 @@ git -C "${source_root}" apply --check "${direct_patch_file}"
 git -C "${source_root}" apply "${direct_patch_file}"
 git -C "${source_root}" apply --check "${vision_patch_file}"
 git -C "${source_root}" apply "${vision_patch_file}"
+git -C "${source_root}" apply --check "${adaptive_patch_file}"
+git -C "${source_root}" apply "${adaptive_patch_file}"
 
 export HIPCXX="$(hipconfig -l)/clang"
 export HIP_PATH="$(hipconfig -R)"
@@ -188,7 +195,7 @@ python3 - "${stage}" "${revision}" "${patch_sha}" <<'PYMETA'
 import json, sys
 from pathlib import Path
 p=Path(sys.argv[1])/"EXPERT_STREAMING.json"
-p.write_text(json.dumps({"version":1,"base_revision":sys.argv[2],"patch_sha256":sys.argv[3],"max_contexts":1,"max_ubatch":1,"direct_io_required":True,"live_resize":False},sort_keys=True)+"\n")
+p.write_text(json.dumps({"version":1,"base_revision":sys.argv[2],"patch_sha256":sys.argv[3],"max_contexts":1,"max_ubatch":1,"direct_io_required":True,"live_resize":True},sort_keys=True)+"\n")
 PYMETA
 runtime_version="$("${stage}/bin/llama-server" --version 2>&1)"
 if [[ "${runtime_version}" != *"commit ${revision:0:7}"* ]]; then
@@ -210,11 +217,15 @@ if [[ ! -x "${stage}/bin/llama-fit-params" ]]; then
   exit 1
 fi
 fit_help="$("${stage}/bin/llama-fit-params" --help 2>&1)"
-if [[ "${fit_help}" != *"--moe-stream"* || "${fit_help}" != *"--fit-print"* || "${fit_help}" != *"on-direct"* ]]; then
-  printf 'built memory-fit planner lacks MoE streaming or direct Engram support\n' >&2
+if [[ "${fit_help}" != *"--moe-stream"* || "${fit_help}" != *"--moe-stream-cache-max"* || "${fit_help}" != *"--fit-print"* || "${fit_help}" != *"on-direct"* ]]; then
+  printf 'built memory-fit planner lacks adaptive MoE streaming or direct Engram support\n' >&2
   exit 1
 fi
 server_help="$("${stage}/bin/llama-server" --help 2>&1)"
+if [[ "${server_help}" != *"--moe-stream-cache-max"* ]]; then
+  printf 'built llama-server lacks adaptive MoE streaming support\n' >&2
+  exit 1
+fi
 if [[ "${server_help}" != *"on-direct"* ]]; then
   printf 'built llama-server lacks direct Engram row support\n' >&2
   exit 1

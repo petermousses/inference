@@ -263,6 +263,61 @@ class Runtime:
             except (ValueError, UnicodeDecodeError) as error:
                 raise RuntimeError("invalid runtime control response") from error
 
+    def expert_cache_url(self, name: str) -> str | None:
+        spec = self.resources[name]
+        url = spec.get("expert_cache_url")
+        if url is None and spec.get("adaptive_cache"):
+            proxy = self.proxies.get(name)
+            base = proxy.rstrip("/") if proxy else f"{self.url}/upstream/{quote(name, safe='')}"
+            url = base + "/expert-cache"
+        return url
+
+    async def expert_cache_info(self, name: str) -> dict:
+        url = self.expert_cache_url(name)
+        if not url:
+            raise RuntimeError("adaptive worker has no expert-cache endpoint")
+        body = await self.json(url, limit=64 * 1024)
+        spec = self.resources[name]
+        limits = spec.get("adaptive_cache")
+        if (
+            not isinstance(body, dict)
+            or not isinstance(limits, dict)
+            or body.get("minimum_capacity_bytes") != limits.get("minimum_capacity_bytes")
+            or body.get("maximum_capacity_bytes") != limits.get("maximum_capacity_bytes")
+            or isinstance(body.get("capacity_bytes"), bool)
+            or not isinstance(body.get("capacity_bytes"), int)
+            or body["capacity_bytes"] <= 0
+            or not limits["minimum_capacity_bytes"] <= body["capacity_bytes"] <= limits["maximum_capacity_bytes"]
+            or type(body.get("pending_backing_release")) is not bool
+            or type(body.get("quarantined")) is not bool
+            or body["quarantined"]
+            or body["pending_backing_release"]
+        ):
+            raise RuntimeError("adaptive worker returned an invalid or unsettled expert-cache state")
+        return body
+
+    async def resize_expert_cache(self, name: str, capacity_bytes: int) -> dict:
+        url = self.expert_cache_url(name)
+        if not url:
+            raise RuntimeError("adaptive worker has no expert-cache endpoint")
+        timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_connect=5, sock_read=None)
+        async with self.session.post(
+            url,
+            headers=self.headers,
+            json={"capacity_bytes": capacity_bytes},
+            timeout=timeout,
+        ) as response:
+            try:
+                body = decode_json(await read_limited(response, 64 * 1024, check_status=False))
+            except (ValueError, UnicodeDecodeError) as error:
+                raise RuntimeError("invalid expert-cache resize response") from error
+            if response.status != 200 or not isinstance(body, dict):
+                raise RuntimeError("expert-cache resize was not accepted")
+        info = await self.expert_cache_info(name)
+        if info["capacity_bytes"] > capacity_bytes:
+            raise RuntimeError("expert-cache resize exceeded its requested capacity")
+        return info
+
     async def generation(self, name: str) -> str | None:
         units = self.resources[name].get("units", [])
         if not units:
@@ -335,6 +390,8 @@ class Runtime:
                 async with self.session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=2)) as response:
                     if response.status != 200:
                         return False
+            if self.resources[name].get("adaptive_cache"):
+                await self.expert_cache_info(name)
             if spec.get("nodes_url"):
                 nodes_url = spec["nodes_url"].rstrip("/")
                 for node in spec["required_nodes"]:
@@ -348,7 +405,7 @@ class Runtime:
                     if not isinstance(node_info, dict) or not isinstance(node_info.get(node), dict):
                         return False
             return True
-        except (aiohttp.ClientError, TimeoutError, ValueError, TypeError):
+        except (aiohttp.ClientError, TimeoutError, ValueError, TypeError, RuntimeError):
             return False
 
     async def busy(self, name: str) -> bool | None:
@@ -444,6 +501,13 @@ class Scheduler:
         self.states: dict[str, str] = {}
         self.last_used: dict[str, float] = {}
         self.active: dict[str, int] = {}
+        self.cache_allocations: dict[str, int] = {
+            name: spec["adaptive_cache"]["minimum_capacity_bytes"]
+            for name, spec in resources.items()
+            if isinstance(spec.get("adaptive_cache"), dict)
+        }
+        self.cache_unready: set[str] = set()
+        self.cache_rebalance_tasks: set[asyncio.Task] = set()
         self.transition = asyncio.Lock()
         self.execution = SerializedExecution(lock_dir)
         self.recovery: dict[str, dict] = {}
@@ -453,9 +517,263 @@ class Scheduler:
         self.states = await self.runtime.snapshot()
         for name in self.states:
             self.last_used.setdefault(name, self.clock())
+        for name, spec in self.resources.items():
+            if not spec.get("adaptive_cache"):
+                continue
+            if name not in self.states:
+                self.cache_allocations.pop(name, None)
+                self.cache_unready.discard(name)
+                continue
+            try:
+                info = await self.runtime.expert_cache_info(name)
+            except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError):
+                # If live cache ownership cannot be proven, reserve its full
+                # profile and refuse to transfer that memory to another model.
+                self.cache_allocations[name] = spec["adaptive_cache"]["maximum_capacity_bytes"]
+                self.cache_unready.add(name)
+            else:
+                self.cache_allocations[name] = info["capacity_bytes"]
+                self.cache_unready.discard(name)
 
     def reserved(self) -> Memory:
-        return sum((footprint(self.resources[name]) for name in self.states), Memory(0, 0))
+        return sum((self.reservation(name) for name in self.states), Memory(0, 0))
+
+    def reservation(self, name: str, *, include_transient: bool | None = None) -> Memory:
+        """Current reservation; adapter-only workers keep their legacy full peak."""
+        spec = self.resources[name]
+        profile = spec.get("memory")
+        if not isinstance(profile, dict):
+            return Memory(spec["gpu_bytes"], spec["host_bytes"])
+        active = include_transient
+        if active is None:
+            active = self.active.get(name, 0) > 0 or not is_openai_worker(spec)
+        mandatory = profile["mandatory"]
+        result = Memory(mandatory["gpu_bytes"], mandatory["host_bytes"])
+        adaptive = spec.get("adaptive_cache")
+        if isinstance(adaptive, dict):
+            minimum = adaptive["minimum_capacity_bytes"]
+            capacity = self.cache_allocations.get(name, adaptive["maximum_capacity_bytes"])
+            delta = math.ceil(max(0, capacity - minimum) * adaptive["reservation_multiplier"])
+            result += Memory(delta, delta)
+        else:
+            reclaimable = profile["reclaimable"]
+            result += Memory(reclaimable["gpu_bytes"], reclaimable["host_bytes"])
+        if active:
+            peak = profile["transient_peak"]
+            result += Memory(peak["gpu_bytes"], peak["host_bytes"])
+        return result
+
+    def minimum_reservation(self, name: str, *, active: bool) -> Memory:
+        """The admission floor; adaptive profiles include their minimum cache in mandatory."""
+        spec = self.resources[name]
+        profile = spec.get("memory")
+        if not isinstance(profile, dict):
+            return Memory(spec["gpu_bytes"], spec["host_bytes"])
+        mandatory = profile["mandatory"]
+        result = Memory(mandatory["gpu_bytes"], mandatory["host_bytes"])
+        if not spec.get("adaptive_cache"):
+            reclaimable = profile["reclaimable"]
+            result += Memory(reclaimable["gpu_bytes"], reclaimable["host_bytes"])
+        if active:
+            peak = profile["transient_peak"]
+            result += Memory(peak["gpu_bytes"], peak["host_bytes"])
+        return result
+
+    async def _rebalance_caches(
+        self,
+        incoming: str | None,
+        capacity: Memory,
+        unknown: Memory,
+    ) -> bool:
+        """Water-fill cache capacity equally across workers with current demand."""
+        adaptive_names = [
+            name for name in self.states
+            if self.resources[name].get("adaptive_cache")
+        ]
+        if (
+            incoming is not None
+            and incoming not in self.states
+            and self.resources[incoming].get("adaptive_cache")
+        ):
+            adaptive_names.append(incoming)
+        if not adaptive_names:
+            return True
+        adjustable_names = [name for name in adaptive_names if name not in self.cache_unready]
+        demand_names = [
+            name for name in adjustable_names
+            if self.active.get(name, 0) > 0 or name == incoming
+        ]
+        # With no in-flight request, keep the most recently used resident MoE
+        # warm. A later request to another model will rebalance around it.
+        if not demand_names and incoming is None:
+            warm = [name for name in adjustable_names if name in self.states]
+            if warm:
+                demand_names = [max(warm, key=lambda name: (self.last_used.get(name, 0), name))]
+
+        def fixed_reservation() -> Memory:
+            fixed = Memory(0, 0)
+            for name in self.states:
+                spec = self.resources[name]
+                profile = spec.get("memory")
+                if not isinstance(profile, dict):
+                    fixed += Memory(spec["gpu_bytes"], spec["host_bytes"])
+                    continue
+                mandatory = profile["mandatory"]
+                fixed += Memory(mandatory["gpu_bytes"], mandatory["host_bytes"])
+                adaptive = spec.get("adaptive_cache")
+                if isinstance(adaptive, dict) and name not in adjustable_names:
+                    minimum = adaptive["minimum_capacity_bytes"]
+                    allocated = self.cache_allocations.get(name, adaptive["maximum_capacity_bytes"])
+                    extra = math.ceil(max(0, allocated - minimum) * adaptive["reservation_multiplier"])
+                    fixed += Memory(extra, extra)
+                elif not adaptive:
+                    reclaimable = profile["reclaimable"]
+                    fixed += Memory(reclaimable["gpu_bytes"], reclaimable["host_bytes"])
+                if (
+                    self.active.get(name, 0) > 0
+                    or name == incoming
+                    or not is_openai_worker(spec)
+                ):
+                    peak = profile["transient_peak"]
+                    fixed += Memory(peak["gpu_bytes"], peak["host_bytes"])
+            if incoming is not None and incoming not in self.states:
+                fixed += self.minimum_reservation(incoming, active=True)
+            return fixed
+
+        def targets_for(extra_bytes: int) -> dict[str, int]:
+            targets = {
+                name: self.resources[name]["adaptive_cache"]["minimum_capacity_bytes"]
+                for name in adjustable_names
+                if name not in demand_names
+            }
+            remaining = extra_bytes
+            uncapped = list(demand_names)
+            while uncapped:
+                share = remaining // len(uncapped)
+                capped = []
+                for name in uncapped:
+                    limits = self.resources[name]["adaptive_cache"]
+                    minimum = limits["minimum_capacity_bytes"]
+                    maximum_extra = math.ceil(
+                        (limits["maximum_capacity_bytes"] - minimum)
+                        * limits["reservation_multiplier"]
+                    )
+                    if maximum_extra <= share:
+                        targets[name] = limits["maximum_capacity_bytes"]
+                        remaining -= maximum_extra
+                        capped.append(name)
+                if not capped:
+                    for name in uncapped:
+                        limits = self.resources[name]["adaptive_cache"]
+                        targets[name] = limits["minimum_capacity_bytes"] + math.floor(
+                            share / limits["reservation_multiplier"]
+                        )
+                    break
+                uncapped = [name for name in uncapped if name not in capped]
+            return targets
+
+        async def resize(name: str, target: int) -> tuple[bool, Memory, Memory]:
+            task = asyncio.create_task(self.runtime.resize_expert_cache(name, target))
+            try:
+                info = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # The worker may finish a safe-point resize after its admission
+                # caller disconnects. Drain it, then reconcile physical cache
+                # ownership before allowing cancellation to release the lease.
+                self.cache_allocations[name] = self.resources[name]["adaptive_cache"]["maximum_capacity_bytes"]
+                self.cache_unready.add(name)
+                try:
+                    info = await finish_shielded(task)
+                except asyncio.CancelledError:
+                    try:
+                        info = await self.runtime.expert_cache_info(name)
+                    except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError):
+                        info = None
+                except Exception:
+                    try:
+                        info = await self.runtime.expert_cache_info(name)
+                    except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError):
+                        info = None
+                if info is not None:
+                    self.cache_allocations[name] = info["capacity_bytes"]
+                    self.cache_unready.discard(name)
+                raise
+            except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError) as error:
+                self.cache_allocations[name] = self.resources[name]["adaptive_cache"]["maximum_capacity_bytes"]
+                self.cache_unready.add(name)
+                LOG.error("cache rebalance failed model=%s target_bytes=%d reason=%s", name, target, type(error).__name__)
+                raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed") from error
+            self.cache_allocations[name] = info["capacity_bytes"]
+            self.cache_unready.discard(name)
+            capacity_now, usage_now = self.runtime.capacity()
+            reserved_now = self.reserved()
+            unknown_now = Memory(
+                max(0, usage_now.gpu - reserved_now.gpu),
+                max(0, usage_now.host - reserved_now.host),
+            )
+            return (reserved_now + unknown_now).fits(capacity_now), capacity_now, unknown_now
+
+        # Shrink, read actual usage again, and recompute before any expansion.
+        # A freed logical cache that the allocator still owns stays in `unknown`
+        # and cannot be spent on another worker.
+        for _ in range(32):
+            fixed = fixed_reservation()
+            available = capacity - fixed - unknown
+            minimum_fits = available.gpu >= 0 and available.host >= 0
+            targets = targets_for(max(0, min(available.gpu, available.host)))
+            shrinking = [
+                name for name in adjustable_names
+                if name in self.states
+                and self.cache_allocations.get(name, targets[name]) > targets[name]
+            ]
+            if not shrinking:
+                # Recheck the current physical budget before making any growth.
+                capacity_now, usage_now = self.runtime.capacity()
+                reserved_now = self.reserved()
+                unknown = Memory(
+                    max(0, usage_now.gpu - reserved_now.gpu),
+                    max(0, usage_now.host - reserved_now.host),
+                )
+                fixed = fixed_reservation()
+                available = capacity_now - fixed - unknown
+                minimum_fits = available.gpu >= 0 and available.host >= 0
+                targets = targets_for(max(0, min(available.gpu, available.host)))
+                shrinking = [
+                    name for name in adjustable_names
+                    if name in self.states
+                    and self.cache_allocations.get(name, targets[name]) > targets[name]
+                ]
+                if shrinking:
+                    capacity, usage = capacity_now, usage_now
+                    continue
+                planned_extra = Memory(0, 0)
+                for name in adjustable_names:
+                    limits = self.resources[name]["adaptive_cache"]
+                    extra = math.ceil(
+                        max(0, targets[name] - limits["minimum_capacity_bytes"])
+                        * limits["reservation_multiplier"]
+                    )
+                    planned_extra += Memory(extra, extra)
+                if not (fixed + unknown + planned_extra).fits(capacity_now):
+                    return False
+                for name in sorted(targets):
+                    if name not in self.states or name in self.cache_unready:
+                        continue
+                    current = self.cache_allocations.get(name, targets[name])
+                    if targets[name] <= current:
+                        continue
+                    fits, capacity, unknown = await resize(name, targets[name])
+                    if not fits:
+                        return False
+                return minimum_fits
+
+            for name in sorted(shrinking):
+                # A single shrink can leave the physical pool temporarily over
+                # budget. Keep releasing every planned cache before deciding
+                # whether the transfer can fit; the next pass will recompute
+                # capacity from actual usage and refuse any unsafe growth.
+                _fits, capacity, unknown = await resize(name, targets[name])
+        return False
 
     async def admit(self, name: str, *, wait_for_idle: bool = False, wait_for_capacity: bool = False) -> None:
         if name not in self.resources:
@@ -510,6 +828,11 @@ class Scheduler:
         if wait_for_idle:
             await self._wait_for_idle_worker(name)
         if self.transition.locked():
+            if self.resources[name].get("adaptive_cache") or any(
+                self.resources[resident].get("adaptive_cache")
+                for resident in self.states
+            ):
+                raise AdmissionError(503, "another model is changing shared expert-cache reservations", "model_transition")
             # Existing warm work can proceed while another model loads. Probe
             # directly so a crashed warm model cannot autoload around the budget.
             if self.states.get(name) == "ready" and await self.runtime.ready(name):
@@ -538,9 +861,13 @@ class Scheduler:
                     if busy is not False:
                         raise AdmissionError(429 if busy is True else 503, "backend work is still active" if busy is True else "backend activity is unknown", "model_busy" if busy is True else "backend_health_uncertain")
                 capacity, usage = self.runtime.capacity()
-                required = footprint(self.resources[name])
+                required = self.minimum_reservation(name, active=True)
                 if not required.fits(capacity):
                     raise AdmissionError(503, "model reservation exceeds this host's memory budget", "model_exceeds_budget", retry_after=None)
+                reserved = self.reserved()
+                unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
+                await self._rebalance_caches(name, capacity, unknown)
+                capacity, usage = self.runtime.capacity()
                 reserved = self.reserved()
                 unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
                 planned = reserved + unknown + (Memory(0, 0) if name in self.states else required)
@@ -555,13 +882,15 @@ class Scheduler:
                         lock.close()
                         continue
                     victim_locks.append((victim, lock))
-                    planned = planned - footprint(self.resources[victim])
+                    planned = planned - self.reservation(victim)
                 if not planned.fits(capacity):
                     raise AdmissionError(503, "insufficient memory while other models are in use; retry later", "capacity_unavailable")
                 for victim, _ in victim_locks:
                     LOG.info("evict model=%s last_request_age_s=%.1f", victim, self.clock() - self.last_used[victim])
                     await asyncio.wait_for(self.runtime.stop(victim), self.policy["stop_timeout_s"])
                     self.states.pop(victim, None)
+                    self.cache_allocations.pop(victim, None)
+                    self.cache_unready.discard(victim)
                 # Recheck real allocations after confirmed stops. Unknown GPU
                 # users and delayed frees must never become imaginary capacity.
                 capacity, usage = self.runtime.capacity()
@@ -572,9 +901,22 @@ class Scheduler:
                 if name not in self.states:
                     loading = True
                     self.states[name] = "starting"
+                    if self.resources[name].get("adaptive_cache"):
+                        self.cache_allocations[name] = self.resources[name]["adaptive_cache"]["minimum_capacity_bytes"]
                     LOG.info("load model=%s gpu_mib=%.0f host_mib=%.0f context=%s", name, required.gpu / MIB, required.host / MIB, self.resources[name].get("context_tokens", 0))
                     await self.runtime.start(name)
                     self.states[name] = "ready"
+                if self.resources[name].get("adaptive_cache"):
+                    capacity, usage = self.runtime.capacity()
+                    reserved = self.reserved()
+                    unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
+                    if not await self._rebalance_caches(name, capacity, unknown):
+                        raise AdmissionError(503, "expert-cache allocation could not be safely rebalanced", "capacity_unavailable")
+                    capacity, usage = self.runtime.capacity()
+                    reserved = self.reserved()
+                    unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
+                    if not (reserved + unknown).fits(capacity):
+                        raise AdmissionError(503, "memory is not yet available after expert-cache expansion", "capacity_unavailable")
                 self.last_used[name] = self.clock()
                 self.recovery.pop(name, None)
             except asyncio.CancelledError:
@@ -589,6 +931,8 @@ class Scheduler:
                 LOG.error("admission failed model=%s reason=%s", name, type(error).__name__)
                 raise AdmissionError(503, "model process could not become ready", "model_load_failed") from error
             except AdmissionError:
+                if loading:
+                    await self._stop_failed_load(name)
                 raise
             except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError) as error:
                 if loading:
@@ -603,11 +947,54 @@ class Scheduler:
         try:
             await asyncio.wait_for(self.runtime.stop(name), self.policy["stop_timeout_s"])
             self.states.pop(name, None)
+            self.cache_allocations.pop(name, None)
+            self.cache_unready.discard(name)
         except Exception:
             self.states[name] = "quarantined"
         failure = self.recovery.setdefault(name, {})
         attempts = failure.get("attempts", 0) + 1
         failure.update(attempts=attempts, state="quarantined" if name in self.states else "cooling-down", last_failure="model_load_failed", next_retry=self.clock() + min(60, 5 * 2 ** min(attempts - 1, 4)))
+
+    async def _rebalance_after_request(self) -> None:
+        """Return unused expert slots after demand falls, outside the request path."""
+        operation = ResourceLock(self.lock_dir.parent, "operations.lock")
+        if not operation.acquire():
+            return
+        try:
+            if any(
+                (self.lock_dir.parent / marker).exists()
+                or (self.lock_dir.parent / marker).is_symlink()
+                for marker in ("maintenance.json", "comfyui-restore.json")
+            ):
+                return
+            async with self.transition:
+                await self.refresh()
+                if not any(
+                    self.resources[name].get("adaptive_cache")
+                    for name in self.states
+                ):
+                    return
+                capacity, usage = self.runtime.capacity()
+                reserved = self.reserved()
+                unknown = Memory(
+                    max(0, usage.gpu - reserved.gpu),
+                    max(0, usage.host - reserved.host),
+                )
+                if not await self._rebalance_caches(None, capacity, unknown):
+                    LOG.warning("post-request expert-cache rebalance did not fit current capacity")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            LOG.warning("post-request expert-cache rebalance deferred reason=%s", type(error).__name__)
+        finally:
+            operation.close()
+
+    def _schedule_cache_rebalance(self) -> None:
+        if not any(spec.get("adaptive_cache") for spec in self.resources.values()):
+            return
+        task = asyncio.create_task(self._rebalance_after_request())
+        self.cache_rebalance_tasks.add(task)
+        task.add_done_callback(self.cache_rebalance_tasks.discard)
 
     @asynccontextmanager
     async def request(self, name: str):
@@ -619,55 +1006,61 @@ class Scheduler:
             if spec.get("exclusive_execution") is True
             else self.execution.hold_worker(name)
         )
-        async with execution_admission as execution:
-            limit = self.resources[name].get(
-                "concurrency_limit", self.resources[name].get("concurrency", 1)
-            )
-            if self.active.get(name, 0) >= limit:
-                raise AdmissionError(429, "model is serving its maximum concurrent requests", "model_busy")
-            lock = ResourceLock(self.lock_dir, name)
-            if not lock.acquire():
-                raise AdmissionError(503, "model is being evicted; retry shortly", "model_transition")
-            self.active[name] = self.active.get(name, 0) + 1
-            owned = None
-            admitted = False
-            try:
-                owned = OwnedRequest(self.lock_dir.parent / "requests", name).begin()
-                # Finish admission cleanup even if its client disappears during a
-                # slow load; otherwise an unaccounted process could keep loading.
-                task = asyncio.create_task(self.admit(name, wait_for_idle=True, wait_for_capacity=True))
+        rebalance_after = False
+        try:
+            async with execution_admission as execution:
+                limit = self.resources[name].get(
+                    "concurrency_limit", self.resources[name].get("concurrency", 1)
+                )
+                if self.active.get(name, 0) >= limit:
+                    raise AdmissionError(429, "model is serving its maximum concurrent requests", "model_busy")
+                lock = ResourceLock(self.lock_dir, name)
+                if not lock.acquire():
+                    raise AdmissionError(503, "model is being evicted; retry shortly", "model_transition")
+                self.active[name] = self.active.get(name, 0) + 1
+                owned = None
+                admitted = False
                 try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    task.cancel()
+                    owned = OwnedRequest(self.lock_dir.parent / "requests", name).begin()
+                    # Finish admission cleanup even if its client disappears during a
+                    # slow load; otherwise an unaccounted process could keep loading.
+                    task = asyncio.create_task(self.admit(name, wait_for_idle=True, wait_for_capacity=True))
                     try:
-                        await finish_shielded(task)
+                        await asyncio.shield(task)
                     except asyncio.CancelledError:
-                        pass
+                        task.cancel()
+                        try:
+                            await finish_shielded(task)
+                        except asyncio.CancelledError:
+                            pass
+                        raise
+                    admitted = True
+                    execution.ready()
+                    yield
+                except BaseException as error:
+                    if owned is not None:
+                        if admitted:
+                            owned.detach()
+                            if isinstance(error, asyncio.CancelledError):
+                                await finish_shielded(
+                                    asyncio.create_task(self._wait_until_idle(name))
+                                )
+                        else:
+                            # Rejected admission never transferred work to this
+                            # request. Keeping its record would grow diagnostics and
+                            # disk use during ordinary capacity pressure.
+                            owned.close()
                     raise
-                admitted = True
-                execution.ready()
-                yield
-            except BaseException as error:
-                if owned is not None:
-                    if admitted:
-                        owned.detach()
-                        if isinstance(error, asyncio.CancelledError):
-                            await finish_shielded(
-                                asyncio.create_task(self._wait_until_idle(name))
-                            )
-                    else:
-                        # Rejected admission never transferred work to this
-                        # request. Keeping its record would grow diagnostics and
-                        # disk use during ordinary capacity pressure.
+                else:
+                    if owned is not None:
                         owned.close()
-                raise
-            else:
-                if owned is not None:
-                    owned.close()
-            finally:
-                self.active[name] -= 1
-                lock.close()
+                finally:
+                    self.active[name] -= 1
+                    lock.close()
+                    rebalance_after = True
+        finally:
+            if rebalance_after:
+                self._schedule_cache_rebalance()
 
     async def _wait_until_idle(self, name: str) -> None:
         """Keep this worker's root and eviction lease until cancelled work drains."""
@@ -775,7 +1168,10 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 yield
             finally:
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                background = list(scheduler.cache_rebalance_tasks)
+                for rebalance in background:
+                    rebalance.cancel()
+                await asyncio.gather(task, *background, return_exceptions=True)
     public.cleanup_ctx.append(lifecycle)
 
     async def health(_: web.Request):

@@ -572,6 +572,17 @@ class DeepSeekEngine:
         if os.environ.get("DS4_REQUEST_PEAK_MIB") != str(service.get("request_peak_mib")):
             raise RuntimeError("systemd request peak does not match scheduler.json")
         self.cache_capacity = _positive_integer(service.get("expert_cache_mib"), "expert_cache_mib") * 1024**2
+        self.cache_min_capacity = self.cache_capacity
+        self.cache_max_capacity = _positive_integer(
+            service.get("expert_cache_max_mib"), "expert_cache_max_mib"
+        ) * 1024**2
+        if self.cache_max_capacity < self.cache_min_capacity:
+            raise RuntimeError("DeepSeek maximum expert cache is below its minimum")
+        self._cache_resize_condition = threading.Condition()
+        self._cache_resize_sequence = 0
+        self._cache_resize_completed = 0
+        self._cache_resize_target: int | None = None
+        self._cache_resize_error: BaseException | None = None
         self.checkpoint_root = Path(service["artifact_root"]).resolve(strict=True)
         self.inference_dir = Path(service["inference_dir"]).resolve(strict=True)
         self.device = torch.device(device_name)
@@ -771,7 +782,13 @@ class DeepSeekEngine:
                 install_chunked_engram_forward(self.model, sequence_tile_rows=256)
             )
             self.installation = self._contexts.enter_context(
-                install_cached_moe(self.model, self.cache, self.reference["linear"], fence=self._request_fence)
+                install_cached_moe(
+                    self.model,
+                    self.cache,
+                    self.reference["linear"],
+                    fence=self._request_fence,
+                    after_moe=self._apply_pending_cache_resize,
+                )
             )
             self.dense_state = dense_state
         except BaseException:
@@ -813,7 +830,91 @@ class DeepSeekEngine:
     def _request_release_allocator(self) -> None:
         if not getattr(self, "_request_active", threading.Event()).is_set():
             raise RuntimeError("DeepSeek request allocator release escaped its reservation")
+        self.torch.cuda.synchronize(self.device)
         self._release_allocator()
+
+    def _cache_info(self) -> dict:
+        stats = self.cache.stats
+        return {
+            "minimum_capacity_bytes": self.cache_min_capacity,
+            "maximum_capacity_bytes": self.cache_max_capacity,
+            "capacity_bytes": stats.capacity_bytes,
+            "resident_bytes": stats.resident_bytes,
+            "loading_bytes": stats.loading_bytes,
+            "releasing_bytes": stats.releasing_bytes,
+            "leased_bytes": stats.leased_bytes,
+            "pending_loads": stats.pending_loads,
+            "pending_backing_release": stats.pending_backing_release,
+            "quarantined": stats.quarantined,
+        }
+
+    def _apply_pending_cache_resize(self) -> None:
+        """Apply a requested cache budget only after the MoE block has fenced."""
+        with self._cache_resize_condition:
+            target = self._cache_resize_target
+            sequence = self._cache_resize_sequence
+        if target is None:
+            return
+        error = None
+        try:
+            self.cache.resize_when_idle(target, after_drop=self._request_release_allocator)
+            stats = self.cache.stats
+            if stats.capacity_bytes != target or not stats.within_capacity:
+                raise RuntimeError("DeepSeek expert cache did not reach the requested capacity")
+            self.cache_capacity = target
+        except BaseException as exc:
+            error = exc
+        with self._cache_resize_condition:
+            if sequence == self._cache_resize_sequence:
+                self._cache_resize_error = error
+                self._cache_resize_completed = sequence
+                self._cache_resize_target = None
+                self._cache_resize_condition.notify_all()
+        if error is not None:
+            raise error
+
+    def _request_cache_resize(self, capacity_bytes: int, timeout: float = 120.0) -> dict:
+        if type(capacity_bytes) is not int or not self.cache_min_capacity <= capacity_bytes <= self.cache_max_capacity:
+            raise ValueError("expert cache capacity is outside the configured limits")
+        if self._closed:
+            raise RuntimeError("DeepSeek worker is shutting down")
+        if capacity_bytes == self.cache.stats.capacity_bytes:
+            return self._cache_info()
+        with self._cache_resize_condition:
+            self._cache_resize_sequence += 1
+            sequence = self._cache_resize_sequence
+            self._cache_resize_target = capacity_bytes
+            self._cache_resize_error = None
+            self._cache_resize_condition.notify_all()
+            deadline = time.monotonic() + timeout
+            while self._cache_resize_completed < sequence:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if self._cache_resize_sequence == sequence:
+                        self._cache_resize_target = None
+                    raise TimeoutError("DeepSeek did not reach a safe expert-cache resize point")
+                self._cache_resize_condition.wait(remaining)
+            error = self._cache_resize_error
+        if error is not None:
+            raise RuntimeError("DeepSeek expert-cache resize failed") from error
+        return self._cache_info()
+
+    def _resize_idle_cache(self, capacity_bytes: int) -> dict:
+        """Resize with a short worker lease while no request owns the model."""
+        if self._request_active.is_set() or self._active_requests:
+            raise RuntimeError("DeepSeek cache is not idle")
+        self.memory["active_leases"] += 1
+        self._request_active.set()
+        try:
+            self._request_fence()
+            self.cache.resize_when_idle(capacity_bytes, after_drop=self._request_release_allocator)
+            self.cache_capacity = capacity_bytes
+            return self._cache_info()
+        finally:
+            self._request_active.clear()
+            self.memory["active_leases"] -= 1
+            if self.memory["active_leases"] < 0:
+                raise RuntimeError("DeepSeek cache resize lease count underflow")
 
     def _request_reservation(self):
         engine = self
@@ -975,6 +1076,7 @@ class DeepSeekEngine:
                     reset_runtime_references=self.reset_runtime_references,
                     release_allocator=self._request_release_allocator,
                 )
+                self._apply_pending_cache_resize()
         if result is None:
             raise RuntimeError("DeepSeek generation produced no result")
         return result
@@ -1258,11 +1360,40 @@ def create_app(engine: DeepSeekEngine, api_key: str) -> web.Application:
     async def slots(_request: web.Request):
         return web.json_response([{"id": 0, "is_processing": engine._active_requests > 0}])
 
+    async def expert_cache(_request: web.Request):
+        return web.json_response(engine._cache_info())
+
+    async def resize_expert_cache(request: web.Request):
+        try:
+            body = await request.json(loads=json.loads)
+        except (json.JSONDecodeError, UnicodeDecodeError, web.HTTPException):
+            return _error(400, "invalid_request", "request body must be valid JSON")
+        if not isinstance(body, dict) or set(body) != {"capacity_bytes"}:
+            return _error(400, "invalid_request", "expected capacity_bytes")
+        capacity = body["capacity_bytes"]
+        if type(capacity) is not int or not engine.cache_min_capacity <= capacity <= engine.cache_max_capacity:
+            return _error(400, "invalid_request", "capacity_bytes is outside the configured limits")
+        try:
+            if engine._request_guard.locked():
+                info = await asyncio.to_thread(engine._request_cache_resize, capacity)
+            else:
+                async with engine._request_guard:
+                    if engine._active_requests:
+                        info = await asyncio.to_thread(engine._request_cache_resize, capacity)
+                    else:
+                        info = await asyncio.to_thread(engine._resize_idle_cache, capacity)
+        except (RuntimeError, TimeoutError, ValueError) as error:
+            LOG.warning("expert cache resize rejected capacity_bytes=%s reason=%s", capacity, type(error).__name__)
+            return _error(503, "expert_cache_resize_failed", "expert cache could not safely reach the requested capacity")
+        return web.json_response(info)
+
     async def shutdown(_app: web.Application):
         await engine.close()
 
     app.router.add_get("/health", health)
     app.router.add_get("/slots", slots)
+    app.router.add_get("/expert-cache", expert_cache)
+    app.router.add_post("/expert-cache", resize_expert_cache)
     app.router.add_post("/v1/chat/completions", engine.chat)
     app.on_cleanup.append(shutdown)
     return app
