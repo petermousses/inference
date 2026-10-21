@@ -275,8 +275,8 @@ def parse_gguf(path: Path) -> dict:
             )
 
         header_end = reader.tell()
-        data_start = ((header_end + alignment - 1) // alignment) * alignment
-        if data_start > file_size:
+        data_start = ((header_end + alignment - 1) // alignment) * alignment if tensor_count else header_end
+        if tensor_count and data_start > file_size:
             raise ValueError("GGUF aligned tensor data section starts past end of file")
 
     occupied = []
@@ -604,12 +604,15 @@ def build_store(
             verified = True
 
         suffix = resolved.suffix.lower()
-        if suffix == ".gguf":
-            layout = parse_gguf(resolved)
-        elif suffix == ".safetensors":
-            layout = parse_safetensors(resolved)
-        else:
-            layout = {"container": "opaque", "tensor_layout": "opaque", "tensors": []}
+        try:
+            if suffix == ".gguf":
+                layout = parse_gguf(resolved)
+            elif suffix == ".safetensors":
+                layout = parse_safetensors(resolved)
+            else:
+                layout = {"container": "opaque", "tensor_layout": "opaque", "tensors": []}
+        except ValueError as error:
+            raise ValueError(f"invalid {suffix or 'opaque'} artifact {relative}: {error}") from error
         tensors = layout["tensors"]
         total_size += size_bytes
         tensor_count += len(tensors)

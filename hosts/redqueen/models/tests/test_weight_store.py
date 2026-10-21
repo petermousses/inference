@@ -26,7 +26,9 @@ def gguf_string(value: str) -> bytes:
     return struct.pack("<Q", len(encoded)) + encoded
 
 
-def make_gguf(*, tensor_type: int = 0, alignment: int = 64, tensor_offset: int = 0) -> bytes:
+def make_gguf(
+    *, tensor_type: int = 0, alignment: int = 64, tensor_offset: int = 0, include_tensor: bool = True
+) -> bytes:
     metadata = b"".join(
         (
             gguf_string("general.architecture")
@@ -42,11 +44,15 @@ def make_gguf(*, tensor_type: int = 0, alignment: int = 64, tensor_offset: int =
             + gguf_string("beta"),
         )
     )
-    tensor_info = (
-        gguf_string("token_embd.weight")
-        + struct.pack("<IQQIQ", 2, 2, 2, tensor_type, tensor_offset)
-    )
-    header = b"GGUF" + struct.pack("<IQQ", 3, 1, 4) + metadata + tensor_info
+    tensor_info = b""
+    if include_tensor:
+        tensor_info = (
+            gguf_string("token_embd.weight")
+            + struct.pack("<IQQIQ", 2, 2, 2, tensor_type, tensor_offset)
+        )
+    header = b"GGUF" + struct.pack("<IQQ", 3, int(include_tensor), 4) + metadata + tensor_info
+    if not include_tensor:
+        return header
     data_start = (len(header) + alignment - 1) // alignment * alignment
     return header + (b"\0" * (data_start - len(header))) + bytes(range(16))
 
@@ -132,6 +138,18 @@ class TensorHeaderTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "outside|span"):
                 weight_store.parse_gguf(path)
+
+    def test_gguf_accepts_metadata_only_shard_without_alignment_padding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "metadata-only.gguf"
+            data = make_gguf(include_tensor=False)
+            self.assertNotEqual(len(data) % 64, 0)
+            path.write_bytes(data)
+
+            result = weight_store.parse_gguf(path)
+
+            self.assertEqual(result["tensors"], [])
+            self.assertEqual(result["data_start"], len(data))
 
 
 class WeightStoreTests(unittest.TestCase):
