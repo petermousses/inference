@@ -1,6 +1,6 @@
 # inference
 
-source for redqueen's inference runtime. the checkout on redqueen is `/srv/ai/inference`.
+source for redqueen's inference runtime. the checkout on redqueen is `/srv/ai/inference`. connect as `ai` with `ssh -i ~/.ssh/redqueen ai@redqueen.mousses.xyz`; pull and test on redqueen only from the `develop` branch.
 
 `hosts/redqueen` tracks host-owned code, configuration, pinned versions, model metadata and integrity manifests, and the ComfyUI workflows used by the deployment. run `hosts/redqueen/link-runtime.sh` as `ai` to make live user-owned host paths symlinks into this checkout and reload user units; it does not restart services. root-owned firewall files can be linked separately with `sudo hosts/redqueen/link-system-runtime.sh`.
 

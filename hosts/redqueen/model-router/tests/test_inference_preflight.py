@@ -155,6 +155,12 @@ class InferencePreflightTests(unittest.TestCase):
 
 
 class PrefillBenchmarkTests(unittest.TestCase):
+    def test_cli_defaults_to_redqueen_scheduler_listener(self):
+        with patch.object(sys, "argv", ["prefill-benchmark.py", "cases.jsonl", "--label", "test"]):
+            args = benchmark.parse_args()
+
+        self.assertEqual(args.url, "http://10.9.20.242:8081/v1/chat/completions")
+
     def test_reads_cases_lazily_and_prepares_chat_request(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "cases.jsonl"
