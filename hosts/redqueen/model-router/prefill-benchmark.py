@@ -191,7 +191,7 @@ def prepare_request(request_data: dict, *, model: str | None, include_usage: boo
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cases", type=Path, help="JSONL with one OpenAI chat request per line")
-    parser.add_argument("--url", default="http://127.0.0.1:8081/v1/chat/completions")
+    parser.add_argument("--url", default="http://10.9.20.242:8081/v1/chat/completions")
     parser.add_argument("--model", help="override the model in every request")
     parser.add_argument("--label", required=True, help="short engine/configuration label for pairing runs")
     parser.add_argument("--api-key-env", default="QWEN_API_KEY", help="environment variable containing the bearer key")
