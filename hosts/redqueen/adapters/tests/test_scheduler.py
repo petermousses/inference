@@ -22,7 +22,7 @@ from redqueen_adapters.jev_api import JevSettings, create_jev_app
 from redqueen_adapters.memory_profile import MIB, build_profiles, file_signature, fingerprint_artifacts, memory_contract, memory_rows, verify_profiles, weight_paths
 from redqueen_adapters.ownership import OwnedRequest, records
 from redqueen_adapters import scheduler_api
-from redqueen_adapters.scheduler_api import Memory, Runtime, Scheduler, create_apps, footprint
+from redqueen_adapters.scheduler_api import ExpertCacheResizeError, Memory, Runtime, Scheduler, create_apps, footprint
 from redqueen_adapters.scheduler_client import (
     ResourceLock,
     SchedulerClient,
@@ -118,6 +118,7 @@ class FakeAdaptiveRuntime(FakeRuntime):
         self.scheduler = None
         self.sticky_cache_backing = False
         self.physical_cache_capacities = dict(self.cache_capacities)
+        self.reject_cache_above: dict[str, int] = {}
 
     async def expert_cache_info(self, name):
         limits = self.resources[name]["adaptive_cache"]
@@ -130,6 +131,9 @@ class FakeAdaptiveRuntime(FakeRuntime):
 
     async def resize_expert_cache(self, name, capacity_bytes):
         self.resize_calls.append((name, capacity_bytes))
+        reject_above = self.reject_cache_above.get(name)
+        if reject_above is not None and capacity_bytes > reject_above:
+            raise ExpertCacheResizeError(503)
         self.cache_capacities[name] = capacity_bytes
         if not self.sticky_cache_backing or capacity_bytes > self.physical_cache_capacities[name]:
             self.physical_cache_capacities[name] = capacity_bytes
@@ -228,6 +232,50 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(deepseek_task, *([qwen_task] if qwen_task else []), return_exceptions=True)
             if scheduler.cache_rebalance_tasks:
                 await asyncio.gather(*list(scheduler.cache_rebalance_tasks), return_exceptions=True)
+
+    async def test_rejected_cache_share_falls_back_to_largest_verified_allocation(self):
+        resources = {name: adaptive_resource() for name in ("deepseek", "qwen")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=150)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "adaptive-fallback-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"deepseek": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        scheduler.active = {"deepseek": 1}
+        runtime.cache_capacities["deepseek"] = 130
+        runtime.physical_cache_capacities["deepseek"] = 130
+        scheduler.cache_allocations["deepseek"] = 130
+        runtime.reject_cache_above["deepseek"] = 52
+
+        self.assertTrue(await scheduler._rebalance_caches("qwen", runtime.limit, Memory(0, 0)))
+
+        self.assertEqual(runtime.cache_capacities["deepseek"], 52)
+        self.assertEqual(scheduler.cache_fallback_caps["deepseek"], 52)
+        self.assertEqual(
+            runtime.resize_calls,
+            [
+                ("deepseek", 55),
+                ("deepseek", 10),
+                ("deepseek", 32),
+                ("deepseek", 43),
+                ("deepseek", 49),
+                ("deepseek", 52),
+            ],
+        )
+
+        runtime.loaded["qwen"] = "ready"
+        runtime.cache_capacities["qwen"] = 10
+        runtime.physical_cache_capacities["qwen"] = 10
+        scheduler.states["qwen"] = "ready"
+        scheduler.cache_allocations["qwen"] = 10
+        self.assertTrue(await scheduler._rebalance_caches("qwen", runtime.limit, Memory(0, 0)))
+        self.assertEqual(runtime.cache_capacities["qwen"], 58)
+        self.assertTrue(runtime.capacity()[1].fits(runtime.limit))
+
+        scheduler.active.pop("deepseek")
+        self.assertTrue(await scheduler._rebalance_caches(None, runtime.limit, Memory(0, 0)))
+        self.assertNotIn("deepseek", scheduler.cache_fallback_caps)
 
     async def test_cache_transfers_shrink_before_growing_another_model(self):
         resources = {name: adaptive_resource() for name in ("a", "m", "z")}
