@@ -151,6 +151,16 @@ class TensorHeaderTests(unittest.TestCase):
             self.assertEqual(result["tensors"], [])
             self.assertEqual(result["data_start"], len(data))
 
+    def test_gguf_rejects_unindexed_data_after_metadata_only_shard(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "metadata-with-extra-data.gguf"
+            header = make_gguf(include_tensor=False)
+            aligned_size = (len(header) + 63) // 64 * 64
+            path.write_bytes(header + bytes(aligned_size - len(header) + 1))
+
+            with self.assertRaisesRegex(ValueError, "unindexed trailing data"):
+                weight_store.parse_gguf(path)
+
 
 class WeightStoreTests(unittest.TestCase):
     def fixture(self, root: Path) -> tuple[Path, Path, dict[str, dict], bytes]:

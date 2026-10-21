@@ -275,9 +275,19 @@ def parse_gguf(path: Path) -> dict:
             )
 
         header_end = reader.tell()
-        data_start = ((header_end + alignment - 1) // alignment) * alignment if tensor_count else header_end
-        if tensor_count and data_start > file_size:
-            raise ValueError("GGUF aligned tensor data section starts past end of file")
+        aligned_data_start = ((header_end + alignment - 1) // alignment) * alignment
+        if tensor_count:
+            data_start = aligned_data_start
+            if data_start > file_size:
+                raise ValueError("GGUF aligned tensor data section starts past end of file")
+        else:
+            if file_size > aligned_data_start:
+                raise ValueError("GGUF shard with no tensors contains unindexed trailing data")
+            stream.seek(header_end)
+            trailing_padding = stream.read(file_size - header_end)
+            if any(trailing_padding):
+                raise ValueError("GGUF metadata-only shard has nonzero alignment padding")
+            data_start = aligned_data_start if file_size == aligned_data_start else header_end
 
     occupied = []
     for tensor in tensors:
