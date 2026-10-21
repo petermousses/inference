@@ -2102,7 +2102,7 @@ class ProfileTest(unittest.TestCase):
                 "if cache == '4g':\n"
                 " print('ROCm0 100 20 10\\nHost 20 0 1\\nMoEStreamCache 4294967296 4294967296 68719476736')\n"
                 "else:\n"
-                " print('ROCm0 200 20 10\\nHost 40 0 1\\nMoEStreamCache 68719476736 68719476736 68719476736')\n"
+                " print('ROCm0 200 20 10\\nHost 40 0 1\\nMoEStreamCache 66571993088 66571993088 68719476736')\n"
             )
             estimator.chmod(0o700)
             router_path, policy_path = root / "router.json", root / "policy.json"
@@ -2122,7 +2122,7 @@ class ProfileTest(unittest.TestCase):
             profile = build_profiles(router_path, policy_path)["resources"]["a"]
             self.assertEqual(profile["adaptive_cache"], {
                 "minimum_capacity_bytes": 4 * 1024**3,
-                "maximum_capacity_bytes": 64 * 1024**3,
+                "maximum_capacity_bytes": 62 * 1024**3,
                 "reservation_multiplier": 1.1,
             })
             self.assertEqual(

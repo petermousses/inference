@@ -482,10 +482,15 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
             max_rows = memory_rows(max_result.stdout)
             max_cache_info = moe_stream_cache_info(max_result.stdout)
             if (
-                max_cache_info[0] != cache_bounds[2]
-                or max_cache_info[1] != max_cache_info[2]
+                max_cache_info[0] < cache_bounds[1]
+                or max_cache_info[1] != max_cache_info[0]
+                or max_cache_info[2] != cache_bounds[2]
             ):
-                raise ValueError(f"{name} maximum expert cache does not match its configured bound")
+                raise ValueError(
+                    f"{name} maximum expert cache does not match its configured bound: "
+                    f"selected={max_cache_info[0]}, minimum={max_cache_info[1]}, "
+                    f"configured_maximum={max_cache_info[2]}, expected_maximum={cache_bounds[2]}"
+                )
         lazy_tensors = lazy_tensor_sizes(result.stdout + "\n" + result.stderr)
         lazy_bytes = sum(lazy_tensors.values())
         lazy_profiles = policy.get("lazy_tensor_profiles", {})
@@ -593,7 +598,7 @@ def build_profiles(router_path: Path, policy_path: Path) -> dict:
                 {
                     "adaptive_cache": {
                         "minimum_capacity_bytes": cache_bounds[1],
-                        "maximum_capacity_bytes": cache_bounds[2],
+                        "maximum_capacity_bytes": max_cache_info[0],
                         "reservation_multiplier": margin,
                     },
                 }
