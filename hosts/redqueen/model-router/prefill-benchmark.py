@@ -13,27 +13,25 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Iterator
 from urllib.parse import urlsplit, urlunsplit
 
 
-def read_cases(path: Path) -> list[dict]:
-    cases = []
-    for line_number, line in enumerate(path.read_text().splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            case = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"invalid JSON on line {line_number}") from error
-        if not isinstance(case, dict):
-            raise ValueError(f"line {line_number} must contain a JSON object")
-        request = case.get("request", {key: value for key, value in case.items() if key != "id"})
-        if not isinstance(request, dict) or not ("messages" in request or "prompt" in request):
-            raise ValueError(f"line {line_number} needs request.messages or request.prompt")
-        cases.append({"index": line_number, "request": request})
-    if not cases:
-        raise ValueError("input contains no benchmark cases")
-    return cases
+def read_cases(path: Path) -> Iterator[dict]:
+    with path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, start=1):
+            if not line.strip():
+                continue
+            try:
+                case = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"invalid JSON on line {line_number}") from error
+            if not isinstance(case, dict):
+                raise ValueError(f"line {line_number} must contain a JSON object")
+            request = case.get("request", {key: value for key, value in case.items() if key != "id"})
+            if not isinstance(request, dict) or not ("messages" in request or "prompt" in request):
+                raise ValueError(f"line {line_number} needs request.messages or request.prompt")
+            yield {"index": line_number, "request": request}
 
 
 def numeric_timings(value: object) -> dict:
@@ -61,8 +59,6 @@ def has_generated_delta(delta: dict) -> bool:
             if not isinstance(call, dict):
                 continue
             function = call.get("function")
-            if any(call.get(key) for key in ("id", "type")):
-                return True
             if isinstance(function, dict) and any(function.get(key) for key in ("name", "arguments")):
                 return True
     return False
@@ -92,18 +88,7 @@ def stream_case(
     *, url: str, api_key: str, model: str | None, request_data: dict,
     include_usage: bool, timeout_s: float,
 ) -> dict:
-    body = dict(request_data)
-    if model is not None:
-        body["model"] = model
-    if not isinstance(body.get("model"), str):
-        raise ValueError("each request needs a model or --model")
-    body["stream"] = True
-    if include_usage:
-        stream_options = body.get("stream_options", {})
-        if not isinstance(stream_options, dict):
-            raise ValueError("stream_options must be an object")
-        body["stream_options"] = {**stream_options, "include_usage": True}
-
+    body = prepare_request(request_data, model=model, include_usage=include_usage)
     request = urllib.request.Request(
         url,
         data=json.dumps(body, allow_nan=False, ensure_ascii=False).encode(),
@@ -187,6 +172,22 @@ def stream_case(
     }
 
 
+def prepare_request(request_data: dict, *, model: str | None, include_usage: bool) -> dict:
+    body = dict(request_data)
+    if model is not None:
+        body["model"] = model
+    if not isinstance(body.get("model"), str):
+        raise ValueError("each request needs a model or --model")
+    body["stream"] = True
+    if include_usage:
+        stream_options = body.get("stream_options", {})
+        if not isinstance(stream_options, dict):
+            raise ValueError("stream_options must be an object")
+        body["stream_options"] = {**stream_options, "include_usage": True}
+    json.dumps(body, allow_nan=False, ensure_ascii=False)
+    return body
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("cases", type=Path, help="JSONL with one OpenAI chat request per line")
@@ -213,7 +214,14 @@ def main() -> int:
         print(f"missing bearer key in environment variable {args.api_key_env}", file=sys.stderr)
         return 2
     try:
-        cases = read_cases(args.cases)
+        case_count = 0
+        for case in read_cases(args.cases):
+            request_data = dict(case["request"])
+            request_data.setdefault("max_tokens", args.max_tokens)
+            prepare_request(request_data, model=args.model, include_usage=not args.no_include_usage)
+            case_count += 1
+        if case_count == 0:
+            raise ValueError("input contains no benchmark cases")
     except (OSError, ValueError) as error:
         print(f"cannot load cases: {error}", file=sys.stderr)
         return 2
@@ -221,7 +229,7 @@ def main() -> int:
     output = args.output.open("w") if args.output else sys.stdout
     try:
         for repeat in range(-args.warmups, args.repeats):
-            for case in cases:
+            for case in read_cases(args.cases):
                 request_data = dict(case["request"])
                 request_data.setdefault("max_tokens", args.max_tokens)
                 measured = stream_case(

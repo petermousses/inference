@@ -15,9 +15,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from pathlib import PurePosixPath
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
 
 MIB = 1024**2
 ROOT = Path(__file__).resolve().parents[3]
@@ -63,9 +68,11 @@ def linux_memory() -> dict:
     }
 
 
-def pci_devices() -> list[dict]:
+def pci_devices(drm_root: Path = Path("/sys/class/drm")) -> list[dict]:
     devices = []
-    for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+    for card in sorted(drm_root.glob("card*")):
+        if re.fullmatch(r"card\d+", card.name) is None:
+            continue
         device = card / "device"
         if not device.exists():
             continue
@@ -266,6 +273,50 @@ def collect_artifact_refs(router: dict, policy: dict, root: Path) -> dict[str, d
         for role in ("weights", "host_weights"):
             for raw_path in service.get(role, []):
                 add(name, role, raw_path, service_class)
+        inventory_value = service.get("artifact_inventory")
+        artifact_root = service.get("artifact_root")
+        if isinstance(inventory_value, str) and isinstance(artifact_root, str):
+            inventory_path = resolve_config_path(inventory_value, root)
+            model_root = resolve_config_path(artifact_root, root)
+            try:
+                inventory_lines = inventory_path.read_text().splitlines()
+            except OSError as error:
+                raise ValueError(f"cannot read artifact inventory {inventory_path}: {type(error).__name__}") from error
+            inventory_entries = 0
+            for line_number, line in enumerate(inventory_lines, start=1):
+                if not line:
+                    continue
+                fields = line.split("\t")
+                if len(fields) != 4:
+                    raise ValueError(f"invalid artifact inventory row {inventory_path}:{line_number}")
+                relative_path = PurePosixPath(fields[0])
+                if (
+                    not relative_path.parts
+                    or relative_path.is_absolute()
+                    or relative_path.as_posix() != fields[0]
+                    or "\\" in fields[0]
+                    or any(part in {"", ".", ".."} for part in relative_path.parts)
+                ):
+                    raise ValueError(f"unsafe artifact path in {inventory_path}:{line_number}")
+                try:
+                    expected_size = int(fields[1])
+                except ValueError as error:
+                    raise ValueError(f"invalid artifact size in {inventory_path}:{line_number}") from error
+                if (
+                    expected_size < 0
+                    or not re.fullmatch(r"[0-9a-f]{64}", fields[2])
+                    or not re.fullmatch(r"[0-9a-f]{40}", fields[3])
+                ):
+                    raise ValueError(f"invalid artifact metadata in {inventory_path}:{line_number}")
+                artifact_path = model_root.joinpath(*relative_path.parts)
+                add(name, "manifest_artifact", str(artifact_path), service_class)
+                item = artifacts[str(artifact_path)]
+                item["expected_size_bytes"] = expected_size
+                item["expected_sha256"] = fields[2].lower()
+                item["source_object_id"] = fields[3]
+                inventory_entries += 1
+            if not inventory_entries:
+                raise ValueError(f"artifact inventory is empty: {inventory_path}")
         unit_value = service.get("command_unit")
         if not isinstance(unit_value, str):
             continue
@@ -354,15 +405,20 @@ def fio_read_probe(path: Path, mode: str, size_bytes: int) -> dict:
     try:
         payload = json.loads(result.stdout)
         read = payload["jobs"][0]["read"]
+        if not isinstance(read, dict):
+            raise TypeError("fio read result is not an object")
     except (ValueError, KeyError, IndexError, TypeError):
         return {"status": "failed", "reason": "invalid_fio_output"}
+    bytes_per_second = read.get("bw_bytes")
+    if bytes_per_second is None and isinstance(read.get("bw"), (int, float)):
+        bytes_per_second = int(read["bw"] * 1024)
     return {
         "status": "ok",
         "mode": mode,
         "block_size": block_size,
         "sample_bytes": size_bytes,
         "sample_offset_bytes": offset_bytes,
-        "bytes_per_second": read.get("bw_bytes", int(read["bw"] * 1024) if "bw" in read else None),
+        "bytes_per_second": bytes_per_second,
         "iops": read.get("iops"),
         "io_bytes": read.get("io_bytes"),
         "runtime_ms": read.get("runtime"),
@@ -372,10 +428,19 @@ def fio_read_probe(path: Path, mode: str, size_bytes: int) -> dict:
 
 
 def collect(args: argparse.Namespace) -> dict:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required to read the router configuration")
     router_path = Path(args.router_config).resolve()
     policy_path = Path(args.scheduler_config).resolve()
-    router = yaml.safe_load(router_path.read_text())
+    try:
+        router = yaml.safe_load(router_path.read_text())
+    except yaml.YAMLError as error:
+        raise ValueError(f"invalid router YAML: {error}") from error
     policy = json.loads(policy_path.read_text())
+    if not isinstance(router, dict) or not isinstance(policy, dict):
+        raise ValueError("router and scheduler configurations must contain objects")
+    if not isinstance(router.get("models", {}), dict) or not isinstance(policy.get("services", {}), dict):
+        raise ValueError("router models and scheduler services must contain objects")
     artifacts = collect_artifact_refs(router, policy, ROOT)
     mounts = mounted_filesystems()
     storage_by_mount: dict[str, dict] = {}
@@ -391,8 +456,12 @@ def collect(args: argparse.Namespace) -> dict:
                 "size_bytes": info.st_size,
                 "mtime_ns": info.st_mtime_ns,
             }
+            if "expected_size_bytes" in artifact:
+                file_entry["size_matches_manifest"] = info.st_size == artifact["expected_size_bytes"]
             if args.sha256 and stat.S_ISREG(info.st_mode):
                 file_entry["sha256"] = sha256_file(path)
+                if "expected_sha256" in artifact:
+                    file_entry["sha256_matches_manifest"] = file_entry["sha256"] == artifact["expected_sha256"]
         except FileNotFoundError:
             file_entry = {**artifact, "exists": False, "size_bytes": None, "mtime_ns": None}
         except OSError as error:
@@ -431,7 +500,15 @@ def collect(args: argparse.Namespace) -> dict:
         "host": host_details(),
         "memory_policy": {
             key: policy[key]
-            for key in ("gpu_reserve_mib", "host_reserve_mib", "host_budget_mib", "estimate_margin", "model_overhead_mib")
+            for key in (
+                "gpu_budget_mib",
+                "host_budget_mib",
+                "minimum_host_available_mib",
+                "prefill_headroom_mib",
+                "estimate_margin",
+                "model_overhead_mib",
+                "moe_stream_overhead_mib",
+            )
             if key in policy
         },
         "sources": {
@@ -466,27 +543,37 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def write_atomic(output: Path, rendered: str) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o640)
+        os.replace(temporary_name, output)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
+
+
 def main() -> int:
     args = parse_args()
     try:
         result = collect(args)
-    except (OSError, ValueError, yaml.YAMLError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         print(f"preflight failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 2
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output is None:
         sys.stdout.write(rendered)
         return 0
-    output = args.output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_text(rendered)
-        os.chmod(temporary, 0o640)
-        os.replace(temporary, output)
-    except OSError:
-        temporary.unlink(missing_ok=True)
-        raise
+        write_atomic(args.output, rendered)
+    except OSError as error:
+        print(f"cannot write preflight output: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
     return 0
 
 
