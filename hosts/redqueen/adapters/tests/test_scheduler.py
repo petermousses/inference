@@ -121,6 +121,7 @@ class FakeAdaptiveRuntime(FakeRuntime):
         self.reject_cache_above: dict[str, int] = {}
         self.cache_rounding_quantum = 1
         self.pending_cache_release: set[str] = set()
+        self.cache_resize_overshoots: dict[tuple[str, int], int] = {}
 
     async def expert_cache_info(self, name, *, allow_pending_backing_release=False):
         limits = self.resources[name]["adaptive_cache"]
@@ -140,9 +141,12 @@ class FakeAdaptiveRuntime(FakeRuntime):
         if reject_above is not None and capacity_bytes > reject_above:
             raise ExpertCacheResizeError(503)
         minimum = self.resources[name]["adaptive_cache"]["minimum_capacity_bytes"]
-        capacity_bytes = max(
-            minimum,
-            capacity_bytes // self.cache_rounding_quantum * self.cache_rounding_quantum,
+        capacity_bytes = self.cache_resize_overshoots.get(
+            (name, capacity_bytes),
+            max(
+                minimum,
+                capacity_bytes // self.cache_rounding_quantum * self.cache_rounding_quantum,
+            ),
         )
         self.cache_capacities[name] = capacity_bytes
         if not self.sticky_cache_backing or capacity_bytes > self.physical_cache_capacities[name]:
@@ -349,6 +353,31 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await scheduler._rebalance_caches("m", runtime.limit, Memory(0, 0)))
         self.assertEqual(runtime.resize_calls, [("z", 40), ("a", 40)])
         self.assertEqual(runtime.capacity()[1], Memory(120, 120))
+
+    async def test_cache_growth_overshoot_falls_back_to_a_fitting_capacity(self):
+        resources = {name: adaptive_resource() for name in ("a", "m", "z")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=180)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "overshoot-cache-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"a": "ready", "z": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        scheduler.active = {"a": 1, "z": 1}
+        runtime.cache_capacities.update(a=10, z=130)
+        runtime.physical_cache_capacities.update(a=10, z=130)
+        scheduler.cache_allocations.update(a=10, z=130)
+        runtime.cache_resize_overshoots[("a", 40)] = 50
+        runtime.cache_resize_overshoots[("a", 38)] = 50
+
+        fits = await scheduler._rebalance_caches("m", runtime.limit, Memory(0, 0))
+
+        self.assertTrue(fits)
+        self.assertLessEqual(runtime.cache_capacities["a"], 40)
+        self.assertEqual(
+            scheduler.cache_fallback_caps["a"], runtime.cache_capacities["a"]
+        )
+        self.assertTrue(runtime.capacity()[1].fits(runtime.limit))
 
     async def test_rebalance_finishes_all_shrinks_when_first_release_is_not_enough(self):
         resources = {name: adaptive_resource() for name in ("a", "m", "z")}
@@ -944,6 +973,7 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.started = asyncio.Event()
         self.api_ready = False
         self.expert_cache_state = {}
+        self.expert_cache_post_capacity = None
         self.custom_nodes = {}
         self.full_catalog_requests = 0
         self.resources = {"a": resource(60), "b": resource(60), "comfyui": resource(60, "service")}
@@ -986,13 +1016,20 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         async def node(request):
             name = request.match_info["node_class"]
             return web.json_response({name: self.custom_nodes[name]} if name in self.custom_nodes else {})
-        async def expert_cache(_):
+        async def expert_cache(request):
+            if request.method == "POST":
+                payload = await request.json()
+                self.expert_cache_state["capacity_bytes"] = (
+                    self.expert_cache_post_capacity
+                    if self.expert_cache_post_capacity is not None
+                    else payload["capacity_bytes"]
+                )
             return web.json_response(self.expert_cache_state)
         upstream.router.add_get("/health", health)
         upstream.router.add_get("/ready", ready)
         upstream.router.add_get("/object_info", nodes)
         upstream.router.add_get("/object_info/{node_class}", node)
-        upstream.router.add_get("/expert-cache", expert_cache)
+        upstream.router.add_route("*", "/expert-cache", expert_cache)
         self.upstream = TestServer(upstream)
         await self.upstream.start_server()
         self.addAsyncCleanup(self.upstream.close)
@@ -1935,6 +1972,26 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ExpertCacheStateError) as caught:
             await runtime.expert_cache_info("moe")
         self.assertEqual(caught.exception.reason_code, "pending_backing_release")
+
+    async def test_resize_accepts_reported_allocator_capacity_for_scheduler_accounting(self):
+        limits = adaptive_resource()["adaptive_cache"]
+        self.resources["moe"] = adaptive_resource()
+        self.resources["moe"].update(
+            expert_cache_url=str(self.upstream.make_url("/expert-cache")),
+            health_url=str(self.upstream.make_url("/health")),
+        )
+        self.expert_cache_state = {
+            **limits,
+            "capacity_bytes": 50,
+            "pending_backing_release": False,
+            "quarantined": False,
+        }
+        self.expert_cache_post_capacity = 35
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        info = await runtime.resize_expert_cache("moe", 30)
+
+        self.assertEqual(info["capacity_bytes"], 35)
 
     async def test_comfy_start_command_waits_past_systemd_readiness_deadline(self):
         self.resources["comfyui"].update(
