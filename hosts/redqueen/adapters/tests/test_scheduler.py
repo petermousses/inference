@@ -1932,6 +1932,60 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             f"{self.policy['upstream_url']}/upstream/native-moe/expert-cache",
         )
 
+    async def test_expert_cache_accepts_runtime_maximum_above_profiled_limit(self):
+        limits = adaptive_resource()["adaptive_cache"]
+        runtime_maximum = limits["maximum_capacity_bytes"] + 10
+        self.resources["moe"] = adaptive_resource()
+        self.resources["moe"]["expert_cache_url"] = str(self.upstream.make_url("/expert-cache"))
+        self.expert_cache_state = {
+            **limits,
+            "maximum_capacity_bytes": runtime_maximum,
+            "capacity_bytes": limits["minimum_capacity_bytes"],
+            "pending_backing_release": False,
+            "quarantined": False,
+        }
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        info = await runtime.expert_cache_info("moe")
+
+        self.assertEqual(info["maximum_capacity_bytes"], runtime_maximum)
+
+    async def test_expert_cache_rejects_runtime_maximum_below_profiled_limit(self):
+        limits = adaptive_resource()["adaptive_cache"]
+        self.resources["moe"] = adaptive_resource()
+        self.resources["moe"]["expert_cache_url"] = str(self.upstream.make_url("/expert-cache"))
+        self.expert_cache_state = {
+            **limits,
+            "maximum_capacity_bytes": limits["maximum_capacity_bytes"] - 1,
+            "capacity_bytes": limits["minimum_capacity_bytes"],
+            "pending_backing_release": False,
+            "quarantined": False,
+        }
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        with self.assertRaises(ExpertCacheStateError) as caught:
+            await runtime.expert_cache_info("moe")
+
+        self.assertEqual(caught.exception.reason_code, "profile_bounds_mismatch")
+
+    async def test_expert_cache_still_rejects_capacity_above_profiled_limit(self):
+        limits = adaptive_resource()["adaptive_cache"]
+        self.resources["moe"] = adaptive_resource()
+        self.resources["moe"]["expert_cache_url"] = str(self.upstream.make_url("/expert-cache"))
+        self.expert_cache_state = {
+            **limits,
+            "maximum_capacity_bytes": limits["maximum_capacity_bytes"] + 10,
+            "capacity_bytes": limits["maximum_capacity_bytes"] + 1,
+            "pending_backing_release": False,
+            "quarantined": False,
+        }
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        with self.assertRaises(ExpertCacheStateError) as caught:
+            await runtime.expert_cache_info("moe")
+
+        self.assertEqual(caught.exception.reason_code, "capacity_out_of_bounds")
+
     async def test_quarantined_expert_cache_state_has_safe_reason_code(self):
         limits = adaptive_resource()["adaptive_cache"]
         self.resources["moe"] = adaptive_resource()
