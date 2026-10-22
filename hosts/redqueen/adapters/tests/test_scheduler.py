@@ -22,7 +22,7 @@ from redqueen_adapters.jev_api import JevSettings, create_jev_app
 from redqueen_adapters.memory_profile import MIB, build_profiles, file_signature, fingerprint_artifacts, memory_contract, memory_rows, verify_profiles, weight_paths
 from redqueen_adapters.ownership import OwnedRequest, records
 from redqueen_adapters import scheduler_api
-from redqueen_adapters.scheduler_api import ExpertCacheResizeError, Memory, Runtime, Scheduler, create_apps, footprint
+from redqueen_adapters.scheduler_api import ExpertCacheResizeError, ExpertCacheStateError, Memory, Runtime, Scheduler, create_apps, footprint
 from redqueen_adapters.scheduler_client import (
     ResourceLock,
     SchedulerClient,
@@ -915,6 +915,7 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.release = asyncio.Event()
         self.started = asyncio.Event()
         self.api_ready = False
+        self.expert_cache_state = {}
         self.custom_nodes = {}
         self.full_catalog_requests = 0
         self.resources = {"a": resource(60), "b": resource(60), "comfyui": resource(60, "service")}
@@ -957,10 +958,13 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         async def node(request):
             name = request.match_info["node_class"]
             return web.json_response({name: self.custom_nodes[name]} if name in self.custom_nodes else {})
+        async def expert_cache(_):
+            return web.json_response(self.expert_cache_state)
         upstream.router.add_get("/health", health)
         upstream.router.add_get("/ready", ready)
         upstream.router.add_get("/object_info", nodes)
         upstream.router.add_get("/object_info/{node_class}", node)
+        upstream.router.add_get("/expert-cache", expert_cache)
         self.upstream = TestServer(upstream)
         await self.upstream.start_server()
         self.addAsyncCleanup(self.upstream.close)
@@ -1862,6 +1866,23 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             runtime.expert_cache_url("native-moe"),
             f"{self.policy['upstream_url']}/upstream/native-moe/expert-cache",
         )
+
+    async def test_quarantined_expert_cache_state_has_safe_reason_code(self):
+        limits = adaptive_resource()["adaptive_cache"]
+        self.resources["moe"] = adaptive_resource()
+        self.resources["moe"]["expert_cache_url"] = str(self.upstream.make_url("/expert-cache"))
+        self.expert_cache_state = {
+            **limits,
+            "capacity_bytes": limits["maximum_capacity_bytes"],
+            "pending_backing_release": False,
+            "quarantined": True,
+        }
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        with self.assertRaises(ExpertCacheStateError) as caught:
+            await runtime.expert_cache_info("moe")
+
+        self.assertEqual(caught.exception.reason_code, "quarantined")
 
     async def test_comfy_start_command_waits_past_systemd_readiness_deadline(self):
         self.resources["comfyui"].update(

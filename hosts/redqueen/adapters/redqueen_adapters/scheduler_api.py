@@ -223,6 +223,14 @@ class ExpertCacheResizeError(RuntimeError):
         self.status_code = status_code
 
 
+class ExpertCacheStateError(RuntimeError):
+    """The worker's cache state cannot safely support memory accounting."""
+
+    def __init__(self, reason_code: str):
+        super().__init__("expert-cache state is invalid or unsettled")
+        self.reason_code = reason_code
+
+
 class Runtime:
     def __init__(self, policy: dict, resources: dict, session: aiohttp.ClientSession, api_key: str):
         self.policy, self.resources, self.session = policy, resources, session
@@ -283,31 +291,39 @@ class Runtime:
     async def expert_cache_info(self, name: str) -> dict:
         url = self.expert_cache_url(name)
         if not url:
-            raise RuntimeError("adaptive worker has no expert-cache endpoint")
-        body = await self.json(url, limit=64 * 1024)
+            raise ExpertCacheStateError("missing_endpoint")
+        try:
+            body = await self.json(url, limit=64 * 1024)
+        except RuntimeError as error:
+            raise ExpertCacheStateError("invalid_json_response") from error
         spec = self.resources[name]
         limits = spec.get("adaptive_cache")
+        if not isinstance(body, dict) or not isinstance(limits, dict):
+            raise ExpertCacheStateError("invalid_response_shape")
         if (
-            not isinstance(body, dict)
-            or not isinstance(limits, dict)
-            or body.get("minimum_capacity_bytes") != limits.get("minimum_capacity_bytes")
+            body.get("minimum_capacity_bytes") != limits.get("minimum_capacity_bytes")
             or body.get("maximum_capacity_bytes") != limits.get("maximum_capacity_bytes")
-            or isinstance(body.get("capacity_bytes"), bool)
-            or not isinstance(body.get("capacity_bytes"), int)
-            or body["capacity_bytes"] <= 0
-            or not limits["minimum_capacity_bytes"] <= body["capacity_bytes"] <= limits["maximum_capacity_bytes"]
-            or type(body.get("pending_backing_release")) is not bool
-            or type(body.get("quarantined")) is not bool
-            or body["quarantined"]
-            or body["pending_backing_release"]
         ):
-            raise RuntimeError("adaptive worker returned an invalid or unsettled expert-cache state")
+            raise ExpertCacheStateError("profile_bounds_mismatch")
+        capacity = body.get("capacity_bytes")
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ExpertCacheStateError("invalid_capacity")
+        if not limits["minimum_capacity_bytes"] <= capacity <= limits["maximum_capacity_bytes"]:
+            raise ExpertCacheStateError("capacity_out_of_bounds")
+        pending_release = body.get("pending_backing_release")
+        quarantined = body.get("quarantined")
+        if type(pending_release) is not bool or type(quarantined) is not bool:
+            raise ExpertCacheStateError("invalid_state_flags")
+        if quarantined:
+            raise ExpertCacheStateError("quarantined")
+        if pending_release:
+            raise ExpertCacheStateError("pending_backing_release")
         return body
 
     async def resize_expert_cache(self, name: str, capacity_bytes: int) -> dict:
         url = self.expert_cache_url(name)
         if not url:
-            raise RuntimeError("adaptive worker has no expert-cache endpoint")
+            raise ExpertCacheStateError("missing_endpoint")
         timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_connect=5, sock_read=None)
         async with self.session.post(
             url,
@@ -318,14 +334,14 @@ class Runtime:
             try:
                 body = decode_json(await read_limited(response, 64 * 1024, check_status=False))
             except (ValueError, UnicodeDecodeError) as error:
-                raise RuntimeError("invalid expert-cache resize response") from error
+                raise ExpertCacheStateError("invalid_resize_response") from error
             if response.status != 200:
                 raise ExpertCacheResizeError(response.status)
             if not isinstance(body, dict):
-                raise RuntimeError("expert-cache resize returned an invalid response")
+                raise ExpertCacheStateError("invalid_resize_response")
         info = await self.expert_cache_info(name)
         if info["capacity_bytes"] > capacity_bytes:
-            raise RuntimeError("expert-cache resize exceeded its requested capacity")
+            raise ExpertCacheStateError("reported_capacity_exceeds_target")
         return info
 
     async def generation(self, name: str) -> str | None:
@@ -740,7 +756,8 @@ class Scheduler:
                 except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError) as state_error:
                     self.cache_allocations[name] = self.resources[name]["adaptive_cache"]["maximum_capacity_bytes"]
                     self.cache_unready.add(name)
-                    LOG.error("cache rebalance state unknown model=%s target_bytes=%d", name, target)
+                    reason = getattr(state_error, "reason_code", type(state_error).__name__)
+                    LOG.error("cache rebalance state unknown model=%s target_bytes=%d reason=%s", name, target, reason)
                     raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed") from state_error
                 self.cache_allocations[name] = info["capacity_bytes"]
                 self.cache_unready.discard(name)
@@ -748,7 +765,8 @@ class Scheduler:
             except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError) as error:
                 self.cache_allocations[name] = self.resources[name]["adaptive_cache"]["maximum_capacity_bytes"]
                 self.cache_unready.add(name)
-                LOG.error("cache rebalance failed model=%s target_bytes=%d reason=%s", name, target, type(error).__name__)
+                reason = getattr(error, "reason_code", type(error).__name__)
+                LOG.error("cache rebalance failed model=%s target_bytes=%d reason=%s", name, target, reason)
                 raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed") from error
             self.cache_allocations[name] = info["capacity_bytes"]
             self.cache_unready.discard(name)
