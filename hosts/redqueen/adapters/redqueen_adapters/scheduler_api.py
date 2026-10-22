@@ -302,9 +302,18 @@ class Runtime:
         limits = spec.get("adaptive_cache")
         if not isinstance(body, dict) or not isinstance(limits, dict):
             raise ExpertCacheStateError("invalid_response_shape")
+        minimum_capacity = body.get("minimum_capacity_bytes")
+        maximum_capacity = body.get("maximum_capacity_bytes")
+        # The fit planner rounds its safe maximum down to a representable
+        # allocation, while the runtime reports its configured upper bound.
+        # All scheduler targets remain capped at the profiled maximum below.
         if (
-            body.get("minimum_capacity_bytes") != limits.get("minimum_capacity_bytes")
-            or body.get("maximum_capacity_bytes") != limits.get("maximum_capacity_bytes")
+            isinstance(minimum_capacity, bool)
+            or not isinstance(minimum_capacity, int)
+            or minimum_capacity != limits["minimum_capacity_bytes"]
+            or isinstance(maximum_capacity, bool)
+            or not isinstance(maximum_capacity, int)
+            or maximum_capacity < limits["maximum_capacity_bytes"]
         ):
             raise ExpertCacheStateError("profile_bounds_mismatch")
         capacity = body.get("capacity_bytes")
