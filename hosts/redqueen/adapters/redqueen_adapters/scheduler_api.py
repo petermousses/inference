@@ -631,8 +631,14 @@ class Scheduler:
         incoming: str | None,
         capacity: Memory,
         unknown: Memory,
+        *,
+        reserve_incoming_startup: bool = False,
     ) -> bool:
-        """Water-fill cache capacity equally across workers with current demand."""
+        """Water-fill cache capacity equally across workers with current demand.
+
+        Before loading a new worker, callers can hold resident adaptive caches
+        at their minima until startup finishes and physical usage is measurable.
+        """
         adaptive_names = [
             name for name in self.states
             if self.resources[name].get("adaptive_cache")
@@ -695,6 +701,15 @@ class Scheduler:
             return fixed
 
         def targets_for(extra_bytes: int) -> dict[str, int]:
+            if (
+                reserve_incoming_startup
+                and incoming is not None
+                and incoming not in self.states
+            ):
+                return {
+                    name: self.resources[name]["adaptive_cache"]["minimum_capacity_bytes"]
+                    for name in adjustable_names
+                }
             targets = {
                 name: self.resources[name]["adaptive_cache"]["minimum_capacity_bytes"]
                 for name in adjustable_names
@@ -1046,7 +1061,12 @@ class Scheduler:
                     raise AdmissionError(503, "model reservation exceeds this host's memory budget", "model_exceeds_budget", retry_after=None)
                 reserved = self.reserved()
                 unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
-                await self._rebalance_caches(name, capacity, unknown)
+                await self._rebalance_caches(
+                    name,
+                    capacity,
+                    unknown,
+                    reserve_incoming_startup=True,
+                )
                 capacity, usage = self.runtime.capacity()
                 reserved = self.reserved()
                 unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))

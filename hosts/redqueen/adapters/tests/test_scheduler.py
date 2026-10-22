@@ -118,10 +118,15 @@ class FakeAdaptiveRuntime(FakeRuntime):
         self.scheduler = None
         self.sticky_cache_backing = False
         self.physical_cache_capacities = dict(self.cache_capacities)
+        self.cache_capacities_at_start: dict[str, dict[str, int]] = {}
         self.reject_cache_above: dict[str, int] = {}
         self.cache_rounding_quantum = 1
         self.pending_cache_release: set[str] = set()
         self.cache_resize_overshoots: dict[tuple[str, int], int] = {}
+
+    async def start(self, name):
+        self.cache_capacities_at_start[name] = dict(self.cache_capacities)
+        await super().start(name)
 
     async def expert_cache_info(self, name, *, allow_pending_backing_release=False):
         limits = self.resources[name]["adaptive_cache"]
@@ -251,6 +256,10 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(entered["qwen"].wait(), 1)
             self.assertFalse(deepseek_task.done())
             self.assertEqual(runtime.loaded, {"deepseek": "ready", "qwen": "ready"})
+            self.assertEqual(
+                runtime.cache_capacities_at_start["qwen"],
+                {"deepseek": 10, "qwen": 10},
+            )
             self.assertEqual(runtime.cache_capacities["deepseek"], 55)
             self.assertEqual(runtime.cache_capacities["qwen"], 55)
             self.assertIn(("deepseek", 55), runtime.resize_calls)
@@ -270,6 +279,79 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(deepseek_task, *([qwen_task] if qwen_task else []), return_exceptions=True)
             if scheduler.cache_rebalance_tasks:
                 await asyncio.gather(*list(scheduler.cache_rebalance_tasks), return_exceptions=True)
+
+    async def test_failed_incoming_start_restores_active_moe_cache(self):
+        resources = {name: adaptive_resource() for name in ("deepseek", "qwen")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=150)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "failed-start-cache-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def serve_deepseek():
+            async with scheduler.request("deepseek"):
+                entered.set()
+                await release.wait()
+
+        deepseek_task = asyncio.create_task(serve_deepseek())
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            self.assertEqual(runtime.cache_capacities["deepseek"], 130)
+            runtime.load_failure = True
+
+            with self.assertRaises(AdmissionError):
+                async with scheduler.request("qwen"):
+                    self.fail("a worker whose startup failed must not serve")
+
+            self.assertEqual(
+                runtime.cache_capacities_at_start["qwen"],
+                {"deepseek": 10, "qwen": 10},
+            )
+            deadline = asyncio.get_running_loop().time() + 1
+            while runtime.cache_capacities["deepseek"] != 130:
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail("active DeepSeek did not reclaim cache after Qwen failed to start")
+                await asyncio.sleep(0.01)
+            self.assertNotIn("qwen", runtime.loaded)
+            self.assertEqual(scheduler.active.get("deepseek"), 1)
+        finally:
+            release.set()
+            await asyncio.gather(deepseek_task, return_exceptions=True)
+            if scheduler.cache_rebalance_tasks:
+                await asyncio.gather(*list(scheduler.cache_rebalance_tasks), return_exceptions=True)
+
+    async def test_new_moe_load_uses_minimum_cache_then_shares_after_load(self):
+        resources = {name: adaptive_resource() for name in ("deepseek", "glm")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=150)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "startup-cache-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"deepseek": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        scheduler.active = {"deepseek": 1, "glm": 1}
+        runtime.cache_capacities["deepseek"] = 130
+        runtime.physical_cache_capacities["deepseek"] = 130
+        scheduler.cache_allocations["deepseek"] = 130
+
+        self.assertTrue(
+            await scheduler._rebalance_caches(
+                "glm", runtime.limit, Memory(0, 0), reserve_incoming_startup=True
+            )
+        )
+
+        self.assertEqual(runtime.cache_capacities["deepseek"], 10)
+        self.assertEqual(runtime.cache_capacities["glm"], 10)
+        self.assertEqual(runtime.resize_calls, [("deepseek", 10)])
+
+        runtime.loaded["glm"] = "ready"
+        scheduler.states["glm"] = "ready"
+        self.assertTrue(await scheduler._rebalance_caches("glm", runtime.limit, Memory(0, 0)))
+
+        self.assertEqual(runtime.cache_capacities["deepseek"], 55)
+        self.assertEqual(runtime.cache_capacities["glm"], 55)
 
     async def test_rejected_cache_share_falls_back_to_largest_verified_allocation(self):
         resources = {name: adaptive_resource() for name in ("deepseek", "qwen")}
