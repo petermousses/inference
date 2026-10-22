@@ -120,13 +120,17 @@ class FakeAdaptiveRuntime(FakeRuntime):
         self.physical_cache_capacities = dict(self.cache_capacities)
         self.reject_cache_above: dict[str, int] = {}
         self.cache_rounding_quantum = 1
+        self.pending_cache_release: set[str] = set()
 
-    async def expert_cache_info(self, name):
+    async def expert_cache_info(self, name, *, allow_pending_backing_release=False):
         limits = self.resources[name]["adaptive_cache"]
+        pending = name in self.pending_cache_release
+        if pending and not allow_pending_backing_release:
+            raise ExpertCacheStateError("pending_backing_release")
         return {
             **limits,
             "capacity_bytes": self.cache_capacities[name],
-            "pending_backing_release": False,
+            "pending_backing_release": pending,
             "quarantined": False,
         }
 
@@ -143,6 +147,7 @@ class FakeAdaptiveRuntime(FakeRuntime):
         self.cache_capacities[name] = capacity_bytes
         if not self.sticky_cache_backing or capacity_bytes > self.physical_cache_capacities[name]:
             self.physical_cache_capacities[name] = capacity_bytes
+        self.pending_cache_release.discard(name)
         return await self.expert_cache_info(name)
 
     def capacity(self):
@@ -176,6 +181,29 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(lock.acquire())
         self.addCleanup(lock.close)
         return lock
+
+    async def test_refresh_accounts_pending_cache_backing_as_unknown_memory(self):
+        resources = {name: adaptive_resource() for name in ("deepseek", "qwen")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=150)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "pending-cache-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"deepseek": "ready"}
+        runtime.cache_capacities["deepseek"] = 80
+        runtime.physical_cache_capacities["deepseek"] = 120
+        runtime.pending_cache_release.add("deepseek")
+        scheduler.active["deepseek"] = 1
+
+        await scheduler.refresh()
+
+        self.assertEqual(scheduler.cache_allocations["deepseek"], 80)
+        self.assertNotIn("deepseek", scheduler.cache_unready)
+        capacity, usage = runtime.capacity()
+        reserved = scheduler.reserved()
+        unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
+        self.assertTrue((reserved + unknown).fits(capacity))
+        self.assertEqual(unknown, Memory(40, 40))
 
     async def test_lru_evicts_only_as_many_idle_models_as_required(self):
         self.runtime.loaded = {"a": "ready", "b": "ready"}
@@ -1883,6 +1911,30 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             await runtime.expert_cache_info("moe")
 
         self.assertEqual(caught.exception.reason_code, "quarantined")
+
+    async def test_pending_backing_is_ready_for_accounting_but_not_transfer(self):
+        limits = adaptive_resource()["adaptive_cache"]
+        self.resources["moe"] = adaptive_resource()
+        self.resources["moe"].update(
+            expert_cache_url=str(self.upstream.make_url("/expert-cache")),
+            health_url=str(self.upstream.make_url("/health")),
+        )
+        self.expert_cache_state = {
+            **limits,
+            "capacity_bytes": limits["maximum_capacity_bytes"],
+            "pending_backing_release": True,
+            "quarantined": False,
+        }
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        self.assertTrue(await runtime.ready("moe"))
+        info = await runtime.expert_cache_info(
+            "moe", allow_pending_backing_release=True
+        )
+        self.assertTrue(info["pending_backing_release"])
+        with self.assertRaises(ExpertCacheStateError) as caught:
+            await runtime.expert_cache_info("moe")
+        self.assertEqual(caught.exception.reason_code, "pending_backing_release")
 
     async def test_comfy_start_command_waits_past_systemd_readiness_deadline(self):
         self.resources["comfyui"].update(

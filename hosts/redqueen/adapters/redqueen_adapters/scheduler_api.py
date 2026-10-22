@@ -288,7 +288,9 @@ class Runtime:
             url = base + "/expert-cache"
         return url
 
-    async def expert_cache_info(self, name: str) -> dict:
+    async def expert_cache_info(
+        self, name: str, *, allow_pending_backing_release: bool = False
+    ) -> dict:
         url = self.expert_cache_url(name)
         if not url:
             raise ExpertCacheStateError("missing_endpoint")
@@ -316,7 +318,7 @@ class Runtime:
             raise ExpertCacheStateError("invalid_state_flags")
         if quarantined:
             raise ExpertCacheStateError("quarantined")
-        if pending_release:
+        if pending_release and not allow_pending_backing_release:
             raise ExpertCacheStateError("pending_backing_release")
         return body
 
@@ -417,7 +419,9 @@ class Runtime:
                     if response.status != 200:
                         return False
             if self.resources[name].get("adaptive_cache"):
-                await self.expert_cache_info(name)
+                # Pending allocator release is accounted as physical unknown
+                # memory; readiness only rejects a quarantined or invalid worker.
+                await self.expert_cache_info(name, allow_pending_backing_release=True)
             if spec.get("nodes_url"):
                 nodes_url = spec["nodes_url"].rstrip("/")
                 for node in spec["required_nodes"]:
@@ -553,7 +557,11 @@ class Scheduler:
                 self.cache_fallback_caps.pop(name, None)
                 continue
             try:
-                info = await self.runtime.expert_cache_info(name)
+                # Keep the logical capacity. Any physical bytes not returned by
+                # the allocator remain in the usage-minus-reservation reserve.
+                info = await self.runtime.expert_cache_info(
+                    name, allow_pending_backing_release=True
+                )
             except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError):
                 # If live cache ownership cannot be proven, reserve its full
                 # profile and refuse to transfer that memory to another model.
