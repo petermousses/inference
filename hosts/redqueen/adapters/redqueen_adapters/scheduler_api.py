@@ -342,8 +342,10 @@ class Runtime:
             if not isinstance(body, dict):
                 raise ExpertCacheStateError("invalid_resize_response")
         info = await self.expert_cache_info(name)
-        if info["capacity_bytes"] > capacity_bytes:
-            raise ExpertCacheStateError("reported_capacity_exceeds_target")
+        # Backends can report allocator-rounded capacity above the requested
+        # byte target. The scheduler accounts for the reported capacity and
+        # checks physical fit before dispatch; cache shrinks probe a lower
+        # representable target when this overshoots.
         return info
 
     async def generation(self, name: str) -> str | None:
@@ -795,11 +797,16 @@ class Scheduler:
             initial = self.cache_allocations.get(name, limits["maximum_capacity_bytes"])
             accepted, info = await issue_resize(name, target)
             actual = info["capacity_bytes"]
+            overshot = actual > target
+            if overshot:
+                # A successful HTTP response is not enough when allocator
+                # granularity leaves more bytes reserved than the target.
+                accepted = False
             fits, capacity_now, unknown_now = measured_fit()
             if accepted or (
                 target < initial and actual <= target
             ) or (
-                target > initial and actual >= target
+                target > initial and actual == target
             ):
                 if actual < target:
                     # The runtime rounds byte budgets down to whole expert
@@ -813,7 +820,7 @@ class Scheduler:
             # A failed growth can safely remain at the verified current size.
             # A failed shrink needs a smaller proven allocation before another
             # model can borrow those bytes.
-            if target >= initial:
+            if target >= initial and not overshot:
                 self.cache_fallback_caps[name] = actual
                 LOG.warning(
                     "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d",
@@ -839,15 +846,13 @@ class Scheduler:
 
             accepted, info = await issue_resize(name, candidate)
             actual = info["capacity_bytes"]
-            if not accepted and actual > candidate:
+            if actual > target:
                 LOG.error(
-                    "cache minimum shrink rejected model=%s minimum_bytes=%d current_bytes=%d",
-                    name,
-                    candidate,
-                    actual,
+                    "cache shrink cannot fit target model=%s minimum_bytes=%d requested_bytes=%d capacity_bytes=%d",
+                    name, candidate, target, actual,
                 )
                 raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed")
-            lower = min(actual, candidate)
+            lower = actual
 
             # Refine the largest verified lower capacity with bounded probes.
             # The failed requested target is the upper bound.
@@ -861,6 +866,13 @@ class Scheduler:
                     lower = actual
                 else:
                     upper = candidate
+
+            if self.cache_allocations.get(name) != lower:
+                _accepted, info = await issue_resize(name, lower)
+                actual = info["capacity_bytes"]
+                if actual > target:
+                    raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed")
+                lower = actual
 
             self.cache_fallback_caps[name] = lower
             fits, capacity_now, unknown_now = measured_fit()
