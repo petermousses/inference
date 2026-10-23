@@ -397,6 +397,94 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await scheduler._rebalance_caches(None, runtime.limit, Memory(0, 0)))
         self.assertNotIn("deepseek", scheduler.cache_fallback_caps)
 
+    async def test_failed_cache_growth_searches_for_largest_verified_capacity(self):
+        resources = {"deepseek": adaptive_resource()}
+        runtime = FakeAdaptiveRuntime(resources, capacity=100)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "growth-search-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"deepseek": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        runtime.reject_cache_above["deepseek"] = 52
+
+        fits = await scheduler._rebalance_caches(None, runtime.limit, Memory(0, 0))
+
+        self.assertTrue(fits)
+        self.assertEqual(runtime.cache_capacities["deepseek"], 52)
+        self.assertEqual(scheduler.cache_allocations["deepseek"], 52)
+        self.assertEqual(scheduler.cache_fallback_caps["deepseek"], 52)
+        self.assertEqual(
+            runtime.resize_calls,
+            [
+                ("deepseek", 100),
+                ("deepseek", 55),
+                ("deepseek", 32),
+                ("deepseek", 43),
+                ("deepseek", 49),
+                ("deepseek", 52),
+                ("deepseek", 53),
+            ],
+        )
+        self.assertTrue(runtime.capacity()[1].fits(runtime.limit))
+
+        resize_calls = list(runtime.resize_calls)
+        self.assertTrue(
+            await scheduler._rebalance_caches(None, runtime.limit, Memory(0, 0))
+        )
+        self.assertEqual(runtime.resize_calls, resize_calls)
+
+        runtime.limit = Memory(150, 150)
+        self.assertTrue(
+            await scheduler._rebalance_caches(None, runtime.limit, Memory(0, 0))
+        )
+        self.assertEqual(runtime.resize_calls[len(resize_calls)], ("deepseek", 130))
+
+        resources["qwen"] = adaptive_resource()
+        runtime.resources = resources
+        runtime.cache_capacities["qwen"] = 10
+        runtime.physical_cache_capacities["qwen"] = 10
+        runtime.loaded["qwen"] = "ready"
+        scheduler.resources = resources
+        scheduler.states["qwen"] = "ready"
+        scheduler.cache_allocations["qwen"] = 10
+        scheduler.active.update(deepseek=1, qwen=1)
+        runtime.resize_calls.clear()
+
+        self.assertTrue(
+            await scheduler._rebalance_caches("qwen", runtime.limit, Memory(0, 0))
+        )
+        self.assertIn(("deepseek", 55), runtime.resize_calls)
+        self.assertEqual(
+            scheduler.cache_fallback_demands["deepseek"], ("deepseek", "qwen")
+        )
+
+    async def test_failed_cache_growth_stops_when_physical_usage_no_longer_fits(self):
+        class RuntimeWithExternalPressure(FakeAdaptiveRuntime):
+            async def resize_expert_cache(self, name, capacity_bytes):
+                try:
+                    return await super().resize_expert_cache(name, capacity_bytes)
+                except ExpertCacheResizeError:
+                    self.external = Memory(141, 141)
+                    raise
+
+        resources = {"deepseek": adaptive_resource()}
+        runtime = RuntimeWithExternalPressure(resources, capacity=150)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "growth-pressure-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"deepseek": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        runtime.reject_cache_above["deepseek"] = 52
+
+        fits = await scheduler._rebalance_caches(None, runtime.limit, Memory(0, 0))
+
+        self.assertFalse(fits)
+        self.assertEqual(runtime.resize_calls, [("deepseek", 130)])
+        self.assertEqual(runtime.cache_capacities["deepseek"], 10)
+        self.assertEqual(scheduler.cache_allocations["deepseek"], 10)
+
     async def test_cache_rounding_caps_unrepresentable_capacity_for_current_demand(self):
         resources = {name: adaptive_resource() for name in ("deepseek", "qwen")}
         runtime = FakeAdaptiveRuntime(resources, capacity=150)

@@ -549,6 +549,8 @@ class Scheduler:
         }
         self.cache_unready: set[str] = set()
         self.cache_fallback_caps: dict[str, int] = {}
+        self.cache_fallback_demands: dict[str, tuple[str, ...]] = {}
+        self.cache_fallback_targets: dict[str, int] = {}
         self.cache_rebalance_tasks: set[asyncio.Task] = set()
         self.transition = asyncio.Lock()
         self.execution = SerializedExecution(lock_dir)
@@ -566,6 +568,8 @@ class Scheduler:
                 self.cache_allocations.pop(name, None)
                 self.cache_unready.discard(name)
                 self.cache_fallback_caps.pop(name, None)
+                self.cache_fallback_demands.pop(name, None)
+                self.cache_fallback_targets.pop(name, None)
                 continue
             try:
                 # Keep the logical capacity. Any physical bytes not returned by
@@ -662,13 +666,27 @@ class Scheduler:
             warm = [name for name in adjustable_names if name in self.states]
             if warm:
                 demand_names = [max(warm, key=lambda name: (self.last_used.get(name, 0), name))]
+        demand_signature = tuple(sorted(demand_names))
         for name in adjustable_names:
             if name not in demand_names:
                 self.cache_fallback_caps.pop(name, None)
-        if len(demand_names) == 1:
-            # A lone active/warm model gets a fresh chance at its full profile
-            # ceiling. Any failed ceiling is re-established from live state.
-            self.cache_fallback_caps.pop(demand_names[0], None)
+                self.cache_fallback_demands.pop(name, None)
+                self.cache_fallback_targets.pop(name, None)
+            else:
+                if self.cache_fallback_demands.get(name) not in {
+                    None,
+                    demand_signature,
+                }:
+                    self.cache_fallback_caps.pop(name, None)
+                    self.cache_fallback_targets.pop(name, None)
+                self.cache_fallback_demands[name] = demand_signature
+
+        def remember_fallback_cap(
+            name: str, capacity_bytes: int, requested_bytes: int
+        ) -> None:
+            self.cache_fallback_caps[name] = capacity_bytes
+            self.cache_fallback_demands[name] = demand_signature
+            self.cache_fallback_targets[name] = requested_bytes
 
         def fixed_reservation() -> Memory:
             fixed = Memory(0, 0)
@@ -700,7 +718,9 @@ class Scheduler:
                 fixed += self.minimum_reservation(incoming, active=True)
             return fixed
 
-        def targets_for(extra_bytes: int) -> dict[str, int]:
+        def targets_for(
+            extra_bytes: int, *, ignore_fallback_caps: bool = False
+        ) -> dict[str, int]:
             if (
                 reserve_incoming_startup
                 and incoming is not None
@@ -725,7 +745,11 @@ class Scheduler:
                     minimum = limits["minimum_capacity_bytes"]
                     maximum = min(
                         limits["maximum_capacity_bytes"],
-                        self.cache_fallback_caps.get(name, limits["maximum_capacity_bytes"]),
+                        limits["maximum_capacity_bytes"]
+                        if ignore_fallback_caps
+                        else self.cache_fallback_caps.get(
+                            name, limits["maximum_capacity_bytes"]
+                        ),
                     )
                     maximum_extra = math.ceil(
                         (maximum - minimum)
@@ -740,7 +764,11 @@ class Scheduler:
                         limits = self.resources[name]["adaptive_cache"]
                         maximum = min(
                             limits["maximum_capacity_bytes"],
-                            self.cache_fallback_caps.get(name, limits["maximum_capacity_bytes"]),
+                            limits["maximum_capacity_bytes"]
+                            if ignore_fallback_caps
+                            else self.cache_fallback_caps.get(
+                                name, limits["maximum_capacity_bytes"]
+                            ),
                         )
                         targets[name] = limits["minimum_capacity_bytes"] + math.floor(
                             share / limits["reservation_multiplier"]
@@ -749,6 +777,20 @@ class Scheduler:
                     break
                 uncapped = [name for name in uncapped if name not in capped]
             return targets
+
+        def targets_for_demand(extra_bytes: int) -> dict[str, int]:
+            unconstrained = targets_for(extra_bytes, ignore_fallback_caps=True)
+            for name in demand_names:
+                previous_target = self.cache_fallback_targets.get(name)
+                if (
+                    previous_target is not None
+                    and unconstrained.get(name, 0) > previous_target
+                ):
+                    # More scheduler-verified headroom is now available than
+                    # when this allocator ceiling was found; probe it again.
+                    self.cache_fallback_caps.pop(name, None)
+                    self.cache_fallback_targets.pop(name, None)
+            return targets_for(extra_bytes)
 
         async def issue_resize(name: str, target: int) -> tuple[bool, dict]:
             task = asyncio.create_task(self.runtime.resize_expert_cache(name, target))
@@ -836,16 +878,101 @@ class Scheduler:
                     # The runtime rounds byte budgets down to whole expert
                     # slots. Remember that representable limit for this demand
                     # set so a later pass does not repeat the same resize.
-                    self.cache_fallback_caps[name] = min(
-                        self.cache_fallback_caps.get(name, actual), actual
+                    remember_fallback_cap(
+                        name,
+                        min(self.cache_fallback_caps.get(name, actual), actual),
+                        target,
                     )
                 return fits, capacity_now, unknown_now
 
-            # A failed growth can safely remain at the verified current size.
-            # A failed shrink needs a smaller proven allocation before another
-            # model can borrow those bytes.
+            # Keep a failed growth at a verified size; a failed shrink must
+            # reach a smaller proven allocation before another model can
+            # borrow those bytes.
             if target >= initial and not overshot:
-                self.cache_fallback_caps[name] = actual
+                if target > initial and fits:
+                    # The full safe budget can still exceed what the runtime
+                    # allocator can represent. Search below that failed target
+                    # while this scheduler owns the transition, accounting for
+                    # the reported capacity and physical usage after every try.
+                    lower = actual
+                    upper = target
+                    for _ in range(8):
+                        candidate = lower + (upper - lower) // 2
+                        if candidate <= lower or candidate >= upper:
+                            break
+                        candidate_accepted, candidate_info = await issue_resize(
+                            name, candidate
+                        )
+                        actual = candidate_info["capacity_bytes"]
+                        if actual > candidate:
+                            candidate_accepted = False
+                        fits, capacity_now, unknown_now = measured_fit()
+
+                        if not candidate_accepted or not fits:
+                            if actual > lower:
+                                # Failed/oversized probes must not leave a
+                                # larger reservation behind while search
+                                # continues. Restore the last proven capacity.
+                                _restored, restore_info = await issue_resize(
+                                    name, lower
+                                )
+                                if restore_info["capacity_bytes"] != lower:
+                                    self.cache_allocations[name] = limits[
+                                        "maximum_capacity_bytes"
+                                    ]
+                                    self.cache_unready.add(name)
+                                    raise AdmissionError(
+                                        503,
+                                        "expert cache could not safely restore its prior reservation",
+                                        "cache_resize_failed",
+                                    )
+                                fits, capacity_now, unknown_now = measured_fit()
+                            elif actual < lower:
+                                # The worker reports a smaller settled backing;
+                                # account for it before considering another try.
+                                lower = actual
+                            upper = candidate
+                            if not fits:
+                                remember_fallback_cap(name, lower, target)
+                                LOG.warning(
+                                    "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d",
+                                    name,
+                                    target,
+                                    lower,
+                                )
+                                return fits, capacity_now, unknown_now
+                            continue
+
+                        if actual > lower:
+                            lower = actual
+                        else:
+                            # The allocator rounded this request to the current
+                            # slot count, so no larger capacity is proven here.
+                            upper = candidate
+
+                    if self.cache_allocations.get(name) != lower:
+                        _restored, restore_info = await issue_resize(name, lower)
+                        if restore_info["capacity_bytes"] != lower:
+                            self.cache_allocations[name] = limits[
+                                "maximum_capacity_bytes"
+                            ]
+                            self.cache_unready.add(name)
+                            raise AdmissionError(
+                                503,
+                                "expert cache could not safely restore its prior reservation",
+                                "cache_resize_failed",
+                            )
+                    remember_fallback_cap(name, lower, target)
+                    fits, capacity_now, unknown_now = measured_fit()
+                    LOG.warning(
+                        "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d",
+                        name,
+                        target,
+                        lower,
+                    )
+                    return fits, capacity_now, unknown_now
+
+                remember_fallback_cap(name, actual, target)
                 LOG.warning(
                     "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d",
                     name,
@@ -898,7 +1025,7 @@ class Scheduler:
                     raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed")
                 lower = actual
 
-            self.cache_fallback_caps[name] = lower
+            remember_fallback_cap(name, lower, target)
             fits, capacity_now, unknown_now = measured_fit()
             LOG.warning(
                 "cache resize reduced model=%s requested_bytes=%d capacity_bytes=%d",
@@ -915,7 +1042,7 @@ class Scheduler:
             fixed = fixed_reservation()
             available = capacity - fixed - unknown
             minimum_fits = available.gpu >= 0 and available.host >= 0
-            targets = targets_for(max(0, min(available.gpu, available.host)))
+            targets = targets_for_demand(max(0, min(available.gpu, available.host)))
             shrinking = [
                 name for name in adjustable_names
                 if name in self.states
@@ -932,7 +1059,7 @@ class Scheduler:
                 fixed = fixed_reservation()
                 available = capacity_now - fixed - unknown
                 minimum_fits = available.gpu >= 0 and available.host >= 0
-                targets = targets_for(max(0, min(available.gpu, available.host)))
+                targets = targets_for_demand(max(0, min(available.gpu, available.host)))
                 shrinking = [
                     name for name in adjustable_names
                     if name in self.states
@@ -1092,6 +1219,8 @@ class Scheduler:
                     self.cache_allocations.pop(victim, None)
                     self.cache_unready.discard(victim)
                     self.cache_fallback_caps.pop(victim, None)
+                    self.cache_fallback_demands.pop(victim, None)
+                    self.cache_fallback_targets.pop(victim, None)
                 # Recheck real allocations after confirmed stops. Unknown GPU
                 # users and delayed frees must never become imaginary capacity.
                 capacity, usage = self.runtime.capacity()
@@ -1151,6 +1280,8 @@ class Scheduler:
             self.cache_allocations.pop(name, None)
             self.cache_unready.discard(name)
             self.cache_fallback_caps.pop(name, None)
+            self.cache_fallback_demands.pop(name, None)
+            self.cache_fallback_targets.pop(name, None)
         except Exception:
             self.states[name] = "quarantined"
         failure = self.recovery.setdefault(name, {})
@@ -1336,6 +1467,8 @@ class Scheduler:
                     self.cache_allocations.pop(name, None)
                     self.cache_unready.discard(name)
                     self.cache_fallback_caps.pop(name, None)
+                    self.cache_fallback_demands.pop(name, None)
+                    self.cache_fallback_targets.pop(name, None)
                     if not ready:
                         failure["attempts"] += 1
                         failure.update(state="cooling-down", next_retry=self.clock() + min(60, 5 * 2 ** min(failure["attempts"] - 1, 4)))
