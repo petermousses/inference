@@ -1,0 +1,3550 @@
+diff --git a/common/parsers/deepseek.cpp b/common/parsers/deepseek.cpp
+index 9ca4bb3..e00132a 100644
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -75,6 +75,13 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+     // non-thinking generation prompt ends with a bare </think> instead of an empty
+     // <think></think> pair.
+     const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
++    // V4.1 keeps the V4 format but its DSML tag names carry a leading space:
++    // "<｜DSML｜ calls>", "<｜DSML｜ invoke>", "<｜DSML｜ parameter>" (the release's
++    // encoding/encoding.py: tool_calls_block_name = " calls"). The template builds the
++    // opener as "<' + dsml_token + ' calls>" (single or double quotes), so that literal
++    // identifies a V4.1 template.
++    const bool is_v41 = is_v4 && (tmpl.source().find("' calls>") != std::string::npos ||
++                                  tmpl.source().find("\" calls>") != std::string::npos);
+ 
+     std::optional<json> adjusted_messages;
+     if (is_v4) {
+@@ -94,13 +101,15 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
+     const std::string DSML         = "｜DSML｜";
+     const std::string THINK_START  = "<think>";
+     const std::string THINK_END    = "</think>";
+-    const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
++    const std::string TC_BLOCK     = is_v41 ? " calls" : is_v4 ? "tool_calls" : "function_calls";
++    const std::string INVOKE_TAG   = is_v41 ? " invoke" : "invoke";
++    const std::string PARAM_TAG    = is_v41 ? " parameter" : "parameter";
+     const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
+     const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
+-    const std::string INVOKE_START = "<" + DSML + "invoke";
+-    const std::string INVOKE_END   = "</" + DSML + "invoke>";
+-    const std::string PARAM_START  = "<" + DSML + "parameter";
+-    const std::string PARAM_END    = "</" + DSML + "parameter>";
++    const std::string INVOKE_START = "<" + DSML + INVOKE_TAG;
++    const std::string INVOKE_END   = "</" + DSML + INVOKE_TAG + ">";
++    const std::string PARAM_START  = "<" + DSML + PARAM_TAG;
++    const std::string PARAM_END    = "</" + DSML + PARAM_TAG + ">";
+     const std::string GEN_PROMPT   = "<｜Assistant｜>";
+     const std::string TC_SEPARATOR = "\n\n";
+ 
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+index 051ddf9..d01ec69 100644
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -63,6 +63,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "Lfm2DSparkDraftModel": "qwen",
+     "LingDSparkModel": "qwen",
+     "DeepseekV4ForCausalLM": "deepseek",
++    "DeepseekV41ForCausalLM": "deepseek",
+     "DeepseekV4DSparkModel": "deepseek",
+     "DistilBertForMaskedLM": "bert",
+     "DistilBertForSequenceClassification": "bert",
+diff --git a/conversion/deepseek.py b/conversion/deepseek.py
+index 817eb76..657eca1 100644
+--- a/conversion/deepseek.py
++++ b/conversion/deepseek.py
+@@ -564,7 +564,10 @@ class DeepseekV4Model(TextModel):
+         # add a default chat template; if the model has a built-in template, it will be overridden later
+         model_id_hint = self.remote_hf_model_id or self.dir_model.name
+         is_0731 = "0731" in model_id_hint
+-        template_name = "deepseek-ai-DeepSeek-V4-Flash-0731.jinja" if is_0731 else "deepseek-ai-DeepSeek-V4.jinja"
++        is_v41 = "V4.1" in model_id_hint
++        template_name = ("deepseek-ai-DeepSeek-V4.1-Flash.jinja" if is_v41 else
++                         "deepseek-ai-DeepSeek-V4-Flash-0731.jinja" if is_0731 else
++                         "deepseek-ai-DeepSeek-V4.jinja")
+         template_path = Path(__file__).parent.parent / "models" / "templates" / template_name
+         if template_path.is_file():
+             with open(template_path, "r", encoding="utf-8") as f:
+@@ -1102,3 +1105,501 @@ class DeepseekV4FlashVisionModel(MmprojModel):
+             return
+ 
+         yield from super().modify_tensors(data_torch, name, bid)
++
++
++def _v41_is_prime(n: int) -> bool:
++    """Trial division, deliberately not sympy.
++
++    The reference uses sympy.isprime, but sympy is not a llama.cpp conversion dependency and
++    pulling in a computer algebra system to test primality would be hard to justify. The
++    candidates here sit just above engram_vocab_size, about 16 million, so trial division runs
++    to sqrt(n) which is around 4000 and costs nothing. There are 48 primes to find in total.
++    """
++    if n < 2:
++        return False
++    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
++        if n % p == 0:
++            return n == p
++    f = 41
++    while f * f <= n:
++        # 6k +/- 1 wheel, having already cleared the small primes above
++        if n % f == 0 or n % (f + 2) == 0:
++            return False
++        f += 6
++    return True
++
++
++def _v41_find_next_prime(start: int, seen_primes: set[int]) -> int:
++    """The smallest prime above start that has not been handed out yet."""
++    candidate = start + 1
++    while not _v41_is_prime(candidate) or candidate in seen_primes:
++        candidate += 1
++    return candidate
++
++
++def _v41_build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
++    """Map token ids to a compressed id space where normalized tokens collapse together."""
++    from tokenizers import Regex, normalizers
++
++    sentinel = "\ue000"  # private-use char to preserve single spaces
++    normalizer = normalizers.Sequence([
++        normalizers.NFKC(),
++        normalizers.NFD(),
++        normalizers.StripAccents(),
++        normalizers.Lowercase(),
++        normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
++        normalizers.Replace(Regex(r"^ $"), sentinel),
++        normalizers.Strip(),
++        normalizers.Replace(sentinel, " "),
++    ])
++
++    backend = tokenizer.backend_tokenizer
++    key_to_new: dict[str, int] = {}
++    lookup = [0] * len(tokenizer)
++    for token_id in range(len(tokenizer)):
++        text = backend.decode([token_id], skip_special_tokens=False)
++        if "\ufffd" in text:
++            key = backend.id_to_token(token_id)
++        else:
++            normalized = normalizer.normalize_str(text)
++            key = normalized if normalized else text
++
++        new_id = key_to_new.get(key)
++        if new_id is None:
++            new_id = len(key_to_new)
++            key_to_new[key] = new_id
++        lookup[token_id] = new_id
++
++    return lookup, len(key_to_new)
++
++
++def _v41_compute_hash_multipliers(layer_ids: tuple[int, ...], max_ngram_size: int, tokenizer_vocab_size: int):
++    """Generate odd multipliers for n-gram hashing, one per (layer, lookback)."""
++    import numpy as np
++    import torch
++
++    max_long = np.iinfo(np.int64).max
++    multiplier_bound = max(1, (max_long // tokenizer_vocab_size) // 2)
++    rows = []
++    for layer_id in layer_ids:
++        generator = np.random.default_rng(10007 * layer_id)
++        values = generator.integers(low=0, high=multiplier_bound, size=(max_ngram_size,), dtype=np.int64)
++        rows.append(torch.tensor(values * 2 + 1))
++    return torch.stack(rows)
++
++
++def _v41_process_identity(pid: int) -> str | None:
++    """Return a boot-scoped Linux process identity, or None when /proc is unavailable."""
++    try:
++        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
++        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
++        # The command name in stat is parenthesized and may contain spaces or ')'.
++        fields = stat[stat.rfind(")") + 2 :].split()
++        start_ticks = fields[19]  # field 22 (starttime), after fields 1-2 were removed
++        return f"{boot_id}:{start_ticks}"
++    except (OSError, IndexError):
++        return None
++
++
++def _v41_cleanup_stale_engram_staging(temp_root: Path) -> None:
++    """Remove only marked Engram scratch dirs whose creating process has exited."""
++    import os as _os
++    import shutil as _shutil
++
++    for path in temp_root.glob("llama-v41-engram-*"):
++        if path.is_symlink() or not path.is_dir():
++            continue
++        marker = path / ".llama-v41-engram-owner.json"
++        try:
++            owner = json.loads(marker.read_text(encoding="utf-8"))
++            pid = owner["pid"]
++            if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
++                continue
++            expected_identity = owner.get("process_identity")
++        except (OSError, ValueError, KeyError, TypeError):
++            # Never delete an unmarked or malformed directory.
++            continue
++
++        try:
++            _os.kill(pid, 0)
++        except ProcessLookupError:
++            alive = False
++        except PermissionError:
++            alive = True
++        except OSError:
++            alive = True
++        else:
++            current_identity = _v41_process_identity(pid)
++            alive = expected_identity is None or current_identity is None or current_identity == expected_identity
++
++        if alive:
++            continue
++        try:
++            _shutil.rmtree(path)
++            logger.info("removed stale DeepSeek-V4.1 Engram staging directory %s", path)
++        except OSError as error:
++            logger.warning("could not remove stale Engram staging directory %s: %s", path, error)
++
++
++@ModelBase.register("DeepseekV41ForCausalLM")
++@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
++class DeepseekV41Model(DeepseekV4Model):
++    """DeepSeek V4.1. Subclasses V4 and overrides only where the checkpoint differs.
++
++    See patch_llamacpp_v41.py for the verified list of differences. The important one is the
++    FP8 block size: V4 is [128, 128] and V4.1 is [32, 32], and using the wrong value corrupts
++    every dequantized weight without raising.
++    """
++
++    model_arch = gguf.MODEL_ARCH.DEEPSEEK41
++
++    def _v41_flatten_hparams(self):
++        """Promote the nested text_config to the top level.
++
++        V4.1 nests its text parameters under text_config while the inherited V4 code expects
++        them flat. Overriding load_hparams does not work, because base.__init__ calls
++        ModelBase.load_hparams explicitly rather than through the instance, so the seam is the
++        first consumer of hparams instead, which is index_tensors.
++        """
++        for key, value in (self.hparams.get("text_config") or {}).items():
++            self.hparams.setdefault(key, value)
++        # absent in V4.1; V4 reads it unconditionally
++        self.hparams.setdefault("num_hash_layers", 0)
++
++    def index_tensors(self, remote_hf_model_id=None):
++        self._v41_flatten_hparams()
++        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++
++        with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
++            raw = json.load(f)
++
++        # the FP8 scale block size, read rather than assumed
++        qcfg = raw.get("quantization_config") or {}
++        block = qcfg.get("weight_block_size") or [128, 128]
++        self._v41_block_rows = int(block[0])
++        self._v41_block_cols = int(block[1] if len(block) > 1 else block[0])
++        logger.info(
++            "DeepSeek V4.1: fp8 weight_block_size %dx%d, engram layers %s",
++            self._v41_block_rows, self._v41_block_cols,
++            self.hparams.get("engram_layer_ids"),
++        )
++
++        self.block_count = self.hparams["num_hidden_layers"]
++        if self.mtp_only:
++            self.block_count += self.hparams.get("num_nextn_predict_layers", 0)
++        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
++
++    @classmethod
++    def filter_tensors(cls, item):
++        name, _ = item
++        # the vision tower and its aligner are exported separately as an mmproj file
++        if name.startswith(("vision.", "aligner.", "image_")):
++            return None
++        return super().filter_tensors(item)
++
++    def dequant_model(self):
++        """Same as V4 but with the block size taken from the checkpoint."""
++        fp8_dtypes = self._float8_dtypes()
++        tensors_to_remove: list[str] = []
++        rows, cols = self._v41_block_rows, self._v41_block_cols
++
++        def dequant_fp8_weight(weight: Tensor, scale: Tensor) -> Tensor:
++            out_features, in_features = weight.shape
++            scale_f = self._e8m0_to_float(scale)
++            scale_f = scale_f.repeat_interleave(rows, 0)[:out_features]
++            scale_f = scale_f.repeat_interleave(cols, 1)[:, :in_features]
++            return weight.float() * scale_f
++
++        for name in list(self.model_tensors.keys()):
++            if not name.endswith(".scale"):
++                continue
++            weight_name = name.removesuffix(".scale") + ".weight"
++            if weight_name not in self.model_tensors:
++                continue
++            weight = self.model_tensors[weight_name]
++            scale = self.model_tensors[name]
++            if weight().dtype not in fp8_dtypes:
++                continue
++            self.model_tensors[weight_name] = lambda w=weight, s=scale: dequant_fp8_weight(w(), s())
++            self._dsv4_fp8_dequantized.add(weight_name)
++            tensors_to_remove.append(name)
++
++        for name in tensors_to_remove:
++            del self.model_tensors[name]
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        hparams = self.hparams
++        candidate_source = hparams.get("candidate_source_layer_id", hparams.get("candidate_source_layer", -1))
++        candidate_topk_blocks = hparams.get("candidate_topk_blocks", 0)
++        candidate_block_size = hparams.get("candidate_block_size", 0)
++        if candidate_source < -1:
++            raise ValueError("candidate_source_layer_id must be -1 or a valid layer")
++        if candidate_source >= 0:
++            if candidate_topk_blocks <= 0 or candidate_block_size <= 0:
++                raise ValueError("candidate attention requires positive candidate_topk_blocks and candidate_block_size")
++            if candidate_block_size > 1024:
++                raise ValueError("candidate_block_size exceeds the supported maximum of 1024")
++        elif candidate_topk_blocks != 0 or candidate_block_size != 0:
++            raise ValueError("candidate block sizes must be zero when candidate attention is disabled")
++        self.gguf_writer.add_indexer_candidate_source_layer(candidate_source)
++        self.gguf_writer.add_indexer_candidate_top_k_blocks(candidate_topk_blocks)
++        self.gguf_writer.add_indexer_candidate_block_size(candidate_block_size)
++        if (engram_ids := hparams.get("engram_layer_ids")) is not None:
++            # These MUST carry the arch prefix, not a literal "deepseek4.". llama.cpp resolves
++            # every LLM_KV_* as "{arch}.{key}", so a hardcoded prefix means the runtime looks up
++            # deepseek41.engram.head_count and finds nothing, on a file that otherwise loads.
++            arch = self.gguf_writer.arch
++            self.gguf_writer.add_uint32(gguf.Keys.Engram.HEAD_COUNT.format(arch=arch), hparams["engram_n_heads"])
++            self.gguf_writer.add_uint32(gguf.Keys.Engram.KEY_LENGTH.format(arch=arch), hparams["engram_head_dim"])
++            self.gguf_writer.add_uint32(gguf.Keys.Engram.MAX_NGRAM_SIZE.format(arch=arch), hparams["engram_max_ngram_size"])
++            self.gguf_writer.add_array(gguf.Keys.Engram.LAYER_IDS.format(arch=arch), engram_ids)
++
++            # Generate and write engram hash constants
++            import numpy as _np
++
++            # A model with engram layers cannot run without these constants, so every step below
++            # raises rather than warns: a file that is missing them loads and then hashes wrong.
++            from transformers import AutoTokenizer
++            tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
++
++            # Build compressed token map
++            token_map, compressed_vocab_size = _v41_build_compressed_token_map(tokenizer)
++            expected_vocab = hparams.get("engram_compressed_vocab_size")
++            if compressed_vocab_size != expected_vocab:
++                # every multiplier derives from this size, so a mismatch rehashes the whole table
++                raise ValueError(f"compressed vocab size is {compressed_vocab_size}, config says {expected_vocab}")
++            engram_vocab_size = int(hparams["engram_vocab_size"])
++            raw_pad_token_id = int(hparams.get("engram_pad_id", 2))
++            if engram_vocab_size <= 0 or engram_vocab_size > 0xFFFFFFFF:
++                raise ValueError(f"Engram vocabulary size is outside uint32 range: {engram_vocab_size}")
++            if compressed_vocab_size <= 0 or compressed_vocab_size > 0xFFFFFFFF:
++                raise ValueError(f"compressed Engram vocabulary size is outside uint32 range: {compressed_vocab_size}")
++            if raw_pad_token_id < 0 or raw_pad_token_id >= len(token_map):
++                raise ValueError(f"Engram pad token id is outside the tokenizer vocabulary: {raw_pad_token_id}")
++
++            # Preserve the raw-token-space metadata needed by GGUFs whose tables are combined
++            # into per_layer_token_embd.weight, alongside the mapped pad id used by this
++            # converter's per-layer Engram tensors.
++            self.gguf_writer.add_uint32(gguf.Keys.Engram.VOCAB_SIZE.format(arch=arch), engram_vocab_size)
++            self.gguf_writer.add_uint32(
++                gguf.Keys.Engram.COMPRESSED_VOCAB_SIZE.format(arch=arch), compressed_vocab_size
++            )
++            self.gguf_writer.add_uint32(gguf.Keys.Engram.PAD_TOKEN_ID.format(arch=arch), raw_pad_token_id)
++
++            # Compute multipliers
++            layer_ids = tuple(engram_ids)
++            multipliers = _v41_compute_hash_multipliers(layer_ids, hparams["engram_max_ngram_size"], compressed_vocab_size)
++
++            # Compute primes and offsets. Every (n-gram size, head) pair gets its own bucket, and
++            # the search starts over at engram_vocab_size - 1 for each n-gram size, so the shared
++            # `seen` set is what keeps the buckets distinct.
++            max_ngram_size = hparams["engram_max_ngram_size"]
++            n_heads = hparams["engram_n_heads"]
++            primes_list, seen_primes = [], set()
++
++            for layer_id in layer_ids:
++                per_ngram = []
++                for ngram_idx in range(max_ngram_size - 1):
++                    current_search = hparams["engram_vocab_size"] - 1
++                    sizes = []
++                    for head_idx in range(n_heads):
++                        current_search = _v41_find_next_prime(current_search, seen_primes)
++                        seen_primes.add(current_search)
++                        sizes.append(current_search)
++                    per_ngram.append(sizes)
++                primes_list.append(per_ngram)
++
++            # [n_engram_layers, max_ngram_size - 1, n_heads]
++            primes_array = _np.array(primes_list, dtype=_np.uint64)
++
++            # each bucket starts where the previous one ended, in that same order flattened
++            offsets_list = []
++            for layer_primes in primes_array:
++                flat_primes = layer_primes.flatten()
++                offsets = _np.cumsum(_np.concatenate(([0], flat_primes[:-1])))
++                offsets_list.append(offsets.reshape(layer_primes.shape))
++            offsets_array = _np.array(offsets_list, dtype=_np.uint64)
++
++            # Write constants to GGUF.
++            # add_array() infers the element type from the first item and maps every Python int to
++            # INT32, which would truncate the multipliers, so pass the element type explicitly and
++            # flatten by hand: a gguf array is one dimensional.
++            def add_u64(key, arr):
++                self.gguf_writer.add_key_value(
++                    key,
++                    [int(x) for x in _np.asarray(arr).reshape(-1)],
++                    gguf.GGUFValueType.ARRAY,
++                    gguf.GGUFValueType.UINT64,
++                )
++
++            add_u64(gguf.Keys.Engram.MULTIPLIERS.format(arch=arch), multipliers.numpy())
++            add_u64(gguf.Keys.Engram.PRIMES.format(arch=arch), primes_array)
++            add_u64(gguf.Keys.Engram.OFFSETS.format(arch=arch), offsets_array)
++            self.gguf_writer.add_key_value(
++                gguf.Keys.Engram.TOKEN_MAP.format(arch=arch),
++                [int(x) for x in token_map],
++                gguf.GGUFValueType.ARRAY,
++                gguf.GGUFValueType.INT32,
++            )
++            # the reference stores the padding token already mapped, so do the same here
++            self.gguf_writer.add_uint32(
++                gguf.Keys.Engram.PAD_ID.format(arch=arch),
++                int(token_map[raw_pad_token_id]),
++            )
++            logger.info("Engram constants written: multipliers %s, primes %s, offsets %s, token_map %d",
++                        multipliers.shape, primes_array.shape, offsets_array.shape, len(token_map))
++
++
++    # rows per block when rewriting an engram table; 1M rows is about 1 GB of float32 scratch
++    _V41_ENGRAM_CHUNK_ROWS = 1_000_000
++
++    def _write_engram_table(self, bid: int) -> list[str]:
++        """Quantize one engram table in row blocks, accumulating into a disk-backed memmap.
++
++        The inherited FP8 path cannot be used here. It computes weight.float() * scale over the
++        whole tensor, and one engram table is 384,006,168 x 256, so 98.3 billion elements, which
++        is 393 GB as float32. A run that reaches this tensor collapses from 118 GiB free to 13 GiB
++        and is killed. Every other tensor in the model converts normally.
++
++        The scale layout also differs from the rest of the checkpoint. Linear weights carry a
++        [rows/32, cols/32] scale matching weight_block_size [32, 32], while the engram scale is
++        [rows, 8], which is one scale per 32 columns within a single row. Broadcasting it the way
++        the generic path does would corrupt the table, so it is expanded along columns only.
++
++        Reading is done straight from the safetensors shard rather than through the lazy tensor
++        wrapper, because to_eager materializes the whole tensor before any slicing takes effect.
++        """
++        import json as _json
++        import os as _os
++        import tempfile as _tempfile
++
++        import numpy as _np
++        from safetensors import safe_open as _safe_open
++
++        weight_name = f"layers.{bid}.engram.embed.weight"
++        scale_name = f"layers.{bid}.engram.embed.scale"
++
++        index_path = self.dir_model / "model.safetensors.index.json"
++        with open(index_path, "r", encoding="utf-8") as f:
++            weight_map = _json.load(f)["weight_map"]
++        shard = self.dir_model / weight_map[weight_name]
++
++        qtype = gguf.GGMLQuantizationType.Q8_0
++        block_elems = gguf.GGML_QUANT_SIZES[qtype][0]
++
++        with _safe_open(str(shard), framework="pt") as f:
++            wsl = f.get_slice(weight_name)
++            n_rows, n_cols = (int(x) for x in wsl.get_shape())
++            has_scale = scale_name in f.keys()
++            ssl = f.get_slice(scale_name) if has_scale else None
++            scale_groups = int(ssl.get_shape()[1]) if has_scale else 0
++
++            if n_cols % block_elems:
++                raise ValueError(
++                    f"engram row width {n_cols} is not a multiple of the {qtype.name} block {block_elems}"
++                )
++            if has_scale and n_cols % scale_groups:
++                raise ValueError(
++                    f"engram row width {n_cols} is not divisible by its {scale_groups} scale groups"
++                )
++            per_group = n_cols // scale_groups if has_scale else 0
++
++            row_bytes = int(gguf.quantize(_np.zeros((1, n_cols), dtype=_np.float32), qtype).nbytes)
++            rows_per_chunk = min(int(self._V41_ENGRAM_CHUNK_ROWS), n_rows)
++            n_chunks = (n_rows + rows_per_chunk - 1) // rows_per_chunk
++
++            tmp_dir = _os.environ.get("V41_ENGRAM_TMPDIR") or None
++            staging = getattr(self, "_v41_engram_tempdir", None)
++            if staging is None:
++                staging_root = Path(tmp_dir or _tempfile.gettempdir())
++                _v41_cleanup_stale_engram_staging(staging_root)
++                staging = _tempfile.TemporaryDirectory(prefix="llama-v41-engram-", dir=str(staging_root))
++                owner = {
++                    "pid": _os.getpid(),
++                    "process_identity": _v41_process_identity(_os.getpid()),
++                }
++                owner_path = Path(staging.name) / ".llama-v41-engram-owner.json"
++                with owner_path.open("x", encoding="utf-8") as f:
++                    json.dump(owner, f)
++                    f.write("\n")
++                self._v41_engram_tempdir = staging
++                self._v41_engram_memmaps = []
++            tmp_path = _os.path.join(staging.name, f"engram_{bid}_{qtype.name}.bin")
++            logger.info(
++                "engram layer %d: %d x %d, scale groups %d, %s in %d blocks of %d rows, staging %.1f GB at %s",
++                bid, n_rows, n_cols, scale_groups, qtype.name, n_chunks, rows_per_chunk,
++                n_rows * row_bytes / 1e9, tmp_path,
++            )
++
++            out = _np.memmap(tmp_path, dtype=_np.uint8, mode="w+", shape=(n_rows, row_bytes))
++            self._v41_engram_memmaps.append(out)
++            for ci, start in enumerate(range(0, n_rows, rows_per_chunk)):
++                stop = min(start + rows_per_chunk, n_rows)
++                chunk = wsl[start:stop, :].float()
++                if has_scale:
++                    s = self._e8m0_to_float(ssl[start:stop, :])
++                    chunk = chunk * s.repeat_interleave(per_group, 1)[:, :n_cols]
++                out[start:stop] = gguf.quantize(
++                    chunk.cpu().numpy().astype(_np.float32), qtype
++                ).reshape(stop - start, row_bytes)
++                del chunk
++                if ci % 25 == 0:
++                    logger.info("  engram layer %d: %d / %d rows", bid, stop, n_rows)
++            out.flush()
++
++        new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid, ".weight")
++        self.gguf_writer.add_tensor(new_name, out, raw_dtype=qtype)
++        logger.info("engram layer %d: wrote %s as %s", bid, new_name, qtype.name)
++
++        consumed = [weight_name]
++        if has_scale:
++            consumed.append(scale_name)
++        return consumed
++
++    def write(self):
++        try:
++            super().write()
++        finally:
++            staging = getattr(self, "_v41_engram_tempdir", None)
++            if staging is not None:
++                for tensor in getattr(self, "_v41_engram_memmaps", []):
++                    mapping = getattr(tensor, "_mmap", None)
++                    if mapping is not None:
++                        try:
++                            mapping.close()
++                        except Exception as error:
++                            logger.warning("could not close Engram staging map: %s", error)
++                self._v41_engram_memmaps = []
++                self._v41_engram_tempdir = None
++                staging.cleanup()
++
++    def generate_extra_tensors(self):
++        yield from super().generate_extra_tensors()
++
++        consumed: list[str] = []
++        for bid in (self.hparams.get("engram_layer_ids") or []):
++            if f"layers.{bid}.engram.embed.weight" in self.model_tensors:
++                consumed.extend(self._write_engram_table(int(bid)))
++        for name in consumed:
++            if name in self.model_tensors:
++                del self.model_tensors[name]
++
++    def _map_dsv4_tensor_name(self, name: str, bid):
++        match = re.match(r"layers\.(\d+)\.(.+)$", name)
++        if match is not None:
++            v41_only = {
++                "engram.embed.weight": (gguf.MODEL_TENSOR.ENGRAM_EMBD, ".weight"),
++                "engram.k_weight": (gguf.MODEL_TENSOR.ENGRAM_K, ".weight"),
++                "engram.q_weight": (gguf.MODEL_TENSOR.ENGRAM_Q, ".weight"),
++                "engram.wkv.weight": (gguf.MODEL_TENSOR.ENGRAM_WKV, ".weight"),
++                "attn.indexer.k_norm.weight": (gguf.MODEL_TENSOR.INDEXER_K_NORM, ".weight"),
++                "attn.indexer.wk.weight": (gguf.MODEL_TENSOR.INDEXER_ATTN_K, ".weight"),
++            }
++            tensor_name = match.group(2)
++            if tensor_name in v41_only:
++                return v41_only[tensor_name]
++        return super()._map_dsv4_tensor_name(name, bid)
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 1e0a6b1..0260271 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -232,6 +232,9 @@ class Keys:
+             TYPES      = "{arch}.attention.indexer.types"
+             KPOOL             = "{arch}.attention.indexer.kpool"              # GLM5-Next
+             KPOOL_SELECT_TAIL = "{arch}.attention.indexer.kpool_select_tail"  # GLM5-Next
++            CANDIDATE_SOURCE_LAYER = "{arch}.attention.indexer.candidate_source_layer"  # DeepSeek-V4.1
++            CANDIDATE_TOP_K_BLOCKS = "{arch}.attention.indexer.candidate_top_k_blocks"  # DeepSeek-V4.1
++            CANDIDATE_BLOCK_SIZE   = "{arch}.attention.indexer.candidate_block_size"    # DeepSeek-V4.1
+ 
+     class HyperConnection:
+         COUNT                = "{arch}.hyper_connection.count"
+@@ -242,6 +245,20 @@ class Keys:
+         # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
+         LOW_RANK             = "{arch}.hyper_connection.low_rank"
+ 
++    class Engram:
++        LAYER_IDS      = "{arch}.engram.layer_ids"
++        HEAD_COUNT     = "{arch}.engram.head_count"
++        KEY_LENGTH     = "{arch}.engram.key_length"
++        MAX_NGRAM_SIZE = "{arch}.engram.max_ngram_size"
++        VOCAB_SIZE     = "{arch}.engram.vocab_size"
++        COMPRESSED_VOCAB_SIZE = "{arch}.engram.compressed_vocab_size"
++        PAD_TOKEN_ID   = "{arch}.engram.pad_token_id"
++        MULTIPLIERS    = "{arch}.engram.multipliers"
++        PRIMES         = "{arch}.engram.primes"
++        OFFSETS        = "{arch}.engram.offsets"
++        TOKEN_MAP      = "{arch}.engram.token_map"
++        PAD_ID         = "{arch}.engram.pad_id"
++
+     class PerLayerEmbedding:
+         LAYERS             = "{arch}.ple.layers"
+         NGRAM_SIZE         = "{arch}.ple.ngram_size"
+@@ -584,6 +601,7 @@ class MODEL_ARCH(IntEnum):
+     DEEPSEEK2OCR     = auto()
+     DEEPSEEK32       = auto()
+     DEEPSEEK4        = auto()
++    DEEPSEEK41       = auto()
+     CHATGLM          = auto()
+     GLM4             = auto()
+     GLM4_MOE         = auto()
+@@ -927,6 +945,12 @@ class MODEL_TENSOR(IntEnum):
+     VISEXP_DOWN          = auto()
+     VISEXP_UP            = auto()
+     INDEXER_K_NORM       = auto()
++    ENGRAM_EMBD            = auto()
++    ENGRAM_K               = auto()
++    ENGRAM_Q               = auto()
++    ENGRAM_WKV             = auto()
++    ENGRAM_GATE            = auto()
++    ENGRAM_KV              = auto()
+     INDEXER_PROJ         = auto()
+     INDEXER_ATTN_K       = auto()
+     INDEXER_ATTN_Q_B     = auto()
+@@ -1363,6 +1387,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.DEEPSEEK2OCR:     "deepseek2-ocr",
+     MODEL_ARCH.DEEPSEEK32:       "deepseek32",
+     MODEL_ARCH.DEEPSEEK4:        "deepseek4",
++    MODEL_ARCH.DEEPSEEK41:       "deepseek41",
+     MODEL_ARCH.CHATGLM:          "chatglm",
+     MODEL_ARCH.GLM4:             "glm4",
+     MODEL_ARCH.GLM4_MOE:         "glm4moe",
+@@ -1705,6 +1730,12 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.VISEXP_DOWN:               "blk.{bid}.vis_down",
+     MODEL_TENSOR.VISEXP_UP:                 "blk.{bid}.vis_up",
+     MODEL_TENSOR.INDEXER_K_NORM:            "blk.{bid}.indexer.k_norm",
++    MODEL_TENSOR.ENGRAM_EMBD:               "blk.{bid}.engram_embd",
++    MODEL_TENSOR.ENGRAM_K:                  "blk.{bid}.engram_k",
++    MODEL_TENSOR.ENGRAM_Q:                  "blk.{bid}.engram_q",
++    MODEL_TENSOR.ENGRAM_WKV:                "blk.{bid}.engram_wkv",
++    MODEL_TENSOR.ENGRAM_GATE:               "blk.{bid}.engram_gate",
++    MODEL_TENSOR.ENGRAM_KV:                 "blk.{bid}.engram_kv",
+     MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
+     MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.indexer.attn_k",
+     MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.indexer.attn_q_b",
+@@ -4021,6 +4052,50 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
+         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+     ],
++    MODEL_ARCH.DEEPSEEK41: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.OUTPUT,
++        MODEL_TENSOR.OUTPUT_NORM,
++        MODEL_TENSOR.ATTN_NORM,
++        MODEL_TENSOR.ATTN_SINKS,
++        MODEL_TENSOR.FFN_GATE_INP,
++        MODEL_TENSOR.FFN_NORM,
++        MODEL_TENSOR.FFN_GATE_EXP,
++        MODEL_TENSOR.FFN_DOWN_EXP,
++        MODEL_TENSOR.FFN_UP_EXP,
++        MODEL_TENSOR.FFN_GATE_SHEXP,
++        MODEL_TENSOR.FFN_DOWN_SHEXP,
++        MODEL_TENSOR.FFN_UP_SHEXP,
++        MODEL_TENSOR.FFN_EXP_PROBS_B,
++        MODEL_TENSOR.FFN_EXP_PROBS_B_VL,
++        MODEL_TENSOR.ATTN_Q_A,
++        MODEL_TENSOR.ATTN_Q_B,
++        MODEL_TENSOR.ATTN_Q_A_NORM,
++        MODEL_TENSOR.ATTN_KV_NORM,
++        MODEL_TENSOR.ATTN_KV,
++        MODEL_TENSOR.ATTN_OUT_A,
++        MODEL_TENSOR.ATTN_OUT_B,
++        MODEL_TENSOR.HC_ATTN_FN,
++        MODEL_TENSOR.HC_ATTN_BASE,
++        MODEL_TENSOR.HC_ATTN_SCALE,
++        MODEL_TENSOR.HC_FFN_FN,
++        MODEL_TENSOR.HC_FFN_BASE,
++        MODEL_TENSOR.HC_FFN_SCALE,
++        MODEL_TENSOR.ATTN_COMPRESSOR_WKV,
++        MODEL_TENSOR.ATTN_COMPRESSOR_WGATE,
++        MODEL_TENSOR.ATTN_COMPRESSOR_NORM,
++        MODEL_TENSOR.INDEXER_K_NORM,
++        MODEL_TENSOR.ENGRAM_EMBD,
++        MODEL_TENSOR.ENGRAM_K,
++        MODEL_TENSOR.ENGRAM_Q,
++        MODEL_TENSOR.ENGRAM_WKV,
++        MODEL_TENSOR.ENGRAM_GATE,
++        MODEL_TENSOR.ENGRAM_KV,
++        MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
++        MODEL_TENSOR.INDEXER_PROJ,
++        MODEL_TENSOR.INDEXER_ATTN_K,
++        MODEL_TENSOR.INDEXER_ATTN_Q_B,
++    ],
+     MODEL_ARCH.DEEPSEEK4: [
+         MODEL_TENSOR.TOKEN_EMBD,
+         MODEL_TENSOR.OUTPUT_NORM,
+diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
+index 4f1f8e5..b6a9e73 100644
+--- a/gguf-py/gguf/gguf_writer.py
++++ b/gguf-py/gguf/gguf_writer.py
+@@ -820,6 +820,15 @@ class GGUFWriter:
+     def add_indexer_top_k(self, top_k: int) -> None:
+         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
+ 
++    def add_indexer_candidate_source_layer(self, layer: int) -> None:
++        self.add_int32(Keys.Attention.Indexer.CANDIDATE_SOURCE_LAYER.format(arch=self.arch), layer)
++
++    def add_indexer_candidate_top_k_blocks(self, top_k_blocks: int) -> None:
++        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_TOP_K_BLOCKS.format(arch=self.arch), top_k_blocks)
++
++    def add_indexer_candidate_block_size(self, block_size: int) -> None:
++        self.add_uint32(Keys.Attention.Indexer.CANDIDATE_BLOCK_SIZE.format(arch=self.arch), block_size)
++
+     def add_indexer_block_size(self, block_size: int) -> None:
+         self.add_uint32(Keys.Attention.Indexer.BLOCK_SIZE.format(arch=self.arch), block_size)
+ 
+diff --git a/models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja b/models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja
+new file mode 100644
+index 0000000..f8012b3
+--- /dev/null
++++ b/models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja
+@@ -0,0 +1,137 @@
++{%- if not add_generation_prompt is defined -%}
++  {%- set add_generation_prompt = false -%}
++{%- endif -%}
++{%- if not thinking is defined -%}
++  {%- if enable_thinking is defined -%}
++    {%- set thinking = enable_thinking -%}
++  {%- else -%}
++    {%- set thinking = false -%}
++  {%- endif -%}
++{%- endif -%}
++{%- if not drop_thinking is defined -%}
++  {%- set drop_thinking = true -%}
++{%- endif -%}
++{%- set dsml_token = '｜DSML｜' -%}
++{%- set thinking_start_token = '<think>' -%}
++{%- set thinking_end_token = '</think>' -%}
++{%- set reasoning_effort_max = 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -%}
++{%- set response_format_template = '## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n' -%}
++{%- set has_tools = false -%}
++{%- set tools_header = '## Tools\n\nYou have access to a set of tools to help answer the user\'s question. You can invoke tools by writing a "<' + dsml_token + ' calls>" block like the following:\n\n<' + dsml_token + ' calls>\n<' + dsml_token + ' invoke name="$TOOL_NAME">\n<' + dsml_token + ' parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</' + dsml_token + ' parameter>\n...\n</' + dsml_token + ' invoke>\n<' + dsml_token + ' invoke name="$TOOL_NAME2">\n...\n</' + dsml_token + ' invoke>\n</' + dsml_token + ' calls>\n\nString parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.\n\nIf thinking_mode is enabled (triggered by ' + thinking_start_token + '), you MUST output your complete reasoning inside ' + thinking_start_token + '...' + thinking_end_token + ' BEFORE any tool calls or final response.\n\nOtherwise, output directly after ' + thinking_end_token + ' with tool calls or final response.\n\n### Available Tool Schemas\n\n' -%}
++{%- set tools_footer = '\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n' -%}
++{%- set ns = namespace(system_prompt='', is_first_sp=true, has_tool_calls=false) -%}
++{%- for message in messages -%}
++  {%- if message['role'] == 'system' -%}
++    {%- if ns.is_first_sp -%}
++      {%- set ns.system_prompt = ns.system_prompt + (message['content'] or '') -%}
++      {%- set ns.is_first_sp = false -%}
++    {%- else -%}
++      {%- set ns.system_prompt = ns.system_prompt + '\n\n' + (message['content'] or '') -%}
++    {%- endif -%}
++  {%- endif -%}
++{%- endfor -%}
++{%- if tools is defined and tools -%}
++  {%- set has_tools = true -%}
++  {%- set ts = namespace(schemas='') -%}
++  {%- for tool in tools -%}
++    {%- if tool['type'] == 'function' -%}
++      {%- set ts.schemas = ts.schemas + (tool['function'] | tojson) + '\n' -%}
++    {%- endif -%}
++  {%- endfor -%}
++  {%- if ns.system_prompt -%}
++    {%- set ns.system_prompt = ns.system_prompt + '\n\n' + tools_header + ts.schemas + tools_footer -%}
++  {%- else -%}
++    {%- set ns.system_prompt = tools_header + ts.schemas + tools_footer -%}
++  {%- endif -%}
++{%- endif -%}
++{%- if response_format is defined -%}
++  {%- if ns.system_prompt -%}
++    {%- set ns.system_prompt = ns.system_prompt + '\n\n' -%}
++  {%- endif -%}
++  {%- set ns.system_prompt = ns.system_prompt + response_format_template + (response_format | tojson) -%}
++{%- endif -%}
++{{- bos_token -}}
++{%- if messages and thinking and reasoning_effort is defined and reasoning_effort == 'max' -%}
++  {{- reasoning_effort_max -}}
++{%- endif -%}
++{{- ns.system_prompt -}}
++{%- set last_user_idx = namespace(value=-1) -%}
++{%- for message in messages -%}
++  {%- if message['role'] == 'user' or message['role'] == 'developer' or message['role'] == 'tool' -%}
++    {%- set last_user_idx.value = loop.index0 -%}
++  {%- endif -%}
++{%- endfor -%}
++{%- set state = namespace(in_user=false) -%}
++{%- for message in messages -%}
++  {%- if message['role'] == 'tool' -%}
++    {%- set ns.has_tool_calls = true -%}
++  {%- endif -%}
++{%- endfor -%}
++{%- for message in messages -%}
++  {%- if message['role'] == 'user' or message['role'] == 'developer' -%}
++    {%- if state.in_user -%}
++      {{- '\n\n' -}}
++    {%- else -%}
++      {{- '<｜User｜>' -}}
++      {%- set state.in_user = true -%}
++    {%- endif -%}
++    {{- message['content'] or '' -}}
++  {%- elif message['role'] == 'tool' -%}
++    {%- if state.in_user -%}
++      {{- '\n\n' -}}
++    {%- else -%}
++      {{- '<｜User｜>' -}}
++      {%- set state.in_user = true -%}
++    {%- endif -%}
++    {{- '<tool_result>' + (message['content'] or '') + '</tool_result>' -}}
++  {%- elif message['role'] == 'assistant' -%}
++    {%- set state.in_user = false -%}
++    {{- '<｜Assistant｜>' -}}
++    {%- set is_after_last_user = loop.index0 > last_user_idx.value -%}
++    {%- set keep_reasoning = thinking and ((not drop_thinking) or has_tools or is_after_last_user or ns.has_tool_calls) -%}
++    {%- if keep_reasoning -%}
++      {{- thinking_start_token -}}
++      {%- if message['reasoning_content'] is defined and message['reasoning_content'] -%}
++        {{- message['reasoning_content'] -}}
++      {%- endif -%}
++      {{- thinking_end_token -}}
++    {%- else -%}
++      {{- thinking_end_token -}}
++    {%- endif -%}
++    {%- if message['content'] is defined and message['content'] -%}
++      {{- message['content'] -}}
++    {%- endif -%}
++    {%- if message['tool_calls'] -%}
++      {{- '\n\n<' + dsml_token + ' calls>\n' -}}
++      {%- for tool in message['tool_calls'] -%}
++        {%- set func = tool['function'] -%}
++        {{- '<' + dsml_token + ' invoke name="' + func['name'] + '">\n' -}}
++        {%- set args = func['arguments'] -%}
++        {%- if args is string -%}
++          {%- set args = args | from_json -%}
++        {%- endif -%}
++        {%- for key, val in args.items() -%}
++          {%- if val is string -%}
++            {{- '<' + dsml_token + ' parameter name="' + key + '" string="true">' + val + '</' + dsml_token + ' parameter>\n' -}}
++          {%- else -%}
++            {{- '<' + dsml_token + ' parameter name="' + key + '" string="false">' + (val | tojson) + '</' + dsml_token + ' parameter>\n' -}}
++          {%- endif -%}
++        {%- endfor -%}
++        {%- if not args -%}
++          {{- '\n' -}}
++        {%- endif -%}
++        {{- '</' + dsml_token + ' invoke>\n' -}}
++      {%- endfor -%}
++      {{- '</' + dsml_token + ' calls>' -}}
++    {%- endif -%}
++    {{- '<｜end▁of▁sentence｜>' -}}
++  {%- endif -%}
++{%- endfor -%}
++{%- if add_generation_prompt -%}
++  {{- '<｜Assistant｜>' -}}
++  {%- if thinking -%}
++    {{- thinking_start_token -}}
++  {%- else -%}
++    {{- thinking_end_token -}}
++  {%- endif -%}
++{%- endif -%}
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 850737e..4b2f773 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -82,6 +82,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_DEEPSEEK2OCR,     "deepseek2-ocr"    },
+     { LLM_ARCH_DEEPSEEK32,       "deepseek32"       },
+     { LLM_ARCH_DEEPSEEK4,        "deepseek4"        },
++    { LLM_ARCH_DEEPSEEK41,       "deepseek41"       },
+     { LLM_ARCH_CHATGLM,          "chatglm"          },
+     { LLM_ARCH_GLM4,             "glm4"             },
+     { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
+@@ -298,6 +299,21 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_ATTENTION_INDEXER_TYPES,                "%s.attention.indexer.types"                },
+     { LLM_KV_ATTENTION_INDEXER_KPOOL,                "%s.attention.indexer.kpool"                },
+     { LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL,    "%s.attention.indexer.kpool_select_tail"    },
++    { LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, "%s.attention.indexer.candidate_source_layer" },
++    { LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, "%s.attention.indexer.candidate_top_k_blocks" },
++    { LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   "%s.attention.indexer.candidate_block_size"   },
++    { LLM_KV_ENGRAM_HEAD_COUNT,                      "%s.engram.head_count"                      },
++    { LLM_KV_ENGRAM_KEY_LENGTH,                      "%s.engram.key_length"                      },
++    { LLM_KV_ENGRAM_MAX_NGRAM_SIZE,                  "%s.engram.max_ngram_size"                  },
++    { LLM_KV_ENGRAM_LAYER_IDS,                       "%s.engram.layer_ids"                       },
++    { LLM_KV_ENGRAM_MULTIPLIERS,                     "%s.engram.multipliers"                     },
++    { LLM_KV_ENGRAM_PRIMES,                          "%s.engram.primes"                          },
++    { LLM_KV_ENGRAM_OFFSETS,                         "%s.engram.offsets"                         },
++    { LLM_KV_ENGRAM_TOKEN_MAP,                       "%s.engram.token_map"                       },
++    { LLM_KV_ENGRAM_PAD_ID,                          "%s.engram.pad_id"                          },
++    { LLM_KV_ENGRAM_VOCAB_SIZE,                      "%s.engram.vocab_size"                      },
++    { LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE,           "%s.engram.compressed_vocab_size"           },
++    { LLM_KV_ENGRAM_PAD_TOKEN_ID,                    "%s.engram.pad_token_id"                    },
+     { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,           "%s.attention.output_group_count"           },
+     { LLM_KV_ATTENTION_OUTPUT_LORA_RANK,             "%s.attention.output_lora_rank"             },
+     { LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,      "%s.attention.compress_rope_freq_base"      },
+@@ -719,6 +735,12 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_INDEXER_COMPRESSOR_NORM,                "blk.%d.indexer_compressor_norm" },
+     { LLM_TENSOR_INDEXER_KPOOL_GATE,                     "blk.%d.indexer_compressor_gate" },
+     { LLM_TENSOR_INDEXER_KPOOL_APE,                      "blk.%d.indexer_compressor_ape" },
++    { LLM_TENSOR_ENGRAM_EMBD,                            "blk.%d.engram_embd" },
++    { LLM_TENSOR_ENGRAM_K,                               "blk.%d.engram_k" },
++    { LLM_TENSOR_ENGRAM_Q,                               "blk.%d.engram_q" },
++    { LLM_TENSOR_ENGRAM_WKV,                             "blk.%d.engram_wkv" },
++    { LLM_TENSOR_ENGRAM_GATE,                            "blk.%d.engram_gate" },
++    { LLM_TENSOR_ENGRAM_KV,                              "blk.%d.engram_kv" },
+     { LLM_TENSOR_FFN_GATE_TID2EID,                       "blk.%d.ffn_gate_tid2eid" },
+     { LLM_TENSOR_MASKED_EMBD_CENTROIDS,                  "masked_embd_centroids" },
+     { LLM_TENSOR_MASKED_EMBD_ORDERING,                   "masked_embd_ordering" },
+@@ -1009,6 +1031,12 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_INDEXER_COMPRESSOR_NORM,    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+     {LLM_TENSOR_INDEXER_KPOOL_GATE,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_INDEXER_KPOOL_APE,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
++    {LLM_TENSOR_ENGRAM_EMBD,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
++    {LLM_TENSOR_ENGRAM_K,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_ENGRAM_Q,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_ENGRAM_WKV,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_ENGRAM_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
++    {LLM_TENSOR_ENGRAM_KV,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_FFN_GATE_TID2EID,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+     {LLM_TENSOR_NEXTN_PROJ_PRE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_NEXTN_PROJ_POST,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+@@ -1140,6 +1168,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
+         case LLM_ARCH_QWEN35MOE:
+         case LLM_ARCH_QWEN4EXP:
+         case LLM_ARCH_DEEPSEEK4:
++        case LLM_ARCH_DEEPSEEK41:
+         case LLM_ARCH_MINIMAX_01:
+             return true;
+         default:
+@@ -1167,6 +1196,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+         case LLM_ARCH_QWEN4EXP:
+         case LLM_ARCH_DEEPSEEK4:
+         case LLM_ARCH_GLM5_NEXT:
++        case LLM_ARCH_DEEPSEEK41:
+         case LLM_ARCH_NEMOTRON_H:
+         case LLM_ARCH_NEMOTRON_H_MOE:
+         case LLM_ARCH_LFM2:
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index 24068fb..50713b5 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -87,6 +87,7 @@ enum llm_arch {
+     LLM_ARCH_DEEPSEEK2OCR,
+     LLM_ARCH_DEEPSEEK32,
+     LLM_ARCH_DEEPSEEK4,
++    LLM_ARCH_DEEPSEEK41,
+     LLM_ARCH_CHATGLM,
+     LLM_ARCH_GLM4,
+     LLM_ARCH_GLM4_MOE,
+@@ -303,6 +304,21 @@ enum llm_kv {
+     LLM_KV_ATTENTION_INDEXER_TYPES,
+     LLM_KV_ATTENTION_INDEXER_KPOOL,
+     LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL,
++    LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER,
++    LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS,
++    LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,
++    LLM_KV_ENGRAM_HEAD_COUNT,
++    LLM_KV_ENGRAM_KEY_LENGTH,
++    LLM_KV_ENGRAM_MAX_NGRAM_SIZE,
++    LLM_KV_ENGRAM_LAYER_IDS,
++    LLM_KV_ENGRAM_MULTIPLIERS,
++    LLM_KV_ENGRAM_PRIMES,
++    LLM_KV_ENGRAM_OFFSETS,
++    LLM_KV_ENGRAM_TOKEN_MAP,
++    LLM_KV_ENGRAM_PAD_ID,
++    LLM_KV_ENGRAM_VOCAB_SIZE,
++    LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE,
++    LLM_KV_ENGRAM_PAD_TOKEN_ID,
+     LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,
+     LLM_KV_ATTENTION_OUTPUT_LORA_RANK,
+     LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,
+@@ -705,6 +721,12 @@ enum llm_tensor {
+     LLM_TENSOR_INDEXER_PROJ,
+     LLM_TENSOR_INDEXER_ATTN_K,
+     LLM_TENSOR_INDEXER_ATTN_Q_B,
++    LLM_TENSOR_ENGRAM_EMBD,
++    LLM_TENSOR_ENGRAM_K,
++    LLM_TENSOR_ENGRAM_Q,
++    LLM_TENSOR_ENGRAM_WKV,
++    LLM_TENSOR_ENGRAM_GATE,
++    LLM_TENSOR_ENGRAM_KV,
+     LLM_TENSOR_INDEXER_Q_PROJ,
+     LLM_TENSOR_INDEXER_K_PROJ,
+     LLM_TENSOR_INDEXER_Q_NORM,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index cc8fae9..923135e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2430,6 +2430,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         model.arch == LLM_ARCH_CLEF ||
+         model.arch == LLM_ARCH_QWEN4EXP ||
+         model.arch == LLM_ARCH_DEEPSEEK4 ||
++        model.arch == LLM_ARCH_DEEPSEEK41 ||
+         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
+         model.arch == LLM_ARCH_NANBEIGE ||
+         model.arch == LLM_ARCH_MINIMAX_01 ||
+@@ -3858,7 +3859,7 @@ llama_context * llama_init_from_model(
+         }
+     }
+ 
+-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
++    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
+         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+         return nullptr;
+     }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index c0b6917..147a94b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1889,7 +1889,7 @@ ggml_tensor * llm_graph_context::build_ffn(
+                     const float limit = hparams.swiglu_clamp_shexp[il];
+                     constexpr float eps = 1e-6f;
+                     if (limit > eps) {
+-                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
++                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                             cur = ggml_swiglu_clamp(ctx0, cur, tmp, limit);
+                         } else {
+                             tmp = ggml_clamp(ctx0, tmp, -limit, limit);
+@@ -2300,7 +2300,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     const float limit = hparams.swiglu_clamp_exp[il];
+                     constexpr float eps = 1e-6f;
+                     if (limit > eps) {
+-                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
++                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                             cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
+                         } else {
+                             up = ggml_clamp(ctx0, up, -limit, limit);
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 6c504c5..aa110bb 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -253,6 +253,9 @@ struct llama_hparams {
+     uint32_t dflash_conv_group_size  = 0;
+     uint32_t dflash_selector_rank    = 0;
+     uint32_t dflash_selector_top_k   = 0;
++    // DSV4 draft with the V4.1 rules: hyper-connection mixes lag by one sublayer, the last FFN mix
++    // collapses the copies (no output_hc_* head), and only the low-rank q is normalized
++    bool     dflash_dsv41            = false;
+ 
+     // llama4 smallthinker
+     uint32_t n_moe_layer_step        = 0;
+@@ -283,6 +286,9 @@ struct llama_hparams {
+     uint32_t indexer_n_head    = 0;
+     uint32_t indexer_head_size = 0;
+     uint32_t indexer_top_k     = 0;
++    int32_t  dsv41_candidate_source_layer = -1;
++    uint32_t dsv41_candidate_top_k_blocks = 0;
++    uint32_t dsv41_candidate_block_size   = 0;
+     uint32_t indexer_kpool     = 0; // k-pool size
+     bool     indexer_kpool_select_tail = true;
+     // head-size slots per cached indexer row, the last one holds the pooled key
+@@ -313,6 +319,24 @@ struct llama_hparams {
+     // scale of the hyper-connection post gate (DeepSeek-V4 hardcodes 2.0)
+     float    hc_magnitude = 0.0f;
+ 
++    // Engram (n-gram lookup table) for DeepSeek-V4.1
++    uint32_t engram_n_head          = 0;
++    uint32_t engram_key_length      = 0;
++    uint32_t engram_max_ngram_size  = 0;
++    std::array<uint32_t, LLAMA_MAX_LAYERS> engram_layer_ids;
++
++    // DeepSeek-V4.1 compresses KV on a few source layers and shares each stream with the layers
++    // that follow, so for every layer these hold the layer that published what it reads, or -1
++    // when it reads nothing. A layer whose entry is itself is a source. The KV cache needs these
++    // to alias a reader's storage onto its source's, so they live here rather than on the model.
++    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_source;
++    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_key_source;
++    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_source;
++
++    bool dsv41_is_kv_source   (uint32_t il) const { return dsv41_kv_source[il]        == (int32_t) il; }
++    bool dsv41_owns_index_k   (uint32_t il) const { return dsv41_index_key_source[il] == (int32_t) il; }
++    bool dsv41_is_index_source(uint32_t il) const { return dsv41_topk_source[il]      == (int32_t) il; }
++
+     uint32_t ple_ngram_size      = 0;
+     uint32_t ple_heads_per_ngram = 0;
+     uint32_t ple_conv_kernel     = 0;
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index 5dd0b45..e1f1ffe 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -547,7 +547,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+         }
+     }
+ 
+-    if (ratio == DSV4_CSA_RATIO && !plan.state_pos.empty()) {
++    // The overlap compressor reads a fixed window per block, so every sequence has to write the
++    // same number of blocks or the graph shape moves between ubatches. For DeepSeek-V4 this is
++    // exactly the CSA and indexer streams.
++    if (overlap && !plan.state_pos.empty()) {
+         assert(kv_size > 0);
+ 
+         // Pad each stream to the reserve plan's block count.
+@@ -602,7 +605,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+         }
+     }
+ 
+-    if (ratio == DSV4_HCA_RATIO && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
++    // A non-overlap stream completes a block only every `ratio` tokens, so a decode step often
++    // completes none. For DeepSeek-V4 this is the HCA stream; V4.1 pools without overlap on both
++    // of its streams and reaches this at ratio 2 on every other token.
++    if (!overlap && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
+         assert(kv_size > 0);
+         // the last slot must not be live, or the dummy write would corrupt it;
+         // a full stream implies a completed block, which implies real writes
+@@ -899,12 +905,14 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
+                 bool        unified,
+             uint32_t        n_seq_max,
+             uint32_t        ratio,
++                bool        overlap,
+             uint32_t        state_size,
+             uint32_t        n_embd_state,
+             uint32_t        n_rs_seq,
+         const char    * name,
+         const llama_memory_i::layer_filter_cb & filter) :
+     ratio(ratio),
++    overlap(overlap),
+     state_size(state_size),
+     n_embd_state(n_embd_state),
+     n_stream(unified ? 1 : n_seq_max),
+@@ -1055,6 +1063,10 @@ uint32_t llama_dsv4_comp_state::get_ratio() const {
+     return ratio;
+ }
+ 
++bool llama_dsv4_comp_state::get_overlap() const {
++    return overlap;
++}
++
+ uint32_t llama_dsv4_comp_state::get_state_size() const {
+     return state_size;
+ }
+@@ -1271,11 +1283,58 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
+     hparams_lid.rope_type          = LLAMA_ROPE_TYPE_NEOX;
+     dsv4_make_k_only(hparams_lid);
+ 
++    // DeepSeek-V4 compresses on every layer, at one of two fixed ratios, and each layer owns its
++    // own rows. V4.1 compresses on a few source layers and shares each stream with the layers that
++    // follow, still at two ratios. The two plan slots carry the two ratios in both cases; what
++    // differs is which layers own storage and which borrow it through the reuse callback.
++    const bool is_v41 = model.arch == LLM_ARCH_DEEPSEEK41;
++
++    uint32_t ratio_a = DSV4_CSA_RATIO;
++    uint32_t ratio_b = DSV4_HCA_RATIO;
++
++    if (is_v41) {
++        ratio_a = 0;
++        ratio_b = 0;
++
++        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
++            const uint32_t r = model.hparams.dsv4_compress_ratios[il];
++            if (r == 0 || r == ratio_a || r == ratio_b) {
++                continue;
++            }
++            if (ratio_a == 0) {
++                ratio_a = r;
++            } else if (ratio_b == 0) {
++                ratio_b = r;
++            } else {
++                throw std::runtime_error("DeepSeek-V4.1 supports at most two compression ratios");
++            }
++        }
++
++        // a file with no compressed layers is pure sliding window attention, which is valid.
++        // every filter below then selects nothing, so the ratio only has to stay non-zero for
++        // the size arithmetic.
++        if (ratio_a == 0) {
++            ratio_a = 1;
++        }
++        if (ratio_b == 0) {
++            ratio_b = ratio_a;
++        }
++    }
++
++    // V4.1 keeps every compressed row in one cache, sized for the finest ratio, with a slot per
++    // source layer; a coarser source simply uses fewer of its rows. Readers alias onto their
++    // source's slot, which is what the reuse callbacks below do.
++    const uint32_t ratio_kv = is_v41 ? std::min(ratio_a, ratio_b) : DSV4_CSA_RATIO;
++
+     const layer_filter_cb filter_csa = [&](int32_t il) {
+         if (filter && !filter(il)) {
+             return false;
+         }
+ 
++        if (is_v41) {
++            return model.hparams.dsv41_is_kv_source(il);
++        }
++
+         return model.hparams.dsv4_compress_ratios[il] == DSV4_CSA_RATIO;
+     };
+ 
+@@ -1284,52 +1343,104 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
+             return false;
+         }
+ 
++        // V4.1 holds every compressed row in the CSA cache, so this one stays empty
++        if (is_v41) {
++            return false;
++        }
++
++        return model.hparams.dsv4_compress_ratios[il] == DSV4_HCA_RATIO;
++    };
++
++    // the pooling state is per ratio, since it carries a partial group across ubatches
++    const layer_filter_cb filter_state_a = [&](int32_t il) {
++        if (filter && !filter(il)) {
++            return false;
++        }
++
++        if (is_v41) {
++            return model.hparams.dsv41_is_kv_source(il) && model.hparams.dsv4_compress_ratios[il] == ratio_a;
++        }
++
++        return model.hparams.dsv4_compress_ratios[il] == DSV4_CSA_RATIO;
++    };
++
++    const layer_filter_cb filter_state_b = [&](int32_t il) {
++        if (filter && !filter(il)) {
++            return false;
++        }
++
++        if (is_v41) {
++            return model.hparams.dsv41_is_kv_source(il) && model.hparams.dsv4_compress_ratios[il] == ratio_b;
++        }
++
+         return model.hparams.dsv4_compress_ratios[il] == DSV4_HCA_RATIO;
+     };
+ 
++    // V4.1 derives index keys from the already pooled latent, so they need storage but no pooling
++    // state of their own; V4 runs a second compressor for them.
++    const layer_filter_cb filter_lid = [&](int32_t il) {
++        if (filter && !filter(il)) {
++            return false;
++        }
++
++        if (is_v41) {
++            return model.hparams.dsv41_owns_index_k(il);
++        }
++
++        return model.hparams.dsv4_compress_ratios[il] == DSV4_CSA_RATIO;
++    };
++
++    const layer_reuse_cb reuse_kv = is_v41
++        ? layer_reuse_cb([&](int32_t il) { return model.hparams.dsv41_kv_source[il]; })
++        : layer_reuse_cb(nullptr);
++
++    const layer_reuse_cb reuse_lid = is_v41
++        ? layer_reuse_cb([&](int32_t il) { return model.hparams.dsv41_index_key_source[il]; })
++        : layer_reuse_cb(nullptr);
++
+     const bool unified_compressed = false;
+ 
+-    LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells\n",
+-            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
++    LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, ratio = %u, size = %u cells\n",
++            __func__, ratio_a, dsv4_comp_size(kv_size, ratio_kv));
+ 
+     kv_csa = std::make_unique<llama_kv_cache>(
+             model, hparams_csa, type_k, type_v,
+-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
+-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
++            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u), n_seq_max, n_pad,
++            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, reuse_kv, nullptr);
+ 
+-    LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
+-            __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
++    LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, ratio = %u, size = %u cells\n",
++            __func__, ratio_b, dsv4_comp_size(kv_size, ratio_b));
+ 
+     kv_hca = std::make_unique<llama_kv_cache>(
+             model, hparams_hca, type_k, type_v,
+-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
++            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_b), 256u), n_seq_max, n_pad,
+             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
+ 
+     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
+-            __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
++            __func__, dsv4_comp_size(kv_size, ratio_kv));
+ 
+     kv_lid = std::make_unique<llama_kv_cache>(
+             model, hparams_lid, type_k, type_v,
+-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
+-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
++            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u), n_seq_max, n_pad,
++            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_lid, reuse_lid, nullptr);
+ 
+     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
+ 
+     csa_state = std::make_unique<llama_dsv4_comp_state>(
+-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+-            2*model.hparams.n_embd_head_k(), n_rs_seq, "csa", filter_csa);
++            model, offload, unified_compressed, n_seq_max, ratio_a, !is_v41, is_v41 ? ratio_a : 2*ratio_a,
++            (is_v41 ? 1 : 2)*model.hparams.n_embd_head_k(), n_rs_seq, "csa", filter_state_a);
+ 
+     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressor state\n", __func__);
+ 
+     hca_state = std::make_unique<llama_dsv4_comp_state>(
+-            model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, DSV4_HCA_RATIO,
+-            model.hparams.n_embd_head_k(), n_rs_seq, "hca", filter_hca);
++            model, offload, unified_compressed, n_seq_max, ratio_b, false, ratio_b,
++            model.hparams.n_embd_head_k(), n_rs_seq, "hca", filter_state_b);
+ 
+     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer compressor state\n", __func__);
+ 
+     lid_state = std::make_unique<llama_dsv4_comp_state>(
+-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+-            2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
++            model, offload, unified_compressed, n_seq_max, ratio_a, !is_v41, is_v41 ? ratio_a : 2*ratio_a,
++            (is_v41 ? 1 : 2)*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_lid);
+ 
+     // DSV4 attention reads compressed-K / compressor-state rows that the current
+     // graph does not necessarily overwrite; uninitialized buffer contents would
+@@ -1935,6 +2046,10 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
+     kv_swa->set_input_k_rot(dst);
+ }
+ 
++void llama_kv_cache_dsv4_raw_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
++    kv_swa->get_prev_tokens(ubatch, n, res);
++}
++
+ //
+ // llama_kv_cache_dsv4_comp_context
+ //
+@@ -2051,13 +2166,13 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
+         std::vector<llama_ubatch> ubatches,
+         std::vector<llama_ubatch> ubatches_raw) :
+     ubatches(std::move(ubatches)),
+-    plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
++    plans_csa(dsv4_build_comp_plans(this->ubatches, kv->get_csa_state()->get_ratio(), kv->get_csa_state()->get_overlap(),
+                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
+                 kv->get_n_rs_seq(), kv->get_rs_idx())),
+-    plans_hca(dsv4_build_comp_plans(this->ubatches, DSV4_HCA_RATIO, false,
++    plans_hca(dsv4_build_comp_plans(this->ubatches, kv->get_hca_state()->get_ratio(), kv->get_hca_state()->get_overlap(),
+                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
+                 kv->get_n_rs_seq(), kv->get_rs_idx())),
+-    plans_lid(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
++    plans_lid(dsv4_build_comp_plans(this->ubatches, kv->get_lid_state()->get_ratio(), kv->get_lid_state()->get_overlap(),
+                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
+                 kv->get_n_rs_seq(), kv->get_rs_idx())),
+     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
+@@ -2221,7 +2336,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
+     }
+ 
+     reserve_plan_csa = dsv4_build_reserve_comp_plan(
+-            ubatch, DSV4_CSA_RATIO, true,
++            ubatch, csa_state->get_ratio(), csa_state->get_overlap(),
+             csa_state->get_state_size(), get_csa()->get_n_kv(), csa_state->get_n_stream(), csa_state->get_n_rs_seq());
+ 
+     return reserve_plan_csa;
+@@ -2235,7 +2350,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
+     }
+ 
+     reserve_plan_hca = dsv4_build_reserve_comp_plan(
+-            ubatch, DSV4_HCA_RATIO, false,
++            ubatch, hca_state->get_ratio(), hca_state->get_overlap(),
+             hca_state->get_state_size(), get_hca()->get_n_kv(), hca_state->get_n_stream(), hca_state->get_n_rs_seq());
+ 
+     return reserve_plan_hca;
+@@ -2249,7 +2364,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
+     }
+ 
+     reserve_plan_lid = dsv4_build_reserve_comp_plan(
+-            ubatch, DSV4_CSA_RATIO, true,
++            ubatch, lid_state->get_ratio(), lid_state->get_overlap(),
+             lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(), lid_state->get_n_rs_seq());
+ 
+     return reserve_plan_lid;
+diff --git a/src/llama-kv-cache-dsv4.h b/src/llama-kv-cache-dsv4.h
+index ce39867..e692719 100644
+--- a/src/llama-kv-cache-dsv4.h
++++ b/src/llama-kv-cache-dsv4.h
+@@ -20,6 +20,7 @@ public:
+             bool            unified,
+             uint32_t        n_seq_max,
+             uint32_t        ratio,
++                bool        overlap,
+             uint32_t        state_size,
+             uint32_t        n_embd_state,
+             uint32_t        n_rs_seq,
+@@ -31,6 +32,7 @@ public:
+     void apply_copies(const stream_copy_info & sc_info) const;
+ 
+     uint32_t get_ratio()      const;
++    bool     get_overlap()    const;
+     uint32_t get_state_size() const;
+     uint32_t get_n_stream()   const;
+     uint32_t get_n_rs_seq()   const;
+@@ -61,6 +63,8 @@ private:
+     };
+ 
+     const uint32_t ratio;
++    // whether a pooled group overlaps the previous one; V4's CSA does, V4.1's compressor does not
++    const bool     overlap;
+     const uint32_t state_size;
+     const uint32_t n_embd_state;
+     const uint32_t n_stream;
+@@ -214,6 +218,9 @@ public:
+     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+     void set_input_k_rot(ggml_tensor * dst) const;
+ 
++    // see llama_kv_cache::get_prev_tokens(); the engram n-gram hash needs the preceding tokens
++    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
++
+ private:
+     size_t i_next = 0;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 463510c..6f1afbd 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -260,8 +260,11 @@ llama_kv_cache::llama_kv_cache(
+                 continue;
+             }
+ 
+-            if (filter && !filter(il)) {
+-                LLAMA_LOG_DEBUG("%s: - layer %3d: filtered\n", __func__, il);
++            // A layer the filter rejected has no storage of its own, which is the case that most
++            // needs to borrow another layer's. Owning storage and reading storage are separate
++            // questions, so only a layer with no KV at all is skipped here.
++            if (!hparams.has_kv(il)) {
++                LLAMA_LOG_DEBUG("%s: - layer %3d: does not have KV cache\n", __func__, il);
+                 continue;
+             }
+ 
+@@ -325,7 +328,7 @@ llama_kv_cache::llama_kv_cache(
+             hparams.n_embd_head_k() % 64 == 0;
+ 
+         // always create Hadamard rotation tensors for DeepSeek lightning indexers
+-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
++        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 ||
+                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
+                 hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+             attn_rot_k = true;
+@@ -1844,8 +1847,8 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
+ }
+ 
+ bool llama_kv_cache::has_cell_ext() const {
+-    // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
+-    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
++    // M-RoPE needs the 2D position, the PLE and engram n-gram hashes need the token id
++    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0 || hparams.engram_n_head > 0;
+ }
+ 
+ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 045489d..9c9ce0f 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -485,9 +485,10 @@ struct llama_mmap::impl {
+         int flags = MAP_SHARED;
+         if (numa) { prefetch = 0; }
+ #ifdef __linux__
+-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+-            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+-                    strerror(errno));
++        const int fadvise = prefetch ? POSIX_FADV_SEQUENTIAL : POSIX_FADV_RANDOM;
++        if (posix_fadvise(fd, 0, 0, fadvise)) {
++            LLAMA_LOG_WARN("warning: posix_fadvise(.., %s) failed: %s\n",
++                    prefetch ? "POSIX_FADV_SEQUENTIAL" : "POSIX_FADV_RANDOM", strerror(errno));
+         }
+         // MAP_POPULATE would fault in the lazy ranges too
+         if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
+@@ -514,6 +515,10 @@ struct llama_mmap::impl {
+             for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
+                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
+             }
++        } else {
++            // In streaming mode, access mapped weights sparsely. Sequential read-ahead here
++            // would pull SSD-streamed expert tensors into the page cache as a side effect.
++            advise(0, file->size(), POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
+         }
+         for (const auto & range : lazy_ranges) {
+             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 2f2ad13..0e2c956 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -413,6 +413,7 @@ namespace GGUFMeta {
+     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
+     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
+     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
++    template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
+     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
+     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
+ 
+@@ -440,6 +441,7 @@ namespace GGUFMeta {
+     template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
+     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
+     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
++    template bool llama_model_loader::get_key<int32_t>    (enum llm_kv kid, int32_t & result,     bool required);
+     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
+ 
+     template<>
+@@ -1088,7 +1090,7 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
+     return ggml_backend_dev_buffer_type(cpu_dev);
+ }
+ 
+-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
++bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool report_fit_sizes) {
+     if (mode == LLAMA_LAZY_MODE_OFF) {
+         return false;
+     }
+@@ -1111,6 +1113,12 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
+ 
+         LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
+                 __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
++    } else if (report_fit_sizes) {
++        // The no-allocation fit planner still accounts for this tensor as host RAM,
++        // but the runtime will back it with demand-paged file mappings. Emit its
++        // exact bytes so the host broker can separate resident state from the
++        // estimated page-cache working set.
++        fprintf(stderr, "fit-lazy-tensor bytes=%zu name=%s\n", ggml_nbytes(t), name.c_str());
+     }
+ 
+     return true;
+@@ -1348,7 +1356,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+ 
+     if (flags & TENSOR_READ_LAZY) {
+         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
+-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
++        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()), no_alloc);
+     }
+ 
+     ggml_tensor t_meta = *cur;
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index e94a7cd..0ba7371 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -99,7 +99,7 @@ struct llama_model_loader {
+ 
+         // decide whether this tensor is read lazily
+         // pass w to also record it, or nullptr to only ask
+-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
++        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool report_fit_sizes = false);
+ 
+         bool any() const {
+             return !ranges.empty();
+diff --git a/src/llama-model-saver.cpp b/src/llama-model-saver.cpp
+index e4fd45e..21edb27 100644
+--- a/src/llama-model-saver.cpp
++++ b/src/llama-model-saver.cpp
+@@ -318,7 +318,7 @@ void llama_model_saver::add_kv_from_model() {
+     add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,      hparams.dsv4_o_group_count);
+     add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,        hparams.dsv4_o_lora_rank);
+     add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, hparams.dsv4_compress_rope_base);
+-    if (model->arch == LLM_ARCH_DEEPSEEK4 || hparams.dsv4_hc_mult > 0) {
++    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41 || hparams.dsv4_hc_mult > 0) {
+         // the loader requires one compress ratio per layer, including nextn layers
+         const std::vector<uint32_t> compress_ratios(
+                 hparams.dsv4_compress_ratios.begin(), hparams.dsv4_compress_ratios.begin() + hparams.n_layer_all);
+@@ -332,6 +332,10 @@ void llama_model_saver::add_kv_from_model() {
+     add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE,           hparams.hc_magnitude);
+     add_kv(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
+     add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,             hparams.hc_low_rank);
++    add_kv(LLM_KV_ENGRAM_HEAD_COUNT,                     hparams.engram_n_head);
++    add_kv(LLM_KV_ENGRAM_KEY_LENGTH,                     hparams.engram_key_length);
++    add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE,                 hparams.engram_max_ngram_size);
++    add_kv(LLM_KV_ENGRAM_LAYER_IDS,                      hparams.engram_layer_ids, true);
+ 
+     // the PLE group only means anything whole: write all of it or none
+     if (hparams.ple_n_heads > 0) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 31a6a49..656b8e6 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -203,6 +203,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_dots3note(params);
+         case LLM_ARCH_DEEPSEEK4:
+             return new llama_model_deepseek4(params);
++        case LLM_ARCH_DEEPSEEK41:
++            return new llama_model_deepseek41(params);
+         case LLM_ARCH_GLM_DSA:
+             return new llama_model_glm_dsa(params);
+         case LLM_ARCH_MISTRAL4:
+@@ -381,7 +383,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
+     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
+     const llama_hparams & hparams = ud->model->hparams;
+     const std::string tensor_name = tensor->name;
+-    const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
++    const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
+         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+ 
+     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
+@@ -1698,10 +1700,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+ 
+     if (params.moe_stream) {
+-        if ((arch != LLM_ARCH_DEEPSEEK4 && arch != LLM_ARCH_QWEN35MOE &&
++        if ((arch != LLM_ARCH_DEEPSEEK4 && arch != LLM_ARCH_DEEPSEEK41 && arch != LLM_ARCH_QWEN35MOE &&
+              arch != LLM_ARCH_GLM_DSA && arch != LLM_ARCH_GLM5_NEXT) ||
+             params.split_mode != LLAMA_SPLIT_MODE_LAYER || pimpl->has_tensor_overrides) {
+-            throw std::runtime_error("streaming supports DeepSeek4/Qwen35MoE/GLM DSA/GLM5-next with layer splitting and no tensor overrides");
++            throw std::runtime_error("streaming supports DeepSeek4/DeepSeek4.1/Qwen35MoE/GLM DSA/GLM5-next with layer splitting and no tensor overrides");
+         }
+         const uint32_t n_slots = llama_moe_stream_resolve_slots(params, hparams, ml);
+         if (n_slots > 0) {
+@@ -1907,7 +1909,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // per-tensor activation precision policy
+     prec_policy.load(ml, *this);
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    // When MoE experts are streamed from SSD, eagerly populating every mmap would read all
++    // expert shards into the page cache at startup. Keep mmap for explicitly lazy tensors,
++    // but let mapped weights fault in only when they are used.
++    ml.init_mappings(!params.moe_stream, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+@@ -2756,6 +2761,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             nullptr);
+                 }
+             } break;
++        case LLM_ARCH_DEEPSEEK41:
+         case LLM_ARCH_DEEPSEEK4:
+             {
+                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+@@ -3167,7 +3173,7 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
+ int32_t llama_model_n_swa(const llama_model * model) {
+     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
+     // other compression ratios, so we return 0 here
+-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
++    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
+         return 0;
+     }
+     return model->hparams.n_swa;
+@@ -3254,6 +3260,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_DEEPSEEK2OCR:
+         case LLM_ARCH_DEEPSEEK32:
+         case LLM_ARCH_DEEPSEEK4:
++        case LLM_ARCH_DEEPSEEK41:
+         case LLM_ARCH_MUSE_GLIMMER:
+         case LLM_ARCH_PLM:
+         case LLM_ARCH_CHATGLM:
+diff --git a/src/llama-model.h b/src/llama-model.h
+index ee1daf0..ba5de8d 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -587,6 +587,12 @@ struct llama_layer {
+     struct ggml_tensor * hc_ffn_up      = nullptr;
+     struct ggml_tensor * hc_ffn_inject  = nullptr;
+ 
++    // Engram (n-gram keyed lookup table) for DeepSeek-V4.1
++    struct ggml_tensor * engram_embd    = nullptr;
++    struct ggml_tensor * engram_k       = nullptr;
++    struct ggml_tensor * engram_q       = nullptr;
++    struct ggml_tensor * engram_wkv     = nullptr;
++
+     struct ggml_tensor * ple_key        = nullptr;
+     struct ggml_tensor * ple_value      = nullptr;
+     struct ggml_tensor * ple_norm_key   = nullptr;
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index 821b479..9711ebb 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -312,6 +312,11 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
+     quantize &= name.find("altup")  == std::string::npos;
+     quantize &= name.find("laurel") == std::string::npos;
+ 
++    // DeepSeek-V4.1 engram gate scales: one value per channel, applied with ggml_mul, which has
++    // no quantized path. They are two vectors per engram layer, so keeping them costs nothing.
++    quantize &= name.find("engram_q.weight") == std::string::npos;
++    quantize &= name.find("engram_k.weight") == std::string::npos;
++
+     // these are not too big so keep them as it is
+     quantize &= name.find("per_layer_model_proj") == std::string::npos;
+ 
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 2be6e77..86c2702 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -323,11 +323,22 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+             if (!params.moe_stream_direct || params.load_mtp || params.check_tensors || file || fname.empty()) {
+                 throw std::runtime_error("MoE streaming requires direct I/O, file paths, no MTP and offline tensor verification");
+             }
+-            if (params.load_mode != LLAMA_LOAD_MODE_AUTO && params.load_mode != LLAMA_LOAD_MODE_NONE) {
+-                throw std::runtime_error("MoE streaming requires load-mode none or auto");
++            // The default streaming path disables mmap to avoid retaining whole model files.
++            // Architectures with giant individually lazy tensors (DeepSeek4.1 Engram) may
++            // explicitly request lazy reads; keep that opt-in while preserving the
++            // existing behavior for callers that use auto/none.
++            if (params.load_mode == LLAMA_LOAD_MODE_AUTO) {
++                params.load_mode = LLAMA_LOAD_MODE_NONE;
++                params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++            } else if (params.load_mode == LLAMA_LOAD_MODE_NONE) {
++                // Explicit lazy=on maps only architecture-marked tensors, such as the
++                // DeepSeek4.1 Engram table; ordinary weights still load without mmap.
++                if (params.lazy_mode != LLAMA_LAZY_MODE_ON) {
++                    params.lazy_mode = LLAMA_LAZY_MODE_OFF;
++                }
++            } else {
++                throw std::runtime_error("MoE streaming requires load-mode auto or none");
+             }
+-            params.load_mode = LLAMA_LOAD_MODE_NONE;
+-            params.lazy_mode = LLAMA_LAZY_MODE_OFF;
+         }
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 223336d..6b4ada4 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -8,7 +8,7 @@
+ #include <stdexcept>
+ #include <string>
+ 
+-static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
++float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
+     if (ext_factor == 0.0f) {
+         return 1.0f;
+     }
+@@ -48,7 +48,8 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
+     ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+-    ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
++    // DeepSeek-V4.1 routes every layer through the gate and omits the key, leaving the count at 0
++    ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count, false);
+ 
+     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
+ 
+@@ -197,7 +198,7 @@ static ggml_tensor * dsv4_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t n
+     return ggml_view_1d(ctx, t, ne0, dsv4_elem_offset(t, i0));
+ }
+ 
+-static ggml_tensor * dsv4_view_2d(
++ggml_tensor * dsv4_view_2d(
+         ggml_context * ctx,
+         ggml_tensor  * t,
+         int64_t        ne0,
+@@ -214,12 +215,7 @@ static ggml_tensor * dsv4_append_zero_row(ggml_context * ctx, ggml_tensor * t, b
+     return ggml_concat(ctx, t, row, 1);
+ }
+ 
+-struct dsv4_state_tensors {
+-    ggml_tensor * kv;
+-    ggml_tensor * score;
+-};
+-
+-static dsv4_state_tensors dsv4_build_state_restore(
++dsv4_state_tensors dsv4_build_state_restore(
+         ggml_context * ctx,
+         const llm_graph_input_dsv4::comp_input & inp,
+         const llama_dsv4_comp_state * state,
+@@ -242,7 +238,7 @@ static dsv4_state_tensors dsv4_build_state_restore(
+     return restored;
+ }
+ 
+-static dsv4_state_tensors dsv4_build_state_snapshot(
++dsv4_state_tensors dsv4_build_state_snapshot(
+         ggml_context * ctx,
+         const llm_graph_input_dsv4::comp_input & inp,
+         const llama_dsv4_comp_state * state,
+@@ -350,11 +346,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
+     return comb;
+ }
+ 
+-ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
+-        ggml_tensor * x,
+-        ggml_tensor * hc_fn,
+-        ggml_tensor * hc_scale,
+-        ggml_tensor * hc_base,
++// derive the pre / post / comb coefficients from the stream, without collapsing it
++// DeepSeek-V4 always collapses right away, V4.1 hands `pre` to the next sublayer instead
++void llama_model_deepseek4::graph::build_hc_mixes(
++        ggml_tensor *  x,
++        ggml_tensor *  hc_fn,
++        ggml_tensor *  hc_scale,
++        ggml_tensor *  hc_base,
++        ggml_tensor ** pre,
+         ggml_tensor ** post,
+         ggml_tensor ** comb,
+         int il) const {
+@@ -377,11 +376,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
+     ggml_tensor * base_pre  = dsv4_view_1d(ctx0, hc_base, hc, 0);
+     ggml_tensor * base_post = dsv4_view_1d(ctx0, hc_base, hc, hc);
+ 
+-    ggml_tensor * pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
+-    pre = dsv4_hc_affine(ctx0, pre, scale_pre, base_pre);
+-    pre = ggml_sigmoid(ctx0, pre);
+-    pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
+-    cb(pre, "hc_pre", il);
++    *pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
++    *pre = dsv4_hc_affine(ctx0, *pre, scale_pre, base_pre);
++    *pre = ggml_sigmoid(ctx0, *pre);
++    *pre = ggml_scale_bias(ctx0, *pre, 1.0f, hparams.dsv4_hc_eps);
++    cb(*pre, "hc_pre", il);
+ 
+     *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
+     *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
+@@ -403,9 +402,20 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
+         *comb = build_hc_sinkhorn(*comb, il);
+     }
+     cb(*comb, "hc_comb", il);
++}
+ 
+-    ggml_tensor * result = build_hc_pre(x, pre, il);
+-    return result;
++ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
++        ggml_tensor * x,
++        ggml_tensor * hc_fn,
++        ggml_tensor * hc_scale,
++        ggml_tensor * hc_base,
++        ggml_tensor ** post,
++        ggml_tensor ** comb,
++        int il) const {
++    ggml_tensor * pre = nullptr;
++    build_hc_mixes(x, hc_fn, hc_scale, hc_base, &pre, post, comb, il);
++
++    return build_hc_pre(x, pre, il);
+ }
+ 
+ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
+@@ -473,24 +483,26 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
+         ggml_tensor * state_read_idxs,
+         ggml_tensor * comp_pos,
+         ggml_tensor * norm,
++        int64_t ratio,
+         int64_t n_embd_head,
+         const char * name,
+-        int il) const {
++        int il,
++        ggml_tensor ** pre_rope) const {
+     const int64_t n_embd_head_rope = hparams.n_rot();
+     const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
+     const int64_t n_blocks         = comp_pos ? comp_pos->ne[0] : 0;
+ 
+     GGML_ASSERT(n_blocks > 0);
+     GGML_ASSERT(state_read_idxs);
+-    GGML_ASSERT(state_read_idxs->ne[0] == DSV4_HCA_RATIO*n_blocks);
++    GGML_ASSERT(state_read_idxs->ne[0] == ratio*n_blocks);
+     GGML_ASSERT(n_embd_head >= n_embd_head_rope);
+ 
+     ggml_tensor * kv = ggml_get_rows(ctx0, kv_state, state_read_idxs);
+-    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, DSV4_HCA_RATIO, n_blocks);
++    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, ratio, n_blocks);
+     cb(kv, name, il);
+ 
+     ggml_tensor * score = ggml_get_rows(ctx0, score_state, state_read_idxs);
+-    score = ggml_reshape_3d(ctx0, score, n_embd_head, DSV4_HCA_RATIO, n_blocks);
++    score = ggml_reshape_3d(ctx0, score, n_embd_head, ratio, n_blocks);
+     cb(score, name, il);
+ 
+     ggml_tensor * values = ggml_cont(ctx0, ggml_permute(ctx0, kv, 1, 0, 2, 3));
+@@ -505,6 +517,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
+     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
+     cb(comp, name, il);
+ 
++    // DeepSeek-V4.1 derives its index keys from the pooled latent before it is rotated, because
++    // the rotated form is what goes into the cache.
++    if (pre_rope) {
++        *pre_rope = comp;
++    }
++
+     comp = ggml_rope_ext(ctx0, comp, comp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig,
+             hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
+             dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
+@@ -916,8 +934,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+ 
+     ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
+     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
+-    q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+-    cb(q, "q_norm", il);
++    if (!hparams.dflash_dsv41) {
++        // V4 normalizes each head again after wq_b; a V4.1 draft normalizes only the low-rank part
++        q = ggml_rms_norm(ctx0, q, norm_rms_eps);
++        cb(q, "q_norm", il);
++    }
+ 
+     q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+@@ -1118,6 +1139,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+                 inp_dsv4->get_hca().state_read_idxs,
+                 inp_dsv4->get_hca().state_write_pos,
+                 layer.attn_comp_norm,
++                DSV4_HCA_RATIO,
+                 n_embd_head,
+                 "hca_state_compress",
+                 il);
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+new file mode 100644
+index 0000000..25c72d3
+--- /dev/null
++++ b/src/models/deepseek41.cpp
+@@ -0,0 +1,1255 @@
++#include "llama-hparams.h"
++#include "models.h"
++
++#include "llama-kv-cache-dsv4.h"
++
++#include <algorithm>
++#include <array>
++#include <cinttypes>
++#include <cmath>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++// DeepSeek-V4.1.
++//
++// Shares almost everything with DeepSeek-V4: the hyper-connection stream, the MoE, the latent
++// attention and the compressed KV cache. Three things differ.
++//
++// 1. The hyper-connection coefficients lag by one sublayer. A sublayer computes the mix that the
++//    NEXT one consumes, so attention uses what the previous layer's FFN produced. V4 computes and
++//    consumes in the same sublayer.
++// 2. There is no learned hyper-connection head. Nothing is left to collapse the copies with in V4,
++//    which is why it needs one; here the last layer's FFN mix is still unused and does the job.
++//    These two facts explain each other, and the file ships no output_hc_* tensors.
++// 3. The engram tables: n-gram keyed lookups added into the stream at a few layers.
++//
++// The sparse attention also differs. V4 compresses KV on every layer at one of two fixed ratios;
++// V4.1 compresses on a few source layers and the layers after each source read the same rows, and
++// it derives index keys from that shared latent rather than from a second compressor. See
++// build_attention_v41().
++//
++// mean over the hyper-connection copies; deepseek4.cpp keeps its own copy of this
++static ggml_tensor * dsv41_hc_mean(ggml_context * ctx, ggml_tensor * x) {
++    const int64_t hc = x->ne[1];
++
++    ggml_tensor * acc = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], 0);
++    for (int64_t s = 1; s < hc; ++s) {
++        acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
++    }
++    return ggml_scale(ctx, acc, 1.0f/hc);
++}
++
++int llama_model_deepseek41::engram_index(int il) const {
++    for (uint32_t e = 0; e < engram_n_layer; ++e) {
++        if (hparams.engram_layer_ids[e] == (uint32_t) il) {
++            return (int) e;
++        }
++    }
++    return -1;
++}
++
++static bool dsv41_is_prime(uint64_t n) {
++    if (n < 2) {
++        return false;
++    }
++    if (n % 2 == 0) {
++        return n == 2;
++    }
++    for (uint64_t d = 3; d <= n / d; d += 2) {
++        if (n % d == 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static uint64_t dsv41_next_prime(uint64_t start, const std::unordered_set<uint64_t> & used) {
++    uint64_t candidate = start + 1;
++    while (!dsv41_is_prime(candidate) || used.count(candidate) != 0) {
++        ++candidate;
++    }
++    return candidate;
++}
++
++void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
++    llama_model_deepseek4::load_arch_hparams(ml);
++
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, hparams.dsv41_candidate_source_layer, false);
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, hparams.dsv41_candidate_top_k_blocks, false);
++    ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   hparams.dsv41_candidate_block_size, false);
++
++    if (hparams.dsv41_candidate_source_layer < -1 ||
++        (hparams.dsv41_candidate_source_layer >= 0 &&
++         static_cast<uint32_t>(hparams.dsv41_candidate_source_layer) >= hparams.n_layer())) {
++        throw std::runtime_error("DeepSeek-V4.1 candidate source layer must be -1 or a valid layer");
++    }
++
++    if (hparams.dsv41_candidate_source_layer == -1) {
++        if (hparams.dsv41_candidate_top_k_blocks != 0 || hparams.dsv41_candidate_block_size != 0) {
++            throw std::runtime_error("DeepSeek-V4.1 candidate block sizes must be zero when candidate attention is disabled");
++        }
++    } else if (hparams.dsv41_candidate_top_k_blocks == 0 || hparams.dsv41_candidate_block_size == 0) {
++        throw std::runtime_error("DeepSeek-V4.1 candidate attention needs positive block count and block size");
++    } else if (hparams.dsv41_candidate_block_size > 1024) {
++        throw std::runtime_error("DeepSeek-V4.1 candidate block size exceeds the supported maximum of 1024");
++    }
++
++    const auto * combined_table = ml.get_weight("per_layer_token_embd.weight");
++    std::vector<uint32_t> gate_layers;
++    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
++        const std::string gate_name = format("blk.%u.engram_gate.weight", il);
++        if (ml.get_weight(gate_name.c_str()) != nullptr) {
++            gate_layers.push_back(il);
++        }
++    }
++    engram_combined_table = combined_table != nullptr || !gate_layers.empty();
++    if (engram_combined_table && (combined_table == nullptr || gate_layers.empty())) {
++        throw std::runtime_error("Unsloth Engram format must provide both per_layer_token_embd.weight and per-layer engram_gate weights");
++    }
++
++    uint32_t metadata_engram_layers = 0;
++    const bool has_layer_ids = ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, metadata_engram_layers, false);
++    if (engram_combined_table) {
++        if (gate_layers.size() != 2 || gate_layers[0] != 1 || gate_layers[1] != 14) {
++            throw std::runtime_error("Unsloth Engram fallback currently requires exactly layers 1 and 14");
++        }
++        engram_n_layer = (uint32_t) gate_layers.size();
++        for (uint32_t e = 0; e < engram_n_layer; ++e) {
++            hparams.engram_layer_ids[e] = gate_layers[e];
++        }
++        if (has_layer_ids) {
++            if (metadata_engram_layers != engram_n_layer) {
++                throw std::runtime_error("Unsloth Engram layer metadata disagrees with gate tensors");
++            }
++            std::array<uint32_t, LLAMA_MAX_LAYERS> metadata_layer_ids = {};
++            ml.get_arr(LLM_KV_ENGRAM_LAYER_IDS, metadata_layer_ids);
++            for (uint32_t e = 0; e < engram_n_layer; ++e) {
++                if (metadata_layer_ids[e] != hparams.engram_layer_ids[e]) {
++                    throw std::runtime_error("Unsloth Engram layer metadata disagrees with gate tensors");
++                }
++            }
++        }
++
++        constexpr uint32_t expected_vocab_size = 16000000;
++        constexpr uint32_t expected_compressed_vocab_size = 99092;
++        constexpr uint32_t expected_pad_token_id = 2;
++        uint32_t vocab_size = 0;
++        uint32_t compressed_vocab_size = 0;
++        uint32_t raw_pad_token_id = 0;
++        ml.get_key(LLM_KV_ENGRAM_VOCAB_SIZE, vocab_size);
++        ml.get_key(LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE, compressed_vocab_size);
++        ml.get_key(LLM_KV_ENGRAM_PAD_TOKEN_ID, raw_pad_token_id);
++        uint32_t optional_value = 0;
++        if ((ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT, optional_value, false) && optional_value != 8) ||
++            (ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH, optional_value, false) && optional_value != 256) ||
++            (ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, optional_value, false) && optional_value != 4)) {
++            throw std::runtime_error("Unsloth Engram shape metadata disagrees with the supported DeepSeek-V4.1-Flash-1017 layout");
++        }
++        if (vocab_size != expected_vocab_size || compressed_vocab_size != expected_compressed_vocab_size ||
++            raw_pad_token_id != expected_pad_token_id) {
++            throw std::runtime_error("Unsloth Engram metadata does not match the supported DeepSeek-V4.1-Flash-1017 layout");
++        }
++
++        hparams.engram_n_head = 8;
++        hparams.engram_key_length = 256;
++        hparams.engram_max_ngram_size = 4;
++        // NumPy default_rng(10007 * layer_id), pinned to the released 1017 tokenizer layout.
++        const std::array<std::array<uint64_t, 4>, 2> multipliers = {{
++            {{76632096046245ULL, 4839876093313ULL, 35959672319349ULL, 73987337458391ULL}},
++            {{67716810739261ULL, 51510806800915ULL, 30921347202721ULL, 82619226485591ULL}},
++        }};
++        engram_multipliers.clear();
++        for (const auto & per_layer : multipliers) {
++            engram_multipliers.insert(engram_multipliers.end(), per_layer.begin(), per_layer.end());
++        }
++
++        engram_primes.clear();
++        engram_offsets.clear();
++        engram_table_offsets.clear();
++        engram_table_rows.clear();
++        std::unordered_set<uint64_t> used_primes;
++        int64_t combined_offset = 0;
++        for (uint32_t e = 0; e < engram_n_layer; ++e) {
++            engram_table_offsets.push_back(combined_offset);
++            uint64_t layer_rows = 0;
++            for (uint32_t ngram = 0; ngram < hparams.engram_max_ngram_size - 1; ++ngram) {
++                uint64_t search = vocab_size - 1;
++                for (uint32_t head = 0; head < hparams.engram_n_head; ++head) {
++                    const uint64_t prime = dsv41_next_prime(search, used_primes);
++                    used_primes.insert(prime);
++                    search = prime;
++                    engram_primes.push_back(prime);
++                    engram_offsets.push_back(layer_rows);
++                    layer_rows += prime;
++                }
++            }
++            engram_table_rows.push_back((int64_t) layer_rows);
++            combined_offset += (int64_t) layer_rows;
++        }
++        if (engram_table_rows[0] != 384006168 || engram_table_rows[1] != 384016682 ||
++            combined_table->tensor->ne[0] != (int64_t) hparams.engram_key_length ||
++            combined_table->tensor->ne[1] != combined_offset) {
++            throw std::runtime_error("Unsloth combined Engram table shape does not match its generated prime buckets");
++        }
++
++        ml.get_arr(LLM_KV_ENGRAM_TOKEN_MAP, engram_token_map);
++        if (raw_pad_token_id >= engram_token_map.size()) {
++            throw std::runtime_error("Unsloth Engram pad token id is outside the token map");
++        }
++        engram_pad_id = (uint32_t) engram_token_map[raw_pad_token_id];
++    } else {
++        ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, engram_n_layer);
++        if (engram_n_layer == 0 || engram_n_layer > LLAMA_MAX_LAYERS) {
++            throw std::runtime_error(format("DeepSeek-V4.1 engram layer count %u is out of range", engram_n_layer));
++        }
++        ml.get_arr(LLM_KV_ENGRAM_LAYER_IDS, hparams.engram_layer_ids);
++
++        ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
++        ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
++        ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size);
++        ml.get_key(LLM_KV_ENGRAM_PAD_ID,         engram_pad_id);
++
++        ml.get_arr(LLM_KV_ENGRAM_MULTIPLIERS, engram_multipliers);
++        ml.get_arr(LLM_KV_ENGRAM_PRIMES,      engram_primes);
++        ml.get_arr(LLM_KV_ENGRAM_OFFSETS,     engram_offsets);
++        ml.get_arr(LLM_KV_ENGRAM_TOKEN_MAP,   engram_token_map);
++    }
++
++    if (engram_n_layer == 0 || engram_n_layer > LLAMA_MAX_LAYERS) {
++        throw std::runtime_error(format("DeepSeek-V4.1 engram layer count %u is out of range", engram_n_layer));
++    }
++
++    if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2) {
++        throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head and a 2-gram");
++    }
++
++    for (uint32_t e = 0; e < engram_n_layer; ++e) {
++        if (hparams.engram_layer_ids[e] >= hparams.n_layer()) {
++            throw std::runtime_error(format("engram layer %u is out of range", hparams.engram_layer_ids[e]));
++        }
++    }
++
++    // the hash indexes straight into these, so a short array would read past the end
++    const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
++
++    if (engram_multipliers.size() != (size_t) engram_n_layer * hparams.engram_max_ngram_size) {
++        throw std::runtime_error("engram multiplier count does not match layers * ngram size");
++    }
++    if (engram_primes.size() != (size_t) engram_n_layer * n_bucket ||
++        engram_offsets.size() != engram_primes.size()) {
++        throw std::runtime_error("engram prime or offset count does not match layers * buckets");
++    }
++    for (uint64_t p : engram_primes) {
++        if (p == 0) {
++            throw std::runtime_error("engram prime of zero would divide by zero in the hash");
++        }
++    }
++}
++
++void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
++    LLAMA_LOAD_LOCALS;
++
++    const int64_t q_lora_rank     = hparams.n_lora_q;
++    const int64_t n_ff_exp        = hparams.n_ff_exp();
++    const int64_t n_expert_shared = hparams.n_expert_shared;
++
++    const int64_t n_embd_head   = hparams.n_embd_head_k();
++    const int64_t o_groups      = hparams.dsv4_o_group_count;
++    const int64_t o_lora_rank   = hparams.dsv4_o_lora_rank;
++    const int64_t hc_mult       = hparams.dsv4_hc_mult;
++    const int64_t hc_dim        = hc_mult * n_embd;
++    const int64_t hc_mix_dim    = (2 + hc_mult) * hc_mult;
++    const int64_t n_embd_indexer = hparams.indexer_head_size;
++
++    if ((size_t) n_vocab > engram_token_map.size()) {
++        throw std::runtime_error(format("engram token map has %zu entries, too few for %" PRId64 " tokens",
++                                        engram_token_map.size(), n_vocab));
++    }
++
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++
++    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
++
++    if (engram_combined_table) {
++        const auto * table = ml.get_weight("per_layer_token_embd.weight");
++        if (table == nullptr || table->tensor->ne[0] != hparams.engram_key_length) {
++            throw std::runtime_error("Unsloth combined Engram table is missing or has an invalid row width");
++        }
++        engram_embd_all = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
++                { hparams.engram_key_length, table->tensor->ne[1] }, TENSOR_READ_LAZY);
++    }
++
++    for (int i = 0; i < n_layer; ++i) {
++        auto & layer = layers[i];
++
++        layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, 0);
++        layer.attn_sinks    = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,    "weight", i), {n_head}, 0);
++        layer.wq_a          = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,      "weight", i), {n_embd, q_lora_rank}, 0);
++        layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), {q_lora_rank}, 0);
++        layer.wq_b          = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,      "weight", i), {q_lora_rank, n_head * n_embd_head}, 0);
++        layer.wkv           = create_tensor(tn(LLM_TENSOR_ATTN_KV,       "weight", i), {n_embd, n_embd_head}, 0);
++        layer.attn_kv_norm  = create_tensor(tn(LLM_TENSOR_ATTN_KV_NORM,  "weight", i), {n_embd_head}, 0);
++        // the file lays wo_a out as (n_head * n_embd_head / o_groups, o_lora_rank * o_groups),
++        // so reshape at load and keep the graph free of it
++        layer.wo_a          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,    "weight", i), {n_head * n_embd_head / o_groups, o_lora_rank, o_groups}, TENSOR_ALLOW_RESHAPE);
++        layer.wo_b          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,    "weight", i), {o_groups * o_lora_rank, n_embd}, 0);
++
++        layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim}, 0);
++        layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, 0);
++        layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, 0);
++        layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix_dim}, 0);
++        layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim}, 0);
++        layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, 0);
++
++        // Only the KV source layers carry a compressor, and only those with a ratio above 1 pool
++        // with a gate, so both are optional rather than keyed off the ratio the way V4 does it.
++        layer.attn_comp_wkv   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, n_embd_head}, TENSOR_NOT_REQUIRED);
++        layer.attn_comp_wgate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, n_embd_head}, TENSOR_NOT_REQUIRED);
++        layer.attn_comp_norm  = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM,  "weight", i), {n_embd_head}, TENSOR_NOT_REQUIRED);
++
++        // An index source scores queries against shared index keys. Only a layer that also
++        // compresses its own KV builds those keys; the rest read what an earlier layer published.
++        layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * n_embd_indexer}, TENSOR_NOT_REQUIRED);
++        layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, TENSOR_NOT_REQUIRED);
++        layer.indexer_attn_k   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd_head, n_embd_indexer}, TENSOR_NOT_REQUIRED);
++        layer.indexer_k_norm   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {n_embd_indexer}, TENSOR_NOT_REQUIRED);
++
++        layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
++        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
++        // vision variant only: routing bias for image tokens
++        layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
++        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
++
++        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
++        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
++        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
++
++        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
++        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, 0);
++        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
++
++        const int eg = engram_index(i);
++        if (eg >= 0) {
++            const int64_t n_cols = (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
++            const int64_t key_len = hparams.engram_key_length;
++
++            const std::string embd_name = engram_combined_table
++                    ? "per_layer_token_embd.weight"
++                    : tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i).str();
++            const auto * embd_w = ml.get_weight(embd_name.c_str());
++            if (embd_w == nullptr) {
++                throw std::runtime_error(format("%s is missing", embd_name.c_str()));
++            }
++            const int64_t n_rows = engram_combined_table ? engram_table_rows.at(eg) : embd_w->tensor->ne[1];
++
++            // a row index is a bucket offset plus a hash, so the last bucket has to end inside
++            uint64_t max_row = 0;
++            for (int64_t b = 0; b < n_cols; ++b) {
++                const size_t k = (size_t) eg*n_cols + b;
++                max_row = std::max(max_row, engram_offsets[k] + engram_primes[k]);
++            }
++            if ((int64_t) max_row > n_rows) {
++                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the engram buckets (%" PRIu64 ")",
++                                                embd_name.c_str(), n_rows, max_row));
++            }
++
++            if (engram_combined_table) {
++                layer.engram_embd = nullptr;
++                layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_KV,   "weight", i), {n_cols * key_len, n_embd * (hc_mult + 1)}, 0);
++                layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_GATE, "weight", i), {n_embd, hc_mult}, 0);
++                layer.engram_k    = nullptr;
++            } else {
++                // The per-layer table is enormous; each token touches only n_cols rows, read lazily.
++                layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {key_len, n_rows}, TENSOR_READ_LAZY);
++                layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,  "weight", i), {n_cols * key_len, n_embd * (hc_mult + 1)}, 0);
++                layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc_mult}, 0);
++                layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc_mult}, 0);
++            }
++        }
++
++    }
++
++    // Work out which layer publishes the stream each layer reads. Only a source carries a
++    // compressor, only an index key owner carries indexer_attn_k, and only an index source
++    // carries indexer_attn_q_b, so the file itself says which layer plays which role.
++    hparams.dsv41_kv_source.fill(-1);
++    hparams.dsv41_index_key_source.fill(-1);
++    hparams.dsv41_topk_source.fill(-1);
++
++    int32_t last_kv_source    = -1;
++    int32_t last_key_owner    = -1;
++    int32_t last_index_source = -1;
++
++    for (int i = 0; i < n_layer; ++i) {
++        const auto & layer = layers[i];
++
++        if (layer.attn_comp_wkv)    { last_kv_source    = i; }
++        if (layer.indexer_attn_k)   { last_key_owner    = i; }
++        if (layer.indexer_attn_q_b) { last_index_source = i; }
++
++        if (hparams.dsv4_compress_ratios[i] == 0) {
++            // pure sliding window, no compressed stream to read
++            continue;
++        }
++
++        if (last_kv_source < 0 || last_key_owner < 0 || last_index_source < 0) {
++            throw std::runtime_error(format("layer %d reads a compressed stream before any layer publishes one", i));
++        }
++
++        // the row layout of a stream follows the ratio it was compressed at, so a reader that
++        // disagrees with its source would index into rows that stand for different positions
++        if (hparams.dsv4_compress_ratios[i] != hparams.dsv4_compress_ratios[last_kv_source]) {
++            throw std::runtime_error(format("layer %d compresses at ratio %u but reads layer %d, compressed at %u",
++                                            i, hparams.dsv4_compress_ratios[i],
++                                            last_kv_source, hparams.dsv4_compress_ratios[last_kv_source]));
++        }
++
++        hparams.dsv41_kv_source[i]        = last_kv_source;
++        hparams.dsv41_index_key_source[i] = last_key_owner;
++        hparams.dsv41_topk_source[i]      = last_index_source;
++    }
++
++    if (hparams.dsv41_candidate_source_layer >= 0) {
++        const uint32_t source = (uint32_t) hparams.dsv41_candidate_source_layer;
++        if (source >= hparams.n_layer() || !hparams.dsv41_is_index_source(source)) {
++            throw std::runtime_error("DeepSeek-V4.1 candidate source layer must be an index source in the backbone");
++        }
++    }
++
++    // a compressor with no gate only makes sense where there is nothing to pool
++    for (int i = 0; i < n_layer; ++i) {
++        if (hparams.dsv41_is_kv_source(i) && !layers[i].attn_comp_wgate && hparams.dsv4_compress_ratios[i] != 1) {
++            throw std::runtime_error(format("layer %d compresses %u tokens per row but has no pooling gate",
++                                            i, hparams.dsv4_compress_ratios[i]));
++        }
++    }
++}
++
++std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(const llm_graph_params & params) const {
++    return std::make_unique<graph>(*this, params);
++}
++
++// Engram n-gram hash: each token gathers n_cols rows of this layer's table.
++//   rolling_i = (t[0]*m[0]) ^ ... ^ (t[i]*m[i]);  row = rolling_i % prime[i][h] + offset[i][h]
++// The hash runs host-side because ggml has no 64 bit integers and no xor. Look-back stops at the
++// start of the sequence, and the compressed token map folds case and accents together first.
++class llm_graph_input_engram : public llm_graph_input_i {
++public:
++    llm_graph_input_engram(const llama_model_deepseek41 & pmodel,
++                           const llama_kv_cache_dsv4_raw_context * mctx,
++                           int eg) : pmodel(pmodel), mctx(mctx), eg(eg) {}
++    virtual ~llm_graph_input_engram() = default;
++
++    void set_input(const llama_ubatch * ubatch) override;
++
++    bool can_reuse(const llm_graph_params & params) override {
++        mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
++        const int64_t n_cols = (pmodel.hparams.engram_max_ngram_size - 1) * pmodel.hparams.engram_n_head;
++        return rows->ne[0] == n_cols * params.ubatch.n_tokens;
++    }
++
++    ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens]
++
++    const llama_model_deepseek41 & pmodel;
++
++    // the predecessor tokens live in the attention KV cells (ext.tok)
++    const llama_kv_cache_dsv4_raw_context * mctx;
++
++    // which engram layer this is, so the right multipliers and buckets are used
++    const int eg;
++
++    // scratch, reused across set_input() calls
++    std::vector<llama_token> prev;
++};
++
++void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
++    const auto & hp = pmodel.hparams;
++
++    const int64_t n_tokens = ubatch->n_tokens;
++    const int64_t n_gram   = hp.engram_max_ngram_size;
++    const int64_t n_heads  = hp.engram_n_head;
++    const int64_t n_cols   = (n_gram - 1) * n_heads;
++    const int64_t n_prev   = n_gram - 1;
++
++    const uint64_t * mult = pmodel.engram_multipliers.data() + (size_t) eg*n_gram;
++    const uint64_t * prime = pmodel.engram_primes.data()  + (size_t) eg*n_cols;
++    const uint64_t * offset = pmodel.engram_offsets.data() + (size_t) eg*n_cols;
++
++    // an image arrives as an embd batch, so ubatch->token is null; the reference gives those
++    // positions no engram contribution at all, which the padding token stands in for here
++    const int32_t pad = (int32_t) pmodel.engram_pad_id;
++    auto map_of = [&](llama_token t) -> uint64_t {
++        if (t < 0 || (size_t) t >= pmodel.engram_token_map.size()) {
++            return (uint64_t) pad;
++        }
++        return (uint64_t) pmodel.engram_token_map[t];
++    };
++
++    std::vector<int32_t> idx(n_cols * n_tokens);
++
++    GGML_ASSERT(mctx != nullptr);
++
++    for (int64_t i = 0; i < n_tokens; ++i) {
++        // the preceding tokens would be ambiguous, see get_prev_tokens()
++        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "engram n-gram lookups do not support tokens shared by multiple sequences");
++    }
++
++    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch
++    mctx->get_prev_tokens(*ubatch, n_prev, prev);
++
++    for (int64_t i = 0; i < n_tokens; ++i) {
++        // look-back stops at the start of the sequence; everything from there on reads as padding
++        std::vector<uint64_t> ctx(n_gram);
++        ctx[0] = ubatch->token ? map_of(ubatch->token[i]) : (uint64_t) pad;
++        bool blocked = false;
++        for (int64_t s = 1; s < n_gram; ++s) {
++            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
++            const llama_token t = blocked ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
++            blocked = blocked || t < 0;
++            ctx[s] = blocked ? (uint64_t) pad : map_of(t);
++        }
++
++        // compressed ids stay under 2^17 and the multipliers under 2^37, so no product overflows
++        uint64_t rolling = ctx[0] * mult[0];
++        for (int64_t s = 1; s < n_gram; ++s) {
++            rolling ^= ctx[s] * mult[s];
++
++            for (int64_t h = 0; h < n_heads; ++h) {
++                const int64_t b = (s - 1)*n_heads + h;
++                idx[i*n_cols + b] = (int32_t) (rolling % prime[b] + offset[b]);
++            }
++        }
++    }
++
++    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
++}
++
++ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
++        const llama_model & model,
++        int il) {
++    const auto & pmodel = static_cast<const llama_model_deepseek41 &>(model);
++
++    const int64_t n_cols  = (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
++    const int64_t key_len = hparams.engram_key_length;
++
++    const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
++
++    auto inp = std::make_unique<llm_graph_input_engram>(pmodel, mctx_cur->get_raw(), pmodel.engram_index(il));
++
++    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
++    ggml_set_input(inp->rows);
++    ggml_tensor * rows = inp->rows;
++    res->add_input(std::move(inp));
++
++    ggml_tensor * table = model.layers[il].engram_embd;
++    if (pmodel.engram_combined_table) {
++        const int eg = pmodel.engram_index(il);
++        GGML_ASSERT(eg >= 0 && pmodel.engram_embd_all != nullptr);
++        table = ggml_view_2d(ctx0, pmodel.engram_embd_all, key_len,
++                pmodel.engram_table_rows.at(eg), pmodel.engram_embd_all->nb[1],
++                (size_t) pmodel.engram_table_offsets.at(eg) * pmodel.engram_embd_all->nb[1]);
++    }
++
++    // gather then flatten, laying the buckets out slowest, as the reference does
++    ggml_tensor * emb = ggml_get_rows(ctx0, table, rows);
++    emb = ggml_reshape_2d(ctx0, emb, key_len * n_cols, n_tokens);
++    cb(emb, "engram_embd", il);
++
++    return emb;
++}
++
++ggml_tensor * llama_model_deepseek41::graph::build_engram(
++        const llama_model & model,
++        ggml_tensor * x,
++        ggml_tensor * emb,
++        int il) const {
++    const int64_t hc     = hparams.dsv4_hc_mult;
++    const int64_t hc_dim = hc*n_embd;
++    const int64_t nt     = x->ne[2];
++
++    // one projection makes a key per hc copy plus one value they all share
++    ggml_tensor * kv = build_lora_mm(model.layers[il].engram_wkv, emb);
++    cb(kv, "engram_kv", il);
++
++    ggml_tensor * key   = ggml_cont(ctx0, ggml_view_2d(ctx0, kv, hc_dim, nt, kv->nb[1], 0));
++    ggml_tensor * value = ggml_cont(ctx0, ggml_view_2d(ctx0, kv, n_embd, nt, kv->nb[1], hc_dim*kv->nb[0]));
++
++    // The gate scales reach ggml_mul, which takes only f32, and a file quantized before
++    // llama-quant.cpp learned to skip them carries them quantized. get_rows dequantizes.
++    auto as_f32 = [&](ggml_tensor * w) {
++        if (w->type == GGML_TYPE_F32) {
++            return w;
++        }
++        ggml_tensor * ids = ggml_cast(ctx0, ggml_arange(ctx0, 0.0f, (float) w->ne[1], 1.0f), GGML_TYPE_I32);
++        return ggml_get_rows(ctx0, w, ids);
++    };
++
++    // Normalize per (token, hc copy) over n_embd, not jointly over the copies. Unsloth stores
++    // engram_q * engram_k as one gate; applying that product on the query side preserves the dot.
++    auto grouped_norm = [&](ggml_tensor * t, ggml_tensor * w) {
++        t = ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
++        t = ggml_rms_norm(ctx0, t, norm_rms_eps);
++        t = ggml_reshape_2d(ctx0, t, hc_dim, nt);
++        if (w != nullptr) {
++            t = ggml_mul(ctx0, t, ggml_reshape_2d(ctx0, w, hc_dim, 1));
++        }
++        return ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
++    };
++
++    ggml_tensor * k = grouped_norm(key, model.layers[il].engram_k ? as_f32(model.layers[il].engram_k) : nullptr);
++    ggml_tensor * q = grouped_norm(x,   as_f32(model.layers[il].engram_q));
++
++    ggml_tensor * s = ggml_sum_rows(ctx0, ggml_mul(ctx0, k, q));
++    s = ggml_scale(ctx0, s, 1.0f/sqrtf((float) n_embd));
++
++    // signed square root before the sigmoid, matching the training kernel.
++    // The reference uses copysign, which treats +0 as positive where ggml_sgn gives 0, so a dot
++    // product of exactly zero gates 0.5 here against 0.50025 there. qwen4exp's PLE gate is built
++    // the same way.
++    ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, s), 1e-6f, INFINITY));
++    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, s), mag));
++    cb(gate, "engram_gate", il);
++
++    // the value is shared across the copies, only the gate differs
++    ggml_tensor * v = ggml_reshape_3d(ctx0, value, n_embd, 1, nt);
++    v = ggml_repeat_4d(ctx0, v, n_embd, hc, nt, 1);
++
++    return ggml_add(ctx0, x, ggml_mul(ctx0, v, gate));
++}
++
++// Rope settings for one layer. A layer that reads a compressed stream rotates with the
++// compressor's base and YaRN; a plain sliding window layer rotates with the model's.
++struct dsv41_rope_cfg {
++    float   base;
++    float   scale;
++    float   ext_factor;
++    float   attn_factor;
++    float   beta_fast;
++    float   beta_slow;
++    int32_t n_ctx_orig;
++};
++
++dsv41_rope_cfg llama_model_deepseek41::graph::rope_cfg(int il) const {
++    if (hparams.dsv4_compress_ratios[il] == 0) {
++        return { freq_base, 1.0f, 0.0f, dsv4_rope_attn_factor(1.0f, 0.0f), 0.0f, 0.0f, 0 };
++    }
++
++    return {
++        hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
++        dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow, n_ctx_orig,
++    };
++}
++
++// Undo the rotation the query carried into attention, then the grouped output projection. wo_a is
++// block diagonal over groups, each projecting only its own heads, hence a batched mul_mat.
++ggml_tensor * llama_model_deepseek41::graph::build_attention_tail(
++        const llama_model & model,
++        ggml_tensor * out,
++        ggml_tensor * inp_pos,
++        int64_t nt,
++        int il) const {
++    const auto & layer = model.layers[il];
++
++    const int64_t n_embd_head      = hparams.n_embd_head_k();
++    const int64_t n_embd_head_rope = hparams.n_rot();
++    const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
++    const int64_t n_groups         = hparams.dsv4_o_group_count;
++    const int64_t o_lora_rank      = hparams.dsv4_o_lora_rank;
++    const int64_t o_group_dim      = (n_head/n_groups)*n_embd_head;
++
++    const dsv41_rope_cfg rc = rope_cfg(il);
++
++    out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
++    out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
++            rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
++    out = ggml_rope_set_offset(out, n_embd_head_nope);
++    cb(out, "attn_derope", il);
++
++    out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
++    out = ggml_permute(ctx0, out, 0, 2, 1, 3);
++
++    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
++    cb(oa, "attn_wo_a", il);
++
++    oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
++    oa = ggml_cont_2d(ctx0, oa, o_lora_rank*n_groups, nt);
++
++    out = build_lora_mm(layer.wo_b, oa);
++    cb(out, "attn_out", il);
++
++    return out;
++}
++
++// Score this layer's queries against the shared index keys and keep the best compressed positions.
++// The keys were published by an earlier layer, so this only builds the query side.
++ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
++        const llama_model & model,
++        llm_graph_input_dsv4 * inp_dsv4,
++        const llm_graph_input_dsv4::comp_input & inp_comp,
++        ggml_tensor * qr,
++        ggml_tensor * cur,
++        ggml_tensor * inp_pos,
++        ggml_tensor * candidate_mask,
++        ggml_tensor ** candidate_mask_out,
++        int il) const {
++    const auto & layer = model.layers[il];
++
++    const int64_t n_idx_head      = hparams.indexer_n_head;
++    const int64_t n_idx_head_dim  = hparams.indexer_head_size;
++    const int64_t n_idx_head_rope = hparams.n_rot();
++    const int64_t n_idx_head_nope = n_idx_head_dim - n_idx_head_rope;
++    const int64_t nt              = cur->ne[1];
++
++    GGML_ASSERT(inp_comp.kq_mask);
++    GGML_ASSERT(n_idx_head_dim >= n_idx_head_rope);
++
++    ggml_tensor * idx_q = build_lora_mm(layer.indexer_attn_q_b, qr);
++    idx_q = ggml_reshape_3d(ctx0, idx_q, n_idx_head_dim, n_idx_head, nt);
++    idx_q = ggml_rope_ext(ctx0, idx_q, inp_pos, nullptr, n_idx_head_rope, rope_type, n_ctx_orig,
++            hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
++            dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
++    idx_q = ggml_rope_set_offset(idx_q, n_idx_head_nope);
++    cb(idx_q, "idx_q", il);
++
++    ggml_tensor * idx_k_rot = inp_dsv4->get_lid().k_rot;
++    if (idx_k_rot) {
++        idx_q = llama_mul_mat_hadamard(ctx0, idx_q, idx_k_rot);
++        cb(idx_q, "idx_q_rot", il);
++    }
++
++    // one weight per head, scaled so the score matches the reference's
++    // softmax_scale * n_heads**-0.5
++    ggml_tensor * idx_w = build_lora_mm(layer.indexer_proj, cur);
++    idx_w = ggml_scale(ctx0, idx_w, 1.0f/sqrtf(float(n_idx_head_dim*n_idx_head)));
++    cb(idx_w, "idx_weights", il);
++
++    ggml_tensor * idx_k = inp_dsv4->mctx->get_lid()->get_k(ctx0, il);
++
++    const int64_t n_comp = inp_comp.kq_mask->ne[0];
++    GGML_ASSERT(n_comp > 0);
++    GGML_ASSERT(n_comp <= idx_k->ne[2]);
++
++    idx_k = ggml_view_4d(ctx0, idx_k,
++            idx_k->ne[0], idx_k->ne[1], n_comp, idx_k->ne[3],
++            idx_k->nb[1], idx_k->nb[2], idx_k->nb[3], 0);
++    cb(idx_k, "idx_k", il);
++
++    const int64_t n_stream = idx_k->ne[3];
++    idx_q = ggml_view_4d(ctx0, idx_q,
++            idx_q->ne[0], idx_q->ne[1], idx_q->ne[2]/n_stream, n_stream,
++            idx_q->nb[1], idx_q->nb[2], idx_q->nb[3]/n_stream, 0);
++    idx_w = ggml_view_4d(ctx0, idx_w,
++            idx_w->ne[0], idx_w->ne[1]/n_stream, idx_w->ne[2], n_stream,
++            idx_w->nb[1], idx_w->nb[2]/n_stream, idx_w->nb[3]/n_stream, 0);
++
++    idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
++    idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
++
++    ggml_tensor * score = ggml_mul_mat(ctx0, idx_k, idx_q);
++    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
++
++    score = ggml_relu(ctx0, score);
++    score = ggml_mul(ctx0, score, idx_w);
++    score = ggml_sum_rows(ctx0, score);
++    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
++
++    // the attention mask is F16 when flash attention is on, and this score is F32. the mask only
++    // ever holds 0 or -inf, so widening it is exact.
++    ggml_tensor * mask = inp_comp.kq_mask;
++    if (mask->type != score->type) {
++        mask = ggml_cast(ctx0, mask, score->type);
++    }
++
++    score = ggml_add(ctx0, score, mask);
++    cb(score, "idx_score", il);
++
++    if (il == hparams.dsv41_candidate_source_layer) {
++        GGML_ASSERT(candidate_mask_out != nullptr);
++        *candidate_mask_out = build_candidate_mask(inp_comp.kq_mask, score, il);
++    } else if (hparams.dsv41_candidate_source_layer >= 0 && il > hparams.dsv41_candidate_source_layer) {
++        GGML_ASSERT(candidate_mask != nullptr && "candidate source must precede index layers that use it");
++        ggml_tensor * mask_candidates = candidate_mask;
++        if (mask_candidates->type != score->type) {
++            mask_candidates = ggml_cast(ctx0, mask_candidates, score->type);
++        }
++        score = ggml_add(ctx0, score, mask_candidates);
++        cb(score, "idx_score_candidate_masked", il);
++    }
++
++    const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
++
++    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
++    cb(top_k, "idx_top_k", il);
++
++    return top_k;
++}
++
++// Select candidate blocks by their maximum index score and pin the newest visible block.
++ggml_tensor * llama_model_deepseek41::graph::build_candidate_mask(
++        ggml_tensor * kq_mask,
++        ggml_tensor * index_score,
++        int il) const {
++    GGML_ASSERT(kq_mask != nullptr && index_score != nullptr);
++    GGML_ASSERT(kq_mask->ne[0] == index_score->ne[0]);
++    GGML_ASSERT(kq_mask->ne[1] == index_score->ne[1]);
++    GGML_ASSERT(kq_mask->ne[2] == index_score->ne[2]);
++    GGML_ASSERT(kq_mask->ne[3] == index_score->ne[3]);
++    GGML_ASSERT(index_score->type == GGML_TYPE_F32);
++
++    const int64_t width      = index_score->ne[0];
++    const int64_t block_size = hparams.dsv41_candidate_block_size;
++    const int64_t n_blocks   = (width + block_size - 1) / block_size;
++    const int64_t n_top      = std::min<int64_t>(hparams.dsv41_candidate_top_k_blocks, n_blocks);
++    const int64_t pad        = n_blocks * block_size - width;
++
++    GGML_ASSERT(block_size > 0 && n_top > 0);
++
++    // The mask is 0 for visible positions and -inf otherwise. Argmax finds the newest visible row.
++    ggml_tensor * mask_f32 = kq_mask->type == GGML_TYPE_F32
++        ? kq_mask
++        : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
++    ggml_tensor * positions = ggml_arange(ctx0, 0.0f, (float) width, 1.0f);
++    positions = ggml_repeat_4d(ctx0, positions, width,
++            kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
++    ggml_tensor * latest = ggml_argmax(ctx0, ggml_add(ctx0, positions, mask_f32));
++    ggml_tensor * latest_block = ggml_cast(ctx0,
++            ggml_floor(ctx0, ggml_scale(ctx0, ggml_cast(ctx0, latest, GGML_TYPE_F32), 1.0f / block_size)),
++            GGML_TYPE_I32);
++
++    // Pad incomplete blocks with -inf so padding cannot win the max pool.
++    ggml_tensor * padded_score = index_score;
++    if (pad > 0) {
++        ggml_tensor * pad_tensor = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, pad,
++                index_score->ne[1], index_score->ne[2], index_score->ne[3]);
++        pad_tensor = ggml_fill(ctx0, pad_tensor, -INFINITY);
++        padded_score = ggml_concat(ctx0, index_score, pad_tensor, 0);
++    }
++    ggml_tensor * block_scores = ggml_pool_1d(ctx0, padded_score,
++            GGML_OP_POOL_MAX, block_size, block_size, 0);
++
++    // Pin the newest visible block with +inf. The causal mask hides it when no row is visible.
++    ggml_tensor * block_scores_rows = ggml_view_4d(ctx0, block_scores,
++            1, n_blocks, block_scores->ne[1], block_scores->ne[3],
++            block_scores->nb[0], block_scores->nb[1], block_scores->nb[2], 0);
++    ggml_tensor * pin_values = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
++            1, 1, block_scores->ne[1], block_scores->ne[3]);
++    pin_values = ggml_fill(ctx0, pin_values, INFINITY);
++    ggml_tensor * latest_block_view = ggml_view_4d(ctx0, latest_block,
++            1, latest_block->ne[1], latest_block->ne[3], 1,
++            latest_block->nb[1], latest_block->nb[2], latest_block->ne[3] * latest_block->nb[3], 0);
++    block_scores_rows = ggml_set_rows(ctx0, block_scores_rows, pin_values, latest_block_view);
++    block_scores = ggml_view_4d(ctx0, block_scores_rows,
++            n_blocks, block_scores_rows->ne[2], 1, block_scores_rows->ne[3],
++            block_scores_rows->nb[2], block_scores_rows->nb[2], block_scores_rows->nb[3], 0);
++    cb(block_scores, "candidate_block_scores", il);
++
++    ggml_tensor * top_blocks = ggml_top_k(ctx0, block_scores, n_top);
++    cb(top_blocks, "candidate_top_blocks", il);
++
++    // Expand selected blocks, then slice off members beyond the final partial block.
++    ggml_tensor * block_ids_f32 = ggml_cast(ctx0, top_blocks, GGML_TYPE_F32);
++    const int64_t n_query_flat = top_blocks->ne[2] * top_blocks->ne[3];
++    block_ids_f32 = ggml_reshape_4d(ctx0, block_ids_f32, 1, n_top,
++            top_blocks->ne[1], n_query_flat);
++    block_ids_f32 = ggml_repeat_4d(ctx0, block_ids_f32, block_size, n_top,
++            top_blocks->ne[1], n_query_flat);
++    block_ids_f32 = ggml_scale(ctx0, block_ids_f32, (float) block_size);
++
++    ggml_tensor * offsets = ggml_arange(ctx0, 0.0f, (float) block_size, 1.0f);
++    offsets = ggml_repeat_4d(ctx0, offsets, block_size, n_top, top_blocks->ne[1], n_query_flat);
++    ggml_tensor * candidate_idxs = ggml_cast(ctx0,
++            ggml_add(ctx0, block_ids_f32, offsets), GGML_TYPE_I32);
++    candidate_idxs = ggml_reshape_4d(ctx0, candidate_idxs,
++            block_size * n_top, top_blocks->ne[1], top_blocks->ne[2], top_blocks->ne[3]);
++
++    ggml_tensor * mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, 1,
++            n_blocks * block_size, kq_mask->ne[1], kq_mask->ne[3]);
++    mask_all = ggml_fill(ctx0, mask_all, -INFINITY);
++    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, 1,
++            candidate_idxs->ne[0], candidate_idxs->ne[1], candidate_idxs->ne[3]);
++    zeros = ggml_fill(ctx0, zeros, 0.0f);
++
++    ggml_tensor * candidate_idxs_view = ggml_view_4d(ctx0, candidate_idxs,
++            candidate_idxs->ne[0], candidate_idxs->ne[1], candidate_idxs->ne[3], 1,
++            candidate_idxs->nb[1], candidate_idxs->nb[2], candidate_idxs->ne[3] * candidate_idxs->nb[3], 0);
++    ggml_tensor * candidate_mask = ggml_set_rows(ctx0, mask_all, zeros, candidate_idxs_view);
++    candidate_mask = ggml_view_4d(ctx0, candidate_mask,
++            width, kq_mask->ne[1], 1, kq_mask->ne[3],
++            candidate_mask->nb[2], candidate_mask->nb[2], candidate_mask->nb[3], 0);
++    candidate_mask = ggml_add(ctx0, candidate_mask, kq_mask);
++    cb(candidate_mask, "candidate_mask", il);
++
++    return candidate_mask;
++}
++
++// DeepSeek-V4.1 attention: a sliding window of raw KV, plus, where the layer uses one, the
++// compressed positions the indexer picked, concatenated into a single masked attention.
++//
++// Only a source layer compresses. The layers after it read the same rows, which the KV cache
++// hands them through the reuse callback, so a reader builds no compressor at all.
++ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
++        const llama_model & model,
++        llm_graph_input_dsv4 * inp_dsv4,
++        ggml_tensor * cur,
++        ggml_tensor * inp_pos,
++        ggml_tensor *& top_k,
++        int & top_k_source,
++        ggml_tensor *& candidate_mask,
++        int il) const {
++    const auto & layer = model.layers[il];
++    llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
++
++    const int64_t n_embd_head      = hparams.n_embd_head_k();
++    const int64_t n_embd_head_rope = hparams.n_rot();
++    const int64_t nt               = cur->ne[1];
++    const int64_t ratio            = hparams.dsv4_compress_ratios[il];
++
++    GGML_ASSERT(n_embd_head == n_embd_head_v);
++    GGML_ASSERT(n_head % hparams.dsv4_o_group_count == 0);
++
++    const dsv41_rope_cfg rc = rope_cfg(il);
++
++    // Query. V4 normalizes again after wq_b; V4.1 normalizes only the low rank part.
++    ggml_tensor * qr = build_lora_mm(layer.wq_a, cur);
++    qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
++    cb(qr, "qr", il);
++
++    ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
++    q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
++    q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
++            rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
++    q = ggml_rope_set_offset(q, n_embd_head - n_embd_head_rope);
++    cb(q, "q", il);
++
++    // the sliding window KV, which every layer keeps for itself
++    ggml_tensor * kv = build_lora_mm(layer.wkv, cur);
++    kv = build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
++    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt);
++    kv = ggml_rope_ext(ctx0, kv, inp_pos, nullptr, n_embd_head_rope, rope_type, rc.n_ctx_orig,
++            rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
++    kv = ggml_rope_set_offset(kv, n_embd_head - n_embd_head_rope);
++    cb(kv, "kv", il);
++
++    const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
++
++    ggml_tensor * out = nullptr;
++
++    if (ratio == 0) {
++        // no compressed stream, so this layer sees only its own window
++        out = build_raw_attention(inp_attn, q, kv, layer.attn_sinks, kq_scale, il);
++
++        return build_attention_tail(model, out, inp_pos, nt, il);
++    }
++
++    // The plan slot follows the ratio, since a plan encodes how many tokens make a row. The rows
++    // themselves always live in the CSA cache, and the index keys in the indexer cache, whichever
++    // plan produced them.
++    const bool use_csa = (uint32_t) ratio == inp_dsv4->mctx->get_csa_state()->get_ratio();
++
++    const auto & inp_comp = use_csa ? inp_dsv4->get_csa() : inp_dsv4->get_hca();
++
++    const llama_dsv4_comp_state * comp_state = use_csa
++        ? inp_dsv4->mctx->get_csa_state()
++        : inp_dsv4->mctx->get_hca_state();
++
++    GGML_ASSERT(inp_comp.kq_mask && "a compressed layer needs a plan for its ratio");
++
++    if (hparams.dsv41_is_kv_source(il) && inp_comp.state_pos) {
++        ggml_tensor * state_kv = build_lora_mm(layer.attn_comp_wkv, cur);
++        cb(state_kv, "comp_state_kv", il);
++
++        // At ratio 1 there is nothing to pool and the file carries no gate. The softmax below
++        // then runs over a single element and returns 1.0 whatever the score holds, so the
++        // values reach the cache unweighted, which is what a plain projection means.
++        ggml_tensor * state_score = layer.attn_comp_wgate
++            ? build_lora_mm(layer.attn_comp_wgate, cur)
++            : state_kv;
++        cb(state_score, "comp_state_score", il);
++
++        const dsv4_state_tensors restored = dsv4_build_state_restore(ctx0, inp_comp, comp_state, il);
++
++        ggml_tensor * base_kv = dsv4_view_2d(
++                ctx0, restored.kv, restored.kv->ne[0], comp_state->get_n_rows(), 0);
++        ggml_tensor * base_score = dsv4_view_2d(
++                ctx0, restored.score, restored.score->ne[0], comp_state->get_n_rows(), 0);
++
++        ggml_tensor * source_kv    = ggml_concat(ctx0, base_kv,    state_kv,    1);
++        ggml_tensor * source_score = ggml_concat(ctx0, base_score, state_score, 1);
++
++        // the indexer reads the latent before it is rotated, so ask for both forms at once
++        ggml_tensor * latent_pre = nullptr;
++
++        ggml_tensor * latent = build_hca_compressed_kv_from_state(
++                source_kv,
++                source_score,
++                inp_comp.state_read_idxs,
++                inp_comp.state_write_pos,
++                layer.attn_comp_norm,
++                ratio,
++                n_embd_head,
++                "comp_kv",
++                il,
++                &latent_pre);
++
++        if (hparams.dsv41_owns_index_k(il)) {
++            const int64_t n_idx_head_dim  = hparams.indexer_head_size;
++            const int64_t n_idx_head_rope = hparams.n_rot();
++
++            ggml_tensor * idx_k = build_lora_mm(layer.indexer_attn_k, latent_pre);
++            idx_k = build_norm(idx_k, layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
++            idx_k = ggml_rope_ext(ctx0, idx_k, inp_comp.state_write_pos, nullptr, n_idx_head_rope,
++                    rope_type, n_ctx_orig, hparams.dsv4_compress_rope_base, freq_scale, ext_factor,
++                    dsv4_rope_attn_factor(freq_scale, ext_factor), beta_fast, beta_slow);
++            idx_k = ggml_rope_set_offset(idx_k, n_idx_head_dim - n_idx_head_rope);
++            cb(idx_k, "idx_k_new", il);
++
++            if (inp_dsv4->get_lid().k_rot) {
++                idx_k = llama_mul_mat_hadamard(ctx0, idx_k, inp_dsv4->get_lid().k_rot);
++            }
++
++            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(
++                        ctx0, idx_k, inp_comp.state_write_idxs, il));
++        }
++
++        if (inp_dsv4->get_csa().k_rot) {
++            latent = llama_mul_mat_hadamard(ctx0, latent, inp_dsv4->get_csa().k_rot);
++            cb(latent, "comp_kv_rot", il);
++        }
++
++        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(
++                    ctx0, latent, inp_comp.state_write_idxs, il));
++
++        // carry whatever did not complete a row into the next ubatch
++        ggml_tensor * snapshot_kv    = ggml_concat(ctx0, restored.kv,    state_kv,    1);
++        ggml_tensor * snapshot_score = ggml_concat(ctx0, restored.score, state_score, 1);
++
++        const dsv4_state_tensors snapshot = dsv4_build_state_snapshot(
++                ctx0, inp_comp, comp_state, snapshot_kv, snapshot_score, il);
++        if (snapshot.kv != nullptr) {
++            ggml_build_forward_expand(gf, snapshot.kv);
++        }
++        if (snapshot.score != nullptr) {
++            ggml_build_forward_expand(gf, snapshot.score);
++        }
++
++        ggml_tensor * persist_kv = ggml_get_rows(ctx0, state_kv, inp_comp.state_persist_src_idxs);
++        ggml_tensor * persist_score = ggml_get_rows(ctx0, state_score, inp_comp.state_persist_src_idxs);
++
++        ggml_build_forward_expand(gf, comp_state->cpy_kv(
++                    ctx0, persist_kv, inp_comp.state_persist_dst_idxs, il));
++        ggml_build_forward_expand(gf, comp_state->cpy_score(
++                    ctx0, persist_score, inp_comp.state_persist_dst_idxs, il));
++    }
++
++    // an index source picks the positions; the layers in between reuse what it picked
++    if (hparams.dsv41_is_index_source(il)) {
++        top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos,
++                candidate_mask, &candidate_mask, il);
++        top_k_source = il;
++    } else if (hparams.dsv41_topk_source[il] >= 0) {
++        GGML_ASSERT(top_k != nullptr && top_k_source == hparams.dsv41_topk_source[il]);
++    }
++
++    ggml_tensor * k_rot = inp_attn->self_k_rot;
++    if (k_rot) {
++        q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
++        kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
++    }
++
++    ggml_build_forward_expand(gf, q);
++    ggml_build_forward_expand(gf, kv);
++
++    const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
++
++    ggml_build_forward_expand(gf, mctx_raw->cpy_k(ctx0, kv, inp_attn->get_k_idxs(), il));
++
++    ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
++    cb(raw_k, "raw_k", il);
++
++    ggml_tensor * comp_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
++
++    const int64_t n_comp = inp_comp.kq_mask->ne[0];
++    GGML_ASSERT(n_comp > 0);
++    GGML_ASSERT(n_comp <= comp_k->ne[2]);
++
++    comp_k = ggml_view_4d(ctx0, comp_k,
++            comp_k->ne[0], comp_k->ne[1], n_comp, comp_k->ne[3],
++            comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
++    cb(comp_k, "comp_k", il);
++
++    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
++    cb(k_all, "k_all", il);
++
++    ggml_tensor * raw_mask  = inp_attn->get_kq_mask();
++    ggml_tensor * comp_mask = top_k
++        ? build_top_k_mask(inp_comp.kq_mask, top_k, "comp_top_k_mask", il)
++        : inp_comp.kq_mask;
++
++    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
++    cb(kq_mask, "kq_mask", il);
++
++    const int64_t n_kv_max = top_k
++        ? std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0]
++        : 0;
++
++    out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
++            nullptr, n_kv_max, kq_scale, il);
++    if (k_rot) {
++        out = llama_mul_mat_hadamard(ctx0, out, k_rot);
++    }
++    cb(out, "attn_out_raw", il);
++
++    return build_attention_tail(model, out, inp_pos, nt, il);
++}
++
++llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_params & params) :
++    llama_model_deepseek4::graph(params) {
++    const auto & pmodel = static_cast<const llama_model_deepseek41 &>(model);
++
++    ggml_tensor * cur;
++
++    ggml_tensor * inp = build_inp_embd(model.tok_embd);
++    ggml_tensor * inp_pos = build_inp_pos();
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++    llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
++    llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
++    ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
++
++    const int64_t hc = hparams.dsv4_hc_mult;
++    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
++    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
++    cb(inpL, "hc_init", -1);
++
++    ggml_tensor * top_k = nullptr;
++    int top_k_source = -1;
++    ggml_tensor * candidate_mask = nullptr;
++
++    // Layer 0 has no previous sublayer to take a mix from, so the reference hands it a one-hot
++    // that selects the first copy.
++    ggml_tensor * pre_mix = ggml_concat(ctx0,
++            ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_tokens), 1.0f),
++            ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
++    cb(pre_mix, "hc_pre_init", -1);
++
++    for (int il = 0; il < n_layer; ++il) {
++        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
++            res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
++            cb(res->t_layer_inp[il], "layer_inp", il);
++            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
++        }
++
++        // the engram sits before the block and writes straight into the stream
++        if (pmodel.engram_index(il) >= 0) {
++            inpL = build_engram(model, inpL, build_inp_engram(model, il), il);
++            cb(inpL, "engram_out", il);
++        }
++
++        ggml_tensor * residual = inpL;
++        ggml_tensor * attn_pre = nullptr;
++        ggml_tensor * post     = nullptr;
++        ggml_tensor * comb     = nullptr;
++
++        // this sublayer's mixes are for the next one, so the collapse uses the incoming mix
++        build_hc_mixes(inpL,
++                model.layers[il].hc_attn_fn,
++                model.layers[il].hc_attn_scale,
++                model.layers[il].hc_attn_base,
++                &attn_pre, &post, &comb, il);
++
++        cur = build_hc_pre(inpL, pre_mix, il);
++        cb(cur, "hc_attn_pre", il);
++
++        cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "attn_norm", il);
++
++        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, top_k, top_k_source, candidate_mask, il);
++
++        inpL = build_hc_post(cur, residual, post, comb, il);
++        cb(inpL, "hc_attn_post", il);
++
++        residual = inpL;
++
++        // the FFN mix is what the next layer's attention collapses with
++        build_hc_mixes(inpL,
++                model.layers[il].hc_ffn_fn,
++                model.layers[il].hc_ffn_scale,
++                model.layers[il].hc_ffn_base,
++                &pre_mix, &post, &comb, il);
++
++        cur = build_hc_pre(inpL, attn_pre, il);
++        cb(cur, "hc_ffn_pre", il);
++
++        ggml_build_forward_expand(gf, residual);
++        ggml_build_forward_expand(gf, post);
++        ggml_build_forward_expand(gf, comb);
++
++        cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
++        cb(cur, "ffn_norm", il);
++
++        const auto & layer = model.layers[il];
++        ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
++
++        // may apply exp_probs_b_vl if the input is from mtmd
++        if (ubatch.embd != nullptr && layer.ffn_exp_probs_b_vl) {
++            exp_probs_b = layer.ffn_exp_probs_b_vl;
++        }
++
++        ggml_tensor * moe_out = build_moe_ffn(cur,
++                layer.ffn_gate_inp,
++                layer.ffn_up_exps,
++                layer.ffn_gate_exps,
++                layer.ffn_down_exps,
++                exp_probs_b,
++                n_expert, hparams.n_expert_used(),
++                LLM_FFN_SILU, hparams.expert_weights_norm,
++                hparams.expert_weights_scale,
++                (llama_expert_gating_func_type) hparams.expert_gating_func,
++                il);
++        cb(moe_out, "ffn_moe_out", il);
++
++        ggml_tensor * ffn_shexp = build_ffn(cur,
++                layer.ffn_up_shexp, nullptr, nullptr,
++                layer.ffn_gate_shexp, nullptr, nullptr,
++                layer.ffn_down_shexp, nullptr, nullptr,
++                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
++        cb(ffn_shexp, "ffn_shexp", il);
++
++        cur = ggml_add(ctx0, moe_out, ffn_shexp);
++        cb(cur, "ffn_out", il);
++
++        inpL = build_hc_post(cur, residual, post, comb, il);
++        inpL = build_cvec(inpL, il);
++        cb(inpL, "l_last", il);
++    }
++
++    if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
++        res->t_layer_inp[n_layer] = dsv41_hc_mean(ctx0, inpL);
++        cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
++        ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
++    }
++
++    if (inp_out_ids) {
++        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
++        inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
++        pre_mix = ggml_get_rows(ctx0, pre_mix, inp_out_ids);
++    }
++
++    // The last layer's FFN mix is the one nothing has consumed, and it collapses the copies here.
++    // This is what a learned hyper-connection head does in V4, which is why this model has none.
++    cur = build_hc_pre(inpL, pre_mix, -1);
++    cb(cur, "hc_out", -1);
++
++    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
++    cb(cur, "result_norm", -1);
++    res->t_embd = cur;
++
++    cur = ggml_mul_mat(ctx0, model.output, cur);
++    cb(cur, "result_output", -1);
++    res->t_logits = cur;
++
++    ggml_build_forward_expand(gf, cur);
++}
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index c8c2895..1302012 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -67,6 +67,12 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+         ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           hparams.dsv4_o_lora_rank);
+         ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+         ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
++
++        // A V4.1 draft ships no output_hc_* head: its mixes lag by one sublayer and the last FFN mix
++        // collapses the copies, exactly as in the V4.1 body (see deepseek41.cpp). The absent head is the signature.
++        hparams.dflash_dsv41 = ml.get_tensor_meta("output_hc_base.weight") == nullptr;
++        LLAMA_LOG_INFO("%s: DSV4 draft flavor = %s\n", __func__,
++                hparams.dflash_dsv41 ? "V4.1 (lagged hyper-connections, no output head)" : "V4");
+         ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS,            hparams.dsv4_compress_ratios, false);
+ 
+         GGML_ASSERT(hparams.dsv4_o_group_count > 0); // avoid div by zero
+@@ -182,9 +188,11 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
+         const int64_t hc_dim          = hc_mult * n_embd;
+         const int64_t hc_mix_dim      = (2 + hc_mult) * hc_mult;
+ 
+-        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, 0);
+-        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, 0);
+-        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
++        // V4.1 drafts carry no output hyper-connection head
++        const int hc_head_flags = hparams.dflash_dsv41 ? TENSOR_NOT_REQUIRED : 0;
++        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, hc_head_flags);
++        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, hc_head_flags);
++        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, hc_head_flags);
+ 
+         for (int i = 0; i < n_layer; ++i) {
+             auto & layer = layers[i];
+@@ -941,18 +949,36 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
+     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+     cb(inpL, "hc_init", -1);
+ 
++    // V4.1 rules (deepseek41.cpp): a sublayer computes the mix the NEXT one consumes, layer 0 starts
++    // from a one-hot that selects the first copy, and the last FFN mix collapses the copies at the end
++    const bool hc_lag = hparams.dflash_dsv41;
++    ggml_tensor * pre_mix = nullptr;
++    if (hc_lag) {
++        pre_mix = ggml_concat(ctx0,
++                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1,      n_tokens), 1.0f),
++                ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hc - 1, n_tokens), 0.0f), 0);
++        cb(pre_mix, "hc_pre_init", -1);
++    }
++
+     for (int il = 0; il < n_layer; ++il) {
+         const auto & layer = model.layers[il];
+ 
+         ggml_tensor * residual = inpL;
+         ggml_tensor * post = nullptr;
+         ggml_tensor * comb = nullptr;
+-
+-        ggml_tensor * cur = build_hc_pre(inpL,
++        ggml_tensor * attn_pre = nullptr;
++
++        ggml_tensor * cur = nullptr;
++        if (hc_lag) {
++            build_hc_mixes(inpL, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base, &attn_pre, &post, &comb, il);
++            cur = build_hc_pre(inpL, pre_mix, il);
++        } else {
++            cur = build_hc_pre(inpL,
+                 layer.hc_attn_fn,
+                 layer.hc_attn_scale,
+                 layer.hc_attn_base,
+                 &post, &comb, il);
++        }
+         cb(cur, "hc_attn_pre", il);
+ 
+         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+@@ -964,11 +990,16 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
+         cb(inpL, "hc_attn_post", il);
+ 
+         residual = inpL;
+-        cur = build_hc_pre(inpL,
++        if (hc_lag) {
++            build_hc_mixes(inpL, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base, &pre_mix, &post, &comb, il);
++            cur = build_hc_pre(inpL, attn_pre, il);
++        } else {
++            cur = build_hc_pre(inpL,
+                 layer.hc_ffn_fn,
+                 layer.hc_ffn_scale,
+                 layer.hc_ffn_base,
+                 &post, &comb, il);
++        }
+         cb(cur, "hc_ffn_pre", il);
+ 
+         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+@@ -1001,7 +1032,13 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
+         cb(inpL, "l_out", il);
+     }
+ 
+-    ggml_tensor * cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
++    ggml_tensor * cur = nullptr;
++    if (hc_lag) {
++        // the last FFN mix is the one nothing consumed; it does what V4's learned head does
++        cur = build_hc_pre(inpL, pre_mix, -1);
++    } else {
++        cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
++    }
+     cb(cur, "hc_head", -1);
+ 
+     // confidence head input: the reference scores the pre-norm collapsed hidden state
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index 839f223..1388af3 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -357,7 +357,7 @@ static ggml_tensor * dsv4_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t n
+     return ggml_view_1d(ctx, t, ne0, dsv4_elem_offset(t, i0));
+ }
+ 
+-static ggml_tensor * dsv4_view_2d(
++static ggml_tensor * glm5_dsv4_view_2d(
+         ggml_context * ctx,
+         ggml_tensor  * t,
+         int64_t        ne0,
+@@ -477,13 +477,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
+     ggml_tensor * base_pre  = dsv4_view_1d(ctx0, hc_base, hc, 0);
+     ggml_tensor * base_post = dsv4_view_1d(ctx0, hc_base, hc, hc);
+ 
+-    ggml_tensor * pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
++    ggml_tensor * pre = glm5_dsv4_view_2d(ctx0, mixes, hc, nt, 0);
+     pre = dsv4_hc_affine(ctx0, pre, scale_pre, base_pre);
+     pre = ggml_sigmoid(ctx0, pre);
+     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
+     cb(pre, "hc_pre", il);
+ 
+-    *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
++    *post = glm5_dsv4_view_2d(ctx0, mixes, hc, nt, hc);
+     *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
+     *post = ggml_sigmoid(ctx0, *post);
+     *post = ggml_scale(ctx0, *post, 2.0f);
+@@ -497,7 +497,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_hc_pre(
+         ggml_tensor * scale_comb = dsv4_view_1d(ctx0, hc_scale, 1, 2);
+         ggml_tensor * base_comb  = dsv4_view_1d(ctx0, hc_base, hc*hc, 2*hc);
+ 
+-        *comb = dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
++        *comb = glm5_dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
+         *comb = dsv4_hc_affine(ctx0, *comb, scale_comb, base_comb);
+         *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
+         *comb = build_hc_sinkhorn(*comb, il);
+diff --git a/src/models/models.h b/src/models/models.h
+index 387a4ad..7058e39 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -9,6 +9,38 @@
+ #include <map>
+ 
+ class llama_memory_hybrid_idx_context;
++class llama_dsv4_comp_state;
++struct dsv41_rope_cfg;
++
++// The compressor state of a DeepSeek-V4 style compressed stream, as the graph sees it.
++struct dsv4_state_tensors {
++    ggml_tensor * kv;
++    ggml_tensor * score;
++};
++
++// Shared by the DeepSeek-V4 and V4.1 graphs, which run the same compressed stream machinery.
++float dsv4_rope_attn_factor(float freq_scale, float ext_factor);
++
++ggml_tensor * dsv4_view_2d(
++        ggml_context * ctx,
++        ggml_tensor  * t,
++        int64_t        ne0,
++        int64_t        ne1,
++        int64_t        i0);
++
++dsv4_state_tensors dsv4_build_state_restore(
++        ggml_context * ctx,
++        const llm_graph_input_dsv4::comp_input & inp,
++        const llama_dsv4_comp_state * state,
++        int32_t il);
++
++dsv4_state_tensors dsv4_build_state_snapshot(
++        ggml_context * ctx,
++        const llm_graph_input_dsv4::comp_input & inp,
++        const llama_dsv4_comp_state * state,
++        ggml_tensor * source_kv,
++        ggml_tensor * source_score,
++        int32_t il);
+ 
+ // ref: https://github.com/ggml-org/llama.cpp/pull/28068
+ static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
+@@ -1215,6 +1247,16 @@ struct llama_model_deepseek4 : public llama_model_base {
+         // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+         ggml_tensor * build_hc_mean(ggml_tensor * x) const;
+ 
++        void build_hc_mixes(
++                ggml_tensor *  x,
++                ggml_tensor *  hc_fn,
++                ggml_tensor *  hc_scale,
++                ggml_tensor *  hc_base,
++                ggml_tensor ** pre,
++                ggml_tensor ** post,
++                ggml_tensor ** comb,
++                int il) const;
++
+         // returns the collapsed input and fills the post / comb weights
+         ggml_tensor * build_hc_pre(
+                 ggml_tensor * x,
+@@ -1270,9 +1312,11 @@ struct llama_model_deepseek4 : public llama_model_base {
+                 ggml_tensor * state_read_idxs,
+                 ggml_tensor * comp_pos,
+                 ggml_tensor * norm,
++                int64_t ratio,
+                 int64_t n_embd_head,
+                 const char * name,
+-                int il) const;
++                int il,
++                ggml_tensor ** pre_rope = nullptr) const;
+ 
+         ggml_tensor * build_overlap_compressed_kv_from_state(
+                 ggml_tensor * kv_state,
+@@ -1339,6 +1383,88 @@ struct llama_model_deepseek4 : public llama_model_base {
+ };
+ 
+ 
++// DeepSeek-V4.1. Same machinery as V4, minus the hash layers, the MTP block and the learned
++// hyper-connection head, plus the engram n-gram tables. See src/models/deepseek41.cpp.
++struct llama_model_deepseek41 : public llama_model_deepseek4 {
++    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    // engram hash constants, read from the file
++    // these live here rather than in hparams because the token map alone is half a megabyte
++    uint32_t engram_n_layer = 0;
++    uint32_t engram_pad_id  = 0;   // already through the token map, as the reference stores it
++    bool engram_combined_table = false;
++    ggml_tensor * engram_embd_all = nullptr; // Unsloth layout: [key_length, rows for every engram layer]
++    std::vector<int64_t> engram_table_offsets;
++    std::vector<int64_t> engram_table_rows;
++
++    std::vector<uint64_t> engram_multipliers; // [engram_n_layer][engram_max_ngram_size]
++    std::vector<uint64_t> engram_primes;      // [engram_n_layer][engram_max_ngram_size - 1][engram_n_head]
++    std::vector<uint64_t> engram_offsets;     // same layout as engram_primes
++    std::vector<int32_t>  engram_token_map;   // [n_vocab], folds case and accents together
++
++    // The shared stream layer roles live in hparams as dsv41_kv_source and friends, because the
++    // KV cache needs them to alias a reader's storage onto its source's. See load_arch_tensors.
++
++    // position of layer il in the engram constants, or -1 if that layer has no engram
++    int engram_index(int il) const;
++
++    struct graph : public llama_model_deepseek4::graph {
++        graph(const llama_model & model, const llm_graph_params & params);
++
++        // gather the n-gram rows of layer il: [engram_key_length * n_hash_cols, n_tokens]
++        ggml_tensor * build_inp_engram(
++                const llama_model & model,
++                int il);
++
++        ggml_tensor * build_engram(
++                const llama_model & model,
++                ggml_tensor * x,
++                ggml_tensor * emb,
++                int il) const;
++
++        struct dsv41_rope_cfg rope_cfg(int il) const;
++
++        ggml_tensor * build_attention_tail(
++                const llama_model & model,
++                ggml_tensor * out,
++                ggml_tensor * inp_pos,
++                int64_t nt,
++                int il) const;
++
++        // which compressed positions this layer's queries attend to
++        ggml_tensor * build_indexer_top_k(
++                const llama_model & model,
++                llm_graph_input_dsv4 * inp_dsv4,
++                const llm_graph_input_dsv4::comp_input & inp_comp,
++                ggml_tensor * qr,
++                ggml_tensor * cur,
++                ggml_tensor * inp_pos,
++                ggml_tensor * candidate_mask,
++                ggml_tensor ** candidate_mask_out,
++                int il) const;
++
++        ggml_tensor * build_candidate_mask(
++                ggml_tensor * kq_mask,
++                ggml_tensor * index_score,
++                int il) const;
++
++        ggml_tensor * build_attention_v41(
++                const llama_model & model,
++                llm_graph_input_dsv4 * inp_dsv4,
++                ggml_tensor * cur,
++                ggml_tensor * inp_pos,
++                ggml_tensor *& top_k,
++                int & top_k_source,
++                ggml_tensor *& candidate_mask,
++                int il) const;
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
++
+ struct llama_model_deepseek2ocr : public llama_model_base {
+     llama_model_deepseek2ocr(const struct llama_model_params & params) : llama_model_base(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;
+diff --git a/tests/test-chat.cpp b/tests/test-chat.cpp
+index c7edf0c..7e45e73 100644
+--- a/tests/test-chat.cpp
++++ b/tests/test-chat.cpp
+@@ -4365,6 +4365,105 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
+             .run();
+     }
+ 
++    // DeepSeek V4.1 tests - the release's encoding/encoding.py renders the DSML tag names with a
++    // leading space: "<｜DSML｜ calls>", "<｜DSML｜ invoke>", "<｜DSML｜ parameter>" (V4 had
++    // "tool_calls" / "invoke" / "parameter" with no space). Everything else is V4.
++    {
++        auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.1-Flash.jinja", detailed_debug);
++
++        // Pure content (non-thinking mode; generation prompt ends with </think>)
++        tst.test("Hello, world!\nWhat's up?")
++            .enable_thinking(false)
++            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
++            .expect(message_assist)
++            .run();
++
++        // Thinking + tool call (single, string param)
++        tst.test(
++               "Let me check the time</think>\n\n"
++               "<｜DSML｜ calls>\n"
++               "<｜DSML｜ invoke name=\"get_time\">\n"
++               "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n"
++               "</｜DSML｜ invoke>\n"
++               "</｜DSML｜ calls>")
++            .enable_thinking(true)
++            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
++            .tools({ get_time_tool })
++            .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", "Let me check the time"))
++            .run();
++
++        // Tool call without reasoning (non-thinking mode), integer param (string="false")
++        tst.test(
++               "<｜DSML｜ calls>\n"
++               "<｜DSML｜ invoke name=\"special_function\">\n"
++               "<｜DSML｜ parameter name=\"arg1\" string=\"false\">1</｜DSML｜ parameter>\n"
++               "</｜DSML｜ invoke>\n"
++               "</｜DSML｜ calls>")
++            .enable_thinking(false)
++            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
++            .tools({ special_function_tool })
++            .expect(message_assist_call)
++            .run();
++
++        // Multiple parallel tool calls with reasoning
++        tst.test(
++               "Calling both</think>\n\n"
++               "<｜DSML｜ calls>\n"
++               "<｜DSML｜ invoke name=\"get_time\">\n"
++               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
++               "</｜DSML｜ invoke>\n"
++               "<｜DSML｜ invoke name=\"get_weather\">\n"
++               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
++               "</｜DSML｜ invoke>\n"
++               "</｜DSML｜ calls>")
++            .enable_thinking(true)
++            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
++            .parallel_tool_calls(true)
++            .tools({ get_time_tool, get_weather_tool })
++            .expect(message_with_reasoning_content_and_multiple_tool_calls(
++                "Calling both", "",
++                { { "get_time", R"({"city": "Paris"})" }, { "get_weather", R"({"city": "Paris"})" } }))
++            .run();
++
++        // Tool call with content before tool calls, round-tripped through the template
++        tst.test(
++               "Thinking about it</think>"
++               "Let me call the function.\n\n"
++               "<｜DSML｜ calls>\n"
++               "<｜DSML｜ invoke name=\"special_function\">\n"
++               "<｜DSML｜ parameter name=\"arg1\" string=\"false\">1</｜DSML｜ parameter>\n"
++               "</｜DSML｜ invoke>\n"
++               "</｜DSML｜ calls>")
++            .enable_thinking(true)
++            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
++            .tools({ special_function_tool })
++            .expect_reasoning("Thinking about it")
++            .expect_content("Let me call the function.")
++            .expect_tool_calls({
++                { "special_function", R"({"arg1": 1})", {} },
++            })
++            .expect_reconstruction()
++            .run();
++
++        // Tool call with multiple params (mixed types)
++        tst.test(
++               "Multi-arg call</think>\n\n"
++               "<｜DSML｜ calls>\n"
++               "<｜DSML｜ invoke name=\"magic_int\">\n"
++               "<｜DSML｜ parameter name=\"ref\" string=\"false\">42</｜DSML｜ parameter>\n"
++               "<｜DSML｜ parameter name=\"name\" string=\"true\">foo bar</｜DSML｜ parameter>\n"
++               "</｜DSML｜ invoke>\n"
++               "</｜DSML｜ calls>")
++            .enable_thinking(true)
++            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
++            .tools({ magic_int_tool })
++            .expect_reasoning("Multi-arg call")
++            .expect_tool_calls({
++                { "magic_int", R"({"ref": 42, "name": "foo bar"})", {} },
++            })
++            .run();
++    }
++
+     {
+         // The DSML separator belongs to the tool call block, not assistant content.
+         auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja", detailed_debug);
