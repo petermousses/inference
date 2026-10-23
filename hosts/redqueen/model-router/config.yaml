@@ -85,7 +85,7 @@ models:
 
   gemma-4-26b-a4b-it:
     cmd: >-
-      /srv/ai/runtimes/llama.cpp-d812350-moe-v4/bin/llama-server
+      /srv/ai/runtimes/llama.cpp-d812350-moe-v5/bin/llama-server
       --model /srv/ai/models/gemma-4-26b-a4b-it/gemma-4-26B-A4B-it-Q4_0.gguf
       --mmproj /srv/ai/models/gemma-4-26b-a4b-it/mmproj-gemma-4-26B-A4B-it-Q8_0.gguf
       --alias gemma-4-26b-a4b-it

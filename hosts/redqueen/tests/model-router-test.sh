@@ -116,26 +116,34 @@ fi
 
 for flag in '--moe-stream' '--moe-stream-direct' '--moe-stream-cache 4g' "--moe-stream-cache-max ${cache_max_gib}g" '--moe-stream-io-threads 1'; do
   count="$(grep -Fxc -- "      ${flag}" "${router_config}")"
-  if [[ "${count}" -ne 3 ]]; then
+  if [[ "${count}" -ne 4 ]]; then
     printf 'expected all streamed MoE workers to use %s\n' "${flag}" >&2
     exit 1
   fi
 done
-grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v3/bin/llama-fit-params' "${scheduler_policy}"
-grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-deepseek41-moe-v8/bin/llama-server' "${router_config}"
-grep -Fq 'readonly runtime=llama.cpp-d812350-moe-v3' "${host_root}/model-router/install-moe-runtime.sh"
-grep -Fq 'readonly runtime=llama.cpp-d812350-deepseek41-moe-v8' "${host_root}/model-router/install-deepseek41-runtime.sh"
-(cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v3" && sha256sum --check --quiet PATCH_SHA256)
-(cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v8" && sha256sum --check --quiet PATCH_SHA256)
+grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v4/bin/llama-fit-params' "${scheduler_policy}"
+grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-deepseek41-moe-v9/bin/llama-server' "${router_config}"
+grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v5/bin/llama-server' "${router_config}"
+grep -Fq 'readonly runtime=llama.cpp-d812350-moe-v4' "${host_root}/model-router/install-moe-runtime.sh"
+grep -Fq 'readonly runtime=llama.cpp-d812350-moe-v5' "${host_root}/model-router/install-gemma4-moe-runtime.sh"
+grep -Fq 'readonly runtime=llama.cpp-d812350-deepseek41-moe-v9' "${host_root}/model-router/install-deepseek41-runtime.sh"
+(cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v4" && sha256sum --check --quiet PATCH_SHA256)
+(cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v5" && sha256sum --check --quiet PATCH_SHA256)
+(cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v9" && sha256sum --check --quiet PATCH_SHA256)
 grep -Fq 'allocated_capacity_bytes() <= capacity_bytes' \
-  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v3/adaptive-cache.patch"
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v4/adaptive-cache.patch"
 grep -Fq 'allocated_capacity_bytes() <= capacity_bytes' \
-  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v8/adaptive-cache.patch"
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v5/adaptive-cache.patch"
+grep -Fq 'allocated_capacity_bytes() <= capacity_bytes' \
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v9/adaptive-cache.patch"
 grep -Fq 'tensor->data = nullptr;' \
-  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v8/adaptive-cache.patch"
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v9/adaptive-cache.patch"
+grep -Fq 'arch != LLM_ARCH_GEMMA4' \
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v5/moe-stream.patch"
 grep -Fq 'llama_moe_stream_resize_cache(context.get(), resize_bytes, &resized)' \
   "${host_root}/model-router/qualification/moe-stream-probe.cpp"
 grep -Fq '"${source_root}/install-moe-runtime.sh"' "${host_root}/model-router/install.sh"
+grep -Fq '"${source_root}/install-gemma4-moe-runtime.sh"' "${host_root}/model-router/install.sh"
 python3 - "${scheduler_policy}" <<'PY'
 import json
 import pathlib
@@ -175,6 +183,7 @@ for file in \
   "${host_root}/model-router/create-venv.sh" \
   "${host_root}/model-router/install-glm53-runtime.sh" \
   "${host_root}/model-router/install-moe-runtime.sh" \
+  "${host_root}/model-router/install-gemma4-moe-runtime.sh" \
   "${host_root}/model-router/glm-5.3-flash-abliterated-launcher.sh" \
   "${host_root}/model-router/install.sh" \
   "${host_root}/model-router/deploy-scheduler.sh" \
