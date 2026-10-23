@@ -276,7 +276,7 @@ index 31a6a495..4ea6e31b 100644
 +++ b/src/llama-model.cpp
 @@ -1703,9 +1703,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
              params.split_mode != LLAMA_SPLIT_MODE_LAYER || pimpl->has_tensor_overrides) {
-             throw std::runtime_error("streaming supports DeepSeek4/Qwen35MoE/GLM DSA/GLM5-next with layer splitting and no tensor overrides");
+             throw std::runtime_error("streaming supports DeepSeek4/Qwen35MoE/GLM DSA/GLM5-next/Gemma4 with layer splitting and no tensor overrides");
          }
 +        if (params.moe_stream_max_budget > 0 && params.moe_stream_budget > 0 &&
 +            params.moe_stream_max_budget < params.moe_stream_budget) {
