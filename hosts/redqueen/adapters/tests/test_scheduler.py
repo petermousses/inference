@@ -258,7 +258,7 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(runtime.loaded, {"deepseek": "ready", "qwen": "ready"})
             self.assertEqual(
                 runtime.cache_capacities_at_start["qwen"],
-                {"deepseek": 10, "qwen": 10},
+                {"deepseek": 55, "qwen": 10},
             )
             self.assertEqual(runtime.cache_capacities["deepseek"], 55)
             self.assertEqual(runtime.cache_capacities["qwen"], 55)
@@ -307,7 +307,7 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 runtime.cache_capacities_at_start["qwen"],
-                {"deepseek": 10, "qwen": 10},
+                {"deepseek": 55, "qwen": 10},
             )
             deadline = asyncio.get_running_loop().time() + 1
             while runtime.cache_capacities["deepseek"] != 130:
@@ -322,7 +322,7 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             if scheduler.cache_rebalance_tasks:
                 await asyncio.gather(*list(scheduler.cache_rebalance_tasks), return_exceptions=True)
 
-    async def test_new_moe_load_uses_minimum_cache_then_shares_after_load(self):
+    async def test_new_moe_load_reserves_equal_cache_share_during_startup(self):
         resources = {name: adaptive_resource() for name in ("deepseek", "glm")}
         runtime = FakeAdaptiveRuntime(resources, capacity=150)
         scheduler = Scheduler(
@@ -336,15 +336,11 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         runtime.physical_cache_capacities["deepseek"] = 130
         scheduler.cache_allocations["deepseek"] = 130
 
-        self.assertTrue(
-            await scheduler._rebalance_caches(
-                "glm", runtime.limit, Memory(0, 0), reserve_incoming_startup=True
-            )
-        )
+        self.assertTrue(await scheduler._rebalance_caches("glm", runtime.limit, Memory(0, 0)))
 
-        self.assertEqual(runtime.cache_capacities["deepseek"], 10)
+        self.assertEqual(runtime.cache_capacities["deepseek"], 55)
         self.assertEqual(runtime.cache_capacities["glm"], 10)
-        self.assertEqual(runtime.resize_calls, [("deepseek", 10)])
+        self.assertEqual(runtime.resize_calls, [("deepseek", 55)])
 
         runtime.loaded["glm"] = "ready"
         scheduler.states["glm"] = "ready"

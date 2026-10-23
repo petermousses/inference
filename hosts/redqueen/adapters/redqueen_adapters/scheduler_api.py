@@ -635,14 +635,8 @@ class Scheduler:
         incoming: str | None,
         capacity: Memory,
         unknown: Memory,
-        *,
-        reserve_incoming_startup: bool = False,
     ) -> bool:
-        """Water-fill cache capacity equally across workers with current demand.
-
-        Before loading a new worker, callers can hold resident adaptive caches
-        at their minima until startup finishes and physical usage is measurable.
-        """
+        """Water-fill cache capacity equally across active MoE requests."""
         adaptive_names = [
             name for name in self.states
             if self.resources[name].get("adaptive_cache")
@@ -721,15 +715,6 @@ class Scheduler:
         def targets_for(
             extra_bytes: int, *, ignore_fallback_caps: bool = False
         ) -> dict[str, int]:
-            if (
-                reserve_incoming_startup
-                and incoming is not None
-                and incoming not in self.states
-            ):
-                return {
-                    name: self.resources[name]["adaptive_cache"]["minimum_capacity_bytes"]
-                    for name in adjustable_names
-                }
             targets = {
                 name: self.resources[name]["adaptive_cache"]["minimum_capacity_bytes"]
                 for name in adjustable_names
@@ -863,6 +848,15 @@ class Scheduler:
             initial = self.cache_allocations.get(name, limits["maximum_capacity_bytes"])
             accepted, info = await issue_resize(name, target)
             actual = info["capacity_bytes"]
+            if actual != initial:
+                LOG.info(
+                    "expert cache resized model=%s from_mib=%.1f to_mib=%.1f target_mib=%.1f active_moe=%s",
+                    name,
+                    initial / MIB,
+                    actual / MIB,
+                    target / MIB,
+                    ",".join(demand_signature),
+                )
             overshot = actual > target
             if overshot:
                 # A successful HTTP response is not enough when allocator
@@ -1198,7 +1192,6 @@ class Scheduler:
                     name,
                     capacity,
                     unknown,
-                    reserve_incoming_startup=True,
                 )
                 capacity, usage = self.runtime.capacity()
                 reserved = self.reserved()
@@ -1551,7 +1544,7 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 diagnostics[filename.removesuffix(".json")] = {"state": "uninitialized"}
             except (OSError, ValueError):
                 diagnostics[filename.removesuffix(".json")] = {"state": "invalid", "ready": False}
-        return web.json_response({"models": {name: {"state": value, "active_requests": scheduler.active.get(name, 0), "last_request_age_s": scheduler.clock() - scheduler.last_used.get(name, scheduler.clock()), **{key: resources[name].get(key) for key in ("gpu_bytes", "host_bytes", "context_tokens", "memory", "artifact_identity", "artifact_fingerprint", "runtime_identity", "supported_request_shapes", "concurrency_limit")}} for name, value in scheduler.states.items()}, "recovery": {name: {**value, "retry_in_s": max(0, value.get("next_retry", 0) - scheduler.clock())} for name, value in scheduler.recovery.items()}, "ownership": [{key: record.get(key) for key in ("id", "resource", "pid", "phase", "boot_id")} for record in records(scheduler.lock_dir.parent / "requests")], "source": revision, "host": diagnostics})
+        return web.json_response({"models": {name: {"state": value, "active_requests": scheduler.active.get(name, 0), "last_request_age_s": scheduler.clock() - scheduler.last_used.get(name, scheduler.clock()), "expert_cache": ({"capacity_bytes": scheduler.cache_allocations.get(name), "minimum_capacity_bytes": resources[name]["adaptive_cache"]["minimum_capacity_bytes"], "maximum_capacity_bytes": resources[name]["adaptive_cache"]["maximum_capacity_bytes"], "unready": name in scheduler.cache_unready} if resources[name].get("adaptive_cache") else None), **{key: resources[name].get(key) for key in ("gpu_bytes", "host_bytes", "context_tokens", "memory", "artifact_identity", "artifact_fingerprint", "runtime_identity", "supported_request_shapes", "concurrency_limit")}} for name, value in scheduler.states.items()}, "recovery": {name: {**value, "retry_in_s": max(0, value.get("next_retry", 0) - scheduler.clock())} for name, value in scheduler.recovery.items()}, "ownership": [{key: record.get(key) for key in ("id", "resource", "pid", "phase", "boot_id")} for record in records(scheduler.lock_dir.parent / "requests")], "source": revision, "host": diagnostics})
 
     async def admit(request: web.Request):
         body = await read_json(request)

@@ -5,7 +5,7 @@
   "router_config": "/srv/ai/model-router/config.yaml",
   "model_root": "/srv/ai/models",
   "artifact_metadata_root": "/srv/ai/inference/hosts/redqueen/models/metadata",
-  "estimator": "/srv/ai/runtimes/llama.cpp-d812350-moe-v3/bin/llama-fit-params",
+  "estimator": "/srv/ai/runtimes/llama.cpp-d812350-moe-v4/bin/llama-fit-params",
   "gpu_budget_mib": 122880,
   "host_budget_mib": 122880,
   "minimum_host_available_mib": 8192,
@@ -25,6 +25,10 @@
       "max_images": 1
     },
     "glm-5.3-flash-abliterated": {
+      "workspace_mib": 4096,
+      "max_images": 1
+    },
+    "gemma-4-26b-a4b-it": {
       "workspace_mib": 4096,
       "max_images": 1
     },
