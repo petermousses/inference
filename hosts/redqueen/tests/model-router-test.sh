@@ -139,8 +139,8 @@ import sys
 
 policy = json.loads(pathlib.Path(sys.argv[1]).read_text())
 assert policy["upstream_url"] == "http://127.0.0.1:8084"
-assert policy["gpu_budget_mib"] == 88 * 1024
-assert policy["host_budget_mib"] == 104 * 1024
+assert policy["gpu_budget_mib"] == 120 * 1024
+assert policy["host_budget_mib"] == 120 * 1024
 assert policy["minimum_host_available_mib"] == 8 * 1024
 assert policy["prefill_headroom_mib"] == 5 * 1024
 assert policy["moe_stream_overhead_mib"] == 1536
