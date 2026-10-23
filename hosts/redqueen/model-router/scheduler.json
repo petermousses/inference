@@ -74,7 +74,7 @@
       "artifact_inventory": "/srv/ai/inference/hosts/redqueen/models/deepseek-v4.1-flash-1017.files.tsv",
       "request_peak_mib": 36864,
       "expert_cache_mib": 1024,
-      "expert_cache_max_mib": 65536,
+      "expert_cache_max_mib": 90112,
       "expert_cache_url": "http://127.0.0.1:8085/expert-cache",
       "context_tokens": 220000,
       "supported_request_shapes": ["openai.chat", "openai.multimodal_chat"],

@@ -125,7 +125,7 @@ models:
       --moe-stream
       --moe-stream-direct
       --moe-stream-cache 4g
-      --moe-stream-cache-max 64g
+      --moe-stream-cache-max 88g
       --moe-stream-io-threads 1
       --cont-batching
       --flash-attn auto
@@ -159,7 +159,7 @@ models:
       --moe-stream
       --moe-stream-direct
       --moe-stream-cache 4g
-      --moe-stream-cache-max 64g
+      --moe-stream-cache-max 88g
       --moe-stream-io-threads 1
       --load-mode none
       --lazy-mode on-direct
@@ -195,7 +195,7 @@ models:
       --moe-stream
       --moe-stream-direct
       --moe-stream-cache 4g
-      --moe-stream-cache-max 64g
+      --moe-stream-cache-max 88g
       --moe-stream-io-threads 1
       --cont-batching
       --flash-attn auto
