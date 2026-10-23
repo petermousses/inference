@@ -896,10 +896,12 @@ class Scheduler:
                     # the reported capacity and physical usage after every try.
                     lower = actual
                     upper = target
-                    for _ in range(8):
+                    growth_probes = 1
+                    for _ in range(12):
                         candidate = lower + (upper - lower) // 2
                         if candidate <= lower or candidate >= upper:
                             break
+                        growth_probes += 1
                         candidate_accepted, candidate_info = await issue_resize(
                             name, candidate
                         )
@@ -935,10 +937,12 @@ class Scheduler:
                             if not fits:
                                 remember_fallback_cap(name, lower, target)
                                 LOG.warning(
-                                    "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d",
+                                    "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d upper_bound_bytes=%d probes=%d",
                                     name,
                                     target,
                                     lower,
+                                    upper,
+                                    growth_probes,
                                 )
                                 return fits, capacity_now, unknown_now
                             continue
@@ -965,10 +969,12 @@ class Scheduler:
                     remember_fallback_cap(name, lower, target)
                     fits, capacity_now, unknown_now = measured_fit()
                     LOG.warning(
-                        "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d",
+                        "cache resize capped model=%s requested_bytes=%d capacity_bytes=%d upper_bound_bytes=%d probes=%d",
                         name,
                         target,
                         lower,
+                        upper,
+                        growth_probes,
                     )
                     return fits, capacity_now, unknown_now
 
