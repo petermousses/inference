@@ -65,6 +65,20 @@ int main(int argc, char ** argv) {
         if (argv[1][0] == '\0' || layers <= 0) {
             throw std::runtime_error("MODEL must be nonempty and GPU_LAYERS must be positive");
         }
+        uint64_t max_cache_budget = 120ull * 1024 * 1024 * 1024;
+        if (const char * raw_max_cache = std::getenv("MOE_PROBE_MAX_CACHE_BYTES")) {
+            max_cache_budget = parse_unsigned(raw_max_cache, "MOE_PROBE_MAX_CACHE_BYTES", std::numeric_limits<uint64_t>::max());
+        }
+        if (max_cache_budget == 0) {
+            throw std::runtime_error("MOE_PROBE_MAX_CACHE_BYTES must be positive");
+        }
+        uint64_t resize_bytes = 0;
+        if (const char * raw_resize = std::getenv("MOE_PROBE_RESIZE_BYTES")) {
+            resize_bytes = parse_unsigned(raw_resize, "MOE_PROBE_RESIZE_BYTES", std::numeric_limits<uint64_t>::max());
+            if (resize_bytes == 0) {
+                throw std::runtime_error("MOE_PROBE_RESIZE_BYTES must be positive");
+            }
+        }
         uint64_t context_value = 512;
         if (const char * raw_context = std::getenv("MOE_PROBE_CONTEXT_TOKENS")) {
             context_value = parse_unsigned(raw_context, "MOE_PROBE_CONTEXT_TOKENS", 220000);
@@ -80,6 +94,7 @@ int main(int argc, char ** argv) {
         mp.moe_stream = slots != 0 || budget != 0;
         mp.moe_stream_slots = slots;
         mp.moe_stream_budget = budget;
+        mp.moe_stream_max_budget = max_cache_budget;
         mp.moe_stream_io_threads = 1;
         mp.moe_stream_direct = mp.moe_stream;
         using Model = std::unique_ptr<llama_model, decltype(&llama_model_free)>;
@@ -96,6 +111,29 @@ int main(int argc, char ** argv) {
         cp.no_perf = true;
         Context context(llama_init_from_model(model.get(), cp), llama_free);
         if (!context) { throw std::runtime_error("context creation failed"); }
+        if (resize_bytes != 0) {
+            if (!mp.moe_stream) {
+                throw std::runtime_error("MOE_PROBE_RESIZE_BYTES requires streamed MoE mode");
+            }
+            llama_moe_stream_info before{};
+            if (!llama_moe_stream_get_info(model.get(), &before) || before.maximum_capacity_bytes == 0) {
+                throw std::runtime_error("model does not expose an adaptive expert-cache range");
+            }
+            if (resize_bytes < before.minimum_capacity_bytes || resize_bytes > before.maximum_capacity_bytes) {
+                throw std::runtime_error("MOE_PROBE_RESIZE_BYTES is outside the model's expert-cache range");
+            }
+            llama_moe_stream_info resized{};
+            if (!llama_moe_stream_resize_cache(context.get(), resize_bytes, &resized)) {
+                throw std::runtime_error("expert-cache resize was rejected");
+            }
+            if (resized.cache_bytes > resize_bytes ||
+                (resize_bytes < before.maximum_capacity_bytes && resized.cache_bytes >= before.maximum_capacity_bytes)) {
+                throw std::runtime_error("expert-cache resize exceeded its requested capacity");
+            }
+            fprintf(stderr, "resize target=%llu actual=%llu maximum=%llu slots=%u\n",
+                (unsigned long long) resize_bytes, (unsigned long long) resized.cache_bytes,
+                (unsigned long long) resized.maximum_capacity_bytes, resized.slots_per_layer);
+        }
         const auto * vocab = llama_model_get_vocab(model.get());
         const std::string prompt = "A scientist compares exact arithmetic with a disk-backed mixture of experts. Explain why moving unchanged weights should preserve model outputs.";
         const auto text_length = static_cast<int32_t>(prompt.size());
@@ -156,8 +194,9 @@ int main(int argc, char ** argv) {
         if (mp.moe_stream && (!streamed || !info.direct_io_verified || info.pending_reads || info.load_failed || !info.misses)) {
             throw std::runtime_error("stream completion contract failed");
         }
-        printf("{\"steps\":%u,\"context_tokens\":%u,\"vocab\":%u,\"streamed\":%s,\"cache_bytes\":%llu,\"host_overhead_bytes\":%llu,\"slots_per_layer\":%u,\"hits\":%llu,\"misses\":%llu,\"pending_reads\":%u,\"direct_io_verified\":%s}\n",
+        printf("{\"steps\":%u,\"context_tokens\":%u,\"vocab\":%u,\"streamed\":%s,\"cache_bytes\":%llu,\"minimum_capacity_bytes\":%llu,\"maximum_capacity_bytes\":%llu,\"host_overhead_bytes\":%llu,\"slots_per_layer\":%u,\"hits\":%llu,\"misses\":%llu,\"pending_reads\":%u,\"direct_io_verified\":%s}\n",
             steps, context_tokens, n_vocab, streamed ? "true" : "false", (unsigned long long) info.cache_bytes,
+            (unsigned long long) info.minimum_capacity_bytes, (unsigned long long) info.maximum_capacity_bytes,
             (unsigned long long) info.host_overhead_bytes, info.slots_per_layer, (unsigned long long) info.hits,
             (unsigned long long) info.misses, info.pending_reads, info.direct_io_verified ? "true" : "false");
         context.reset();
