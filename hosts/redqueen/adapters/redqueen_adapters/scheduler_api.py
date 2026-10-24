@@ -305,13 +305,14 @@ def count_image_inputs(value: object) -> int:
             if "multimodal_data" in item:
                 media = item["multimodal_data"]
                 count += len(media) if isinstance(media, list) else 1
-            pending.append(
-                iter(
-                    item[key]
-                    for key in ("messages", "input", "content", "prompt")
-                    if key in item
-                )
-            )
+            # Materialize child references before `item` is rebound by the next
+            # traversal step; a lazy generator can inspect a later value such as None.
+            children = [
+                item[key]
+                for key in ("messages", "input", "content", "prompt")
+                if key in item
+            ]
+            pending.append(iter(children))
         elif isinstance(item, list):
             pending.append(iter(item))
     return count
