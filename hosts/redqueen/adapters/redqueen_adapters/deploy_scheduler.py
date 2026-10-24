@@ -184,6 +184,35 @@ def restore(repo: Path, previous: str, enabled: dict, active: list[str], profile
         systemctl("start", *active)
 
 
+def rollback_unactivated_pull(
+    repo: Path,
+    expected_head: str,
+    previous: str,
+    deployment_journal: Path,
+) -> bool:
+    """Undo a pulled develop commit only when activation never journaled or changed services."""
+    try:
+        with host_reliability.operation_lock(deployment_journal.parent):
+            if deployment_journal.exists():
+                return False
+            if run("git", "-C", str(repo), "branch", "--show-current").stdout.strip() != "develop":
+                return False
+            if run("git", "-C", str(repo), "status", "--porcelain").stdout.strip():
+                return False
+            current = run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()
+            if current != expected_head:
+                return False
+            if run(
+                "git", "-C", str(repo), "merge-base", "--is-ancestor", previous, current,
+                check=False,
+            ).returncode:
+                return False
+            run("git", "-C", str(repo), "reset", "--hard", previous)
+            return True
+    except host_reliability.MaintenanceBusy:
+        return False
+
+
 def validate(source: Path, *, fresh_profiler: bool = False) -> tuple[dict, dict]:
     policy_path, router_path = source / "model-router/scheduler.json", source / "model-router/config.yaml"
     policy = json.loads(policy_path.read_text())
@@ -523,35 +552,60 @@ def deploy(
                 print(f"develop at {head[:12]} is already deployed; nothing to reconcile", flush=True)
                 return
 
-        if not has_digest:
-            # Rebuild every admission field against the pinned source without
-            # holding the request lock. The exact snapshot is rechecked below.
-            verify_legacy_profile_payload(repo, previous, router, policy, profiles)
-
-        with host_reliability.operation_lock(directory):
-            current_policy = json.loads((source / "model-router/scheduler.json").read_text())
-            if verify_lock_directory(current_policy, directory) != profile_path:
-                raise RuntimeError("scheduler paths changed while acquiring the deployment lock")
-            current = update_state()
-            if current != snapshot:
-                raise RuntimeError("last-good deployment changed during profile verification; retry update")
+        try:
             if not has_digest:
-                marker = json.loads(marker_bytes)
-                marker["profile_sha256"] = hashlib.sha256(profile_bytes).hexdigest()
-                host_reliability.atomic_json(directory / "last-good.json", marker)
-            rollback_profile_bytes = profile_bytes
-            print(
-                f"using {len(profiles['resources'])} profiles from last-good {previous[:12]} to drain current workers",
-                flush=True,
-            )
-            branch = run("git", "-C", str(repo), "branch", "--show-current").stdout.strip() or None
-            if systemctl("is-active", "qwen38.service", check=False).returncode == 0:
-                raise RuntimeError("legacy qwen38.service is active; drain and stop it explicitly before deployment")
-            _activate(
-                repo, previous, source, policy, profiles, profile_path,
-                branch=branch, update=True, pull_source=update,
-                rollback_profile_bytes=rollback_profile_bytes,
-            )
+                # Rebuild every admission field against the pinned source without
+                # holding the request lock. The exact snapshot is rechecked below.
+                verify_legacy_profile_payload(repo, previous, router, policy, profiles)
+
+            with host_reliability.operation_lock(directory):
+                current_policy = json.loads((source / "model-router/scheduler.json").read_text())
+                if verify_lock_directory(current_policy, directory) != profile_path:
+                    raise RuntimeError("scheduler paths changed while acquiring the deployment lock")
+                current = update_state()
+                if current != snapshot:
+                    raise RuntimeError("last-good deployment changed during profile verification; retry update")
+                if not has_digest:
+                    marker = json.loads(marker_bytes)
+                    marker["profile_sha256"] = hashlib.sha256(profile_bytes).hexdigest()
+                    host_reliability.atomic_json(directory / "last-good.json", marker)
+                rollback_profile_bytes = profile_bytes
+                print(
+                    f"using {len(profiles['resources'])} profiles from last-good {previous[:12]} to drain current workers",
+                    flush=True,
+                )
+                branch = run("git", "-C", str(repo), "branch", "--show-current").stdout.strip() or None
+                if systemctl("is-active", "qwen38.service", check=False).returncode == 0:
+                    raise RuntimeError("legacy qwen38.service is active; drain and stop it explicitly before deployment")
+                _activate(
+                    repo, previous, source, policy, profiles, profile_path,
+                    branch=branch, update=True, pull_source=update,
+                    rollback_profile_bytes=rollback_profile_bytes,
+                )
+        except BaseException:
+            if post_pull:
+                try:
+                    rolled_back = rollback_unactivated_pull(
+                        repo, head, previous, directory / "deployment.json"
+                    )
+                except Exception as rollback_error:
+                    print(
+                        "post-pull deployment failed before activation; source rollback also failed: "
+                        f"{type(rollback_error).__name__}; manual recovery required",
+                        flush=True,
+                    )
+                else:
+                    if rolled_back:
+                        print(
+                            f"post-pull deployment did not activate; restored develop to last-good {previous[:12]}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "post-pull deployment failed before activation; source rollback preconditions were not met",
+                            flush=True,
+                        )
+            raise
         return
 
     with host_reliability.operation_lock(directory):

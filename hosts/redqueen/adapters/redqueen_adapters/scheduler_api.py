@@ -116,7 +116,7 @@ def _memory_log_fields(
 
 
 def _sse_frame_metrics(frame: bytes) -> dict:
-    """Extract only counts and token usage; never return or log generated text."""
+    """Extract stream structure and counts; never return or log payload text."""
     data_lines = []
     for line in frame.splitlines():
         if line.startswith(b"data:"):
@@ -127,6 +127,12 @@ def _sse_frame_metrics(frame: bytes) -> dict:
         "reasoning_chars": 0,
         "prompt_tokens": None,
         "completion_tokens": None,
+        "tool_call_deltas": 0,
+        "function_call_deltas": 0,
+        "delta_fields": set(),
+        "event_type": "none",
+        "finish_reasons": set(),
+        "output_item_types": set(),
     }
     if not data_lines:
         return metrics
@@ -142,24 +148,110 @@ def _sse_frame_metrics(frame: bytes) -> dict:
         for choice in choices:
             if not isinstance(choice, dict):
                 continue
+            finish_reason = choice.get("finish_reason")
+            if isinstance(finish_reason, str):
+                metrics["finish_reasons"].add(
+                    finish_reason
+                    if finish_reason in {"stop", "length", "tool_calls", "function_call", "content_filter"}
+                    else "other"
+                )
             delta = choice.get("delta")
             if not isinstance(delta, dict):
                 continue
+            known_delta_fields = {
+                "content",
+                "text",
+                "reasoning",
+                "reasoning_content",
+                "thinking",
+                "refusal",
+                "tool_calls",
+                "function_call",
+                "audio",
+                "image",
+                "annotations",
+                "role",
+                "parsed",
+            }
+            metrics["delta_fields"].update(known_delta_fields.intersection(delta))
             for key in ("content", "text"):
                 value = delta.get(key)
                 if isinstance(value, str):
                     metrics["text_chars"] += len(value)
+                elif key == "content" and isinstance(value, list):
+                    metrics["text_chars"] += sum(
+                        len(part["text"])
+                        for part in value
+                        if isinstance(part, dict) and isinstance(part.get("text"), str)
+                    )
             for key in ("reasoning", "reasoning_content", "thinking"):
                 value = delta.get(key)
                 if isinstance(value, str):
                     metrics["reasoning_chars"] += len(value)
+            refusal = delta.get("refusal")
+            if isinstance(refusal, str):
+                metrics["text_chars"] += len(refusal)
+            calls = delta.get("tool_calls")
+            if isinstance(calls, list):
+                metrics["tool_call_deltas"] += len(calls)
+            if isinstance(delta.get("function_call"), (dict, str)):
+                metrics["function_call_deltas"] += 1
 
     event_type = payload.get("type")
+    known_events = {
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.reasoning_text.delta",
+        "response.reasoning_summary_text.delta",
+        "response.refusal.delta",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    }
+    metrics["event_type"] = (
+        "none"
+        if event_type is None
+        else event_type
+        if isinstance(event_type, str) and event_type in known_events
+        else "other"
+    )
+    if isinstance(event_type, str) and event_type in {
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+    }:
+        metrics["function_call_deltas"] += 1
+    item = payload.get("item")
+    if isinstance(item, dict) and isinstance(item.get("type"), str):
+        item_type = item["type"]
+        known_item_types = {
+            "message",
+            "function_call",
+            "reasoning",
+            "refusal",
+            "image_generation_call",
+            "code_interpreter_call",
+            "computer_call",
+            "web_search_call",
+            "file_search_call",
+            "mcp_call",
+        }
+        metrics["output_item_types"].add(
+            item_type if item_type in known_item_types else "other"
+        )
+        if item_type == "function_call":
+            metrics["function_call_deltas"] += 1
     delta_text = payload.get("delta")
     if isinstance(delta_text, str):
-        if event_type in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
+        if isinstance(event_type, str) and event_type in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
             metrics["reasoning_chars"] += len(delta_text)
-        elif event_type in {"response.output_text.delta", "response.refusal.delta"}:
+        elif isinstance(event_type, str) and event_type in {"response.output_text.delta", "response.refusal.delta"}:
             metrics["text_chars"] += len(delta_text)
 
     usage = payload.get("usage")
@@ -877,6 +969,138 @@ class Runtime:
             return any(slot["is_processing"] for slot in slots)
         except (aiohttp.ClientError, TimeoutError, KeyError, TypeError, AttributeError, RuntimeError, UpstreamError):
             return None
+
+    async def inference_progress(self, name: str) -> dict:
+        """Return bounded, content-free worker progress counters for diagnostics."""
+        spec = self.resources[name]
+        base = self.proxies.get(name) or spec.get("gateway_url")
+        slots_url = spec.get("slots_url") or (f"{base.rstrip('/')}/slots" if base else None)
+        metrics_url = spec.get("metrics_url") or (f"{base.rstrip('/')}/metrics" if base else None)
+        timeout = aiohttp.ClientTimeout(
+            total=2,
+            connect=1,
+            sock_connect=1,
+            sock_read=1,
+        )
+
+        async def fetch(url: str | None) -> tuple[bytes | None, str | None]:
+            if not url:
+                return None, "endpoint_unavailable"
+            try:
+                async with self.session.get(
+                    url,
+                    headers=self.headers,
+                    timeout=timeout,
+                ) as response:
+                    payload = await read_limited(
+                        response, 64 * 1024, check_status=False
+                    )
+                    if response.status != 200:
+                        return None, f"http_{response.status}"
+                    return payload, None
+            except Exception as error:
+                return None, type(error).__name__
+
+        slots_result, metrics_result = await asyncio.gather(
+            fetch(slots_url), fetch(metrics_url)
+        )
+        slots_payload, slots_error = slots_result
+        metrics_payload, metrics_error = metrics_result
+        slots = None
+        metrics: dict[str, int | float] = {}
+
+        if slots_payload is not None:
+            try:
+                raw_slots = decode_json(slots_payload)
+                if not isinstance(raw_slots, list) or any(
+                    not isinstance(slot, dict)
+                    or not isinstance(slot.get("is_processing"), bool)
+                    for slot in raw_slots
+                ):
+                    raise ValueError("invalid_slots_shape")
+                safe_slots = []
+                for index, slot in enumerate(raw_slots):
+                    slot_id = slot.get("id", index)
+                    if (
+                        isinstance(slot_id, bool)
+                        or not isinstance(slot_id, int)
+                        or not 0 <= slot_id <= 2**31 - 1
+                    ):
+                        slot_id = index
+                    safe = {
+                        "id": slot_id,
+                        "is_processing": slot["is_processing"],
+                    }
+                    task_id = slot.get("id_task")
+                    if (
+                        isinstance(task_id, int)
+                        and not isinstance(task_id, bool)
+                        and -1 <= task_id <= 2**31 - 1
+                    ):
+                        safe["id_task"] = task_id
+                    decoded_tokens = slot.get("n_decoded")
+                    next_token = slot.get("next_token")
+                    if (
+                        not isinstance(decoded_tokens, int)
+                        or isinstance(decoded_tokens, bool)
+                    ) and isinstance(next_token, list) and next_token and isinstance(next_token[0], dict):
+                        decoded_tokens = next_token[0].get("n_decoded")
+                    for field in (
+                        "n_prompt_tokens",
+                        "n_prompt_tokens_processed",
+                        "n_tokens",
+                        "n_past",
+                        "n_ctx",
+                    ):
+                        value = slot.get(field)
+                        if (
+                            isinstance(value, int)
+                            and not isinstance(value, bool)
+                            and 0 <= value <= 2**63 - 1
+                        ):
+                            safe[field] = value
+                    if (
+                        isinstance(decoded_tokens, int)
+                        and not isinstance(decoded_tokens, bool)
+                        and 0 <= decoded_tokens <= 2**63 - 1
+                    ):
+                        safe["n_decoded"] = decoded_tokens
+                    if len(safe_slots) < 64:
+                        safe_slots.append(safe)
+                slots = safe_slots
+            except (ValueError, UnicodeDecodeError, TypeError):
+                slots_error = "invalid_response"
+
+        if metrics_payload is not None:
+            try:
+                metrics_text = metrics_payload.decode("utf-8")
+                wanted = {
+                    "llamacpp:prompt_tokens_total",
+                    "llamacpp:tokens_predicted_total",
+                    "llamacpp:n_decode_total",
+                    "llamacpp:requests_processing",
+                    "llamacpp:requests_deferred",
+                }
+                for line in metrics_text.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or " " not in line:
+                        continue
+                    name_value, raw_value = line.split(None, 1)
+                    metric_name = name_value.split("{", 1)[0]
+                    if metric_name not in wanted:
+                        continue
+                    value = float(raw_value.split(None, 1)[0])
+                    if math.isfinite(value) and 0 <= value <= 2**63 - 1:
+                        metrics[metric_name] = int(value) if value.is_integer() else value
+            except (IndexError, UnicodeDecodeError, ValueError, OverflowError):
+                metrics_error = "invalid_response"
+
+        return {
+            "slots": slots,
+            "metrics": metrics,
+            "slots_error": slots_error,
+            "metrics_error": metrics_error,
+        }
 
     async def start(self, name: str) -> None:
         spec = self.resources[name]
@@ -2708,9 +2932,18 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
             sse_data_frames = 0
             text_chars = 0
             reasoning_chars = 0
+            tool_call_deltas = 0
+            function_call_deltas = 0
+            sse_delta_fields = set()
+            sse_event_types = set()
+            sse_finish_reasons = set()
+            sse_output_item_types = set()
             prompt_tokens = None
             completion_tokens = None
             last_wait_log = 0.0
+            last_worker_progress_signature = None
+            last_worker_progress_at = forward_started
+            last_worker_sample = None
 
             async def open_stream(headers=None, status=200):
                 nonlocal response
@@ -2721,12 +2954,14 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
 
             async def wait_with_heartbeat(task, phase: str):
                 nonlocal last_wait_log
+                nonlocal last_worker_progress_signature, last_worker_progress_at, last_worker_sample
                 nonlocal response
                 while not task.done():
                     done, _ = await asyncio.wait({task}, timeout=policy.get("heartbeat_s", 15))
                     if not done:
                         elapsed = time.monotonic() - forward_started
-                        if last_wait_log == 0.0 or elapsed - last_wait_log >= 60:
+                        wait_log_interval = policy.get("heartbeat_s", 15)
+                        if last_wait_log == 0.0 or elapsed - last_wait_log >= wait_log_interval:
                             LOG.info(
                                 "upstream_waiting id=%s model=%s phase=%s elapsed_s=%.1f received_bytes=%d sse_data_frames=%d",
                                 request.get("request_id", "-"),
@@ -2737,6 +2972,170 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                                 sse_data_frames,
                             )
                             last_wait_log = elapsed
+                            runtime = state.get("runtime")
+                            if model and hasattr(runtime, "inference_progress"):
+                                try:
+                                    progress = await runtime.inference_progress(model)
+                                except Exception as error:
+                                    progress = {
+                                        "slots": None,
+                                        "metrics": {},
+                                        "slots_error": type(error).__name__,
+                                        "metrics_error": "probe_failed",
+                                    }
+                                slots = progress.get("slots")
+                                metrics = progress.get("metrics", {})
+                                slot_summary = "none"
+                                processing_slots = None
+                                no_progress_s = "unknown"
+                                progress_phase = "unknown"
+                                prefill_tps = "unknown"
+                                decode_tps = "unknown"
+                                progress_at = time.monotonic()
+                                if isinstance(slots, list):
+                                    busy_slots = [
+                                        slot for slot in slots
+                                        if isinstance(slot, dict)
+                                        and slot.get("is_processing") is True
+                                    ]
+                                    processing_slots = len(busy_slots)
+                                    slot_summary = ",".join(
+                                        ":".join((
+                                            str(slot.get("id", "?")),
+                                            f"task={slot.get('id_task', '?')}",
+                                            f"busy={int(slot.get('is_processing') is True)}",
+                                            f"prompt={slot.get('n_prompt_tokens_processed', '?')}/{slot.get('n_prompt_tokens', '?')}",
+                                            f"tokens={slot.get('n_tokens', slot.get('n_past', '?'))}",
+                                            f"decoded={slot.get('n_decoded', '?')}",
+                                            f"ctx={slot.get('n_ctx', '?')}",
+                                        ))
+                                        for slot in slots
+                                    ) or "none"
+                                    if busy_slots:
+                                        active_slot = busy_slots[0]
+                                        prompt_processed = active_slot.get("n_prompt_tokens_processed")
+                                        prompt_total = active_slot.get("n_prompt_tokens")
+                                        decoded_tokens = active_slot.get("n_decoded")
+                                        predicted_total = (
+                                            metrics.get("llamacpp:tokens_predicted_total")
+                                            if isinstance(metrics, dict)
+                                            else None
+                                        )
+                                        previous = last_worker_sample
+                                        elapsed_sample_s = (
+                                            progress_at - previous["at"]
+                                            if previous is not None
+                                            else 0.0
+                                        )
+                                        if elapsed_sample_s > 0 and previous is not None:
+                                            previous_prompt = previous.get("prompt_processed")
+                                            if (
+                                                isinstance(prompt_processed, int)
+                                                and isinstance(previous_prompt, int)
+                                                and prompt_processed >= previous_prompt
+                                            ):
+                                                prefill_tps = f"{(prompt_processed - previous_prompt) / elapsed_sample_s:.2f}"
+                                            current_decoded = decoded_tokens
+                                            previous_decoded = previous.get("decoded_tokens")
+                                            if not (
+                                                isinstance(current_decoded, int)
+                                                and isinstance(previous_decoded, int)
+                                            ):
+                                                current_decoded = predicted_total
+                                                previous_decoded = previous.get("predicted_total")
+                                            if (
+                                                isinstance(current_decoded, int)
+                                                and isinstance(previous_decoded, int)
+                                                and current_decoded >= previous_decoded
+                                            ):
+                                                decode_tps = f"{(current_decoded - previous_decoded) / elapsed_sample_s:.2f}"
+                                        if (
+                                            isinstance(prompt_processed, int)
+                                            and isinstance(prompt_total, int)
+                                            and prompt_processed < prompt_total
+                                        ):
+                                            progress_phase = "prefill"
+                                        elif (
+                                            isinstance(decoded_tokens, int)
+                                            and decoded_tokens > 0
+                                        ) or (
+                                            previous is not None
+                                            and isinstance(predicted_total, int)
+                                            and isinstance(previous.get("predicted_total"), int)
+                                            and predicted_total > previous["predicted_total"]
+                                        ):
+                                            progress_phase = "decode"
+                                        elif (
+                                            isinstance(prompt_processed, int)
+                                            and isinstance(prompt_total, int)
+                                            and prompt_processed >= prompt_total
+                                        ):
+                                            progress_phase = "decode_waiting"
+                                        else:
+                                            progress_phase = "active_no_token_progress"
+                                        signature = (
+                                            tuple(
+                                                (
+                                                    slot.get("id"),
+                                                    slot.get("is_processing"),
+                                                    slot.get("n_prompt_tokens_processed"),
+                                                    slot.get("n_prompt_tokens"),
+                                                    slot.get("n_tokens"),
+                                                    slot.get("n_decoded"),
+                                                    slot.get("n_past"),
+                                                )
+                                                for slot in slots
+                                            ),
+                                            tuple(sorted(metrics.items())) if isinstance(metrics, dict) else (),
+                                        )
+                                        if signature != last_worker_progress_signature:
+                                            last_worker_progress_signature = signature
+                                            last_worker_progress_at = progress_at
+                                        no_progress_s = f"{progress_at - last_worker_progress_at:.1f}"
+                                        last_worker_sample = {
+                                            "at": progress_at,
+                                            "prompt_processed": prompt_processed,
+                                            "decoded_tokens": decoded_tokens,
+                                            "predicted_total": predicted_total,
+                                        }
+                                    else:
+                                        last_worker_progress_signature = None
+                                        last_worker_progress_at = progress_at
+                                        last_worker_sample = None
+                                        no_progress_s = "n/a"
+                                else:
+                                    last_worker_progress_signature = None
+                                    last_worker_progress_at = progress_at
+                                    last_worker_sample = None
+                                if isinstance(slots, list) and not processing_slots:
+                                    progress_phase = "backend_idle"
+                                metric_summary = ",".join(
+                                    f"{name.rsplit(':', 1)[-1]}={value}"
+                                    for name, value in sorted(metrics.items())
+                                ) if isinstance(metrics, dict) else "invalid"
+                                metric_summary = metric_summary or "none"
+                                LOG.info(
+                                    "upstream_worker_progress id=%s model=%s phase=%s worker_phase=%s processing_slots=%s slots=%s metrics=%s prefill_tps=%s decode_tps=%s no_progress_s=%s slots_error=%s metrics_error=%s",
+                                    request.get("request_id", "-"),
+                                    model,
+                                    phase,
+                                    progress_phase,
+                                    processing_slots if processing_slots is not None else "unknown",
+                                    slot_summary,
+                                    metric_summary,
+                                    prefill_tps,
+                                    decode_tps,
+                                    no_progress_s,
+                                    progress.get("slots_error") or "none",
+                                    progress.get("metrics_error") or "none",
+                                )
+                            elif model:
+                                LOG.info(
+                                    "upstream_worker_progress id=%s model=%s phase=%s probe=unsupported",
+                                    request.get("request_id", "-"),
+                                    model,
+                                    phase,
+                                )
                         if response is None:
                             await open_stream()
                         await response.write(b": ping\n\n")
@@ -2747,6 +3146,7 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 nonlocal sse_frames
                 nonlocal first_data_at, sse_data_frames, text_chars
                 nonlocal reasoning_chars, prompt_tokens, completion_tokens
+                nonlocal tool_call_deltas, function_call_deltas
                 sse_frames += 1
                 metrics = _sse_frame_metrics(frame)
                 if not metrics["has_data"]:
@@ -2762,6 +3162,13 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                     )
                 text_chars += metrics["text_chars"]
                 reasoning_chars += metrics["reasoning_chars"]
+                tool_call_deltas += metrics["tool_call_deltas"]
+                function_call_deltas += metrics["function_call_deltas"]
+                sse_delta_fields.update(metrics["delta_fields"])
+                if metrics["event_type"] != "none":
+                    sse_event_types.add(metrics["event_type"])
+                sse_finish_reasons.update(metrics["finish_reasons"])
+                sse_output_item_types.update(metrics["output_item_types"])
                 if (
                     first_output_at is None
                     and (metrics["text_chars"] or metrics["reasoning_chars"])
@@ -2874,7 +3281,7 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                         else None
                     )
                     LOG.info(
-                        "upstream_complete id=%s model=%s outcome=complete status=%d response_bytes=%d sse_frames=%d sse_data_frames=%d text_chars=%d reasoning_chars=%d prompt_tokens=%s completion_tokens=%s completion_tps_since_first_output=%s first_byte_s=%s first_data_s=%s first_output_s=%s duration_s=%.3f",
+                        "upstream_complete id=%s model=%s outcome=complete status=%d response_bytes=%d sse_frames=%d sse_data_frames=%d text_chars=%d reasoning_chars=%d delta_fields=%s event_types=%s finish_reasons=%s output_item_types=%s tool_call_deltas=%d function_call_deltas=%d prompt_tokens=%s completion_tokens=%s completion_tps_since_first_output=%s first_byte_s=%s first_data_s=%s first_output_s=%s duration_s=%.3f",
                         request.get("request_id", "-"),
                         model or "-",
                         upstream.status,
@@ -2883,6 +3290,12 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                         sse_data_frames,
                         text_chars,
                         reasoning_chars,
+                        ",".join(sorted(sse_delta_fields)) or "none",
+                        ",".join(sorted(sse_event_types)) or "none",
+                        ",".join(sorted(sse_finish_reasons)) or "none",
+                        ",".join(sorted(sse_output_item_types)) or "none",
+                        tool_call_deltas,
+                        function_call_deltas,
                         prompt_tokens if prompt_tokens is not None else "unknown",
                         completion_tokens if completion_tokens is not None else "unknown",
                         f"{output_tps:.3f}" if output_tps is not None else "unknown",

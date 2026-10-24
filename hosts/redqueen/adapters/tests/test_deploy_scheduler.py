@@ -174,5 +174,83 @@ class DeployedProfileVerificationTests(unittest.TestCase):
                 deploy_scheduler.verify_profiles(tampered, verify_sources=False)
 
 
+class PulledSourceRollbackTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.repo = Path(self.temporary.name) / "inference"
+        self.repo.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet", "--initial-branch=develop", str(self.repo)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.email", "test@example.invalid"],
+            check=True,
+        )
+        tracked = self.repo / "tracked.txt"
+        tracked.write_text("last-good\n", encoding="utf-8")
+        self.commit("last-good")
+        self.previous = self.head()
+        tracked.write_text("pulled candidate\n", encoding="utf-8")
+        self.commit("pulled candidate")
+        self.candidate = self.head()
+        self.journal = Path(self.temporary.name) / "run/deployment.json"
+
+    def commit(self, message: str) -> None:
+        subprocess.run(["git", "-C", str(self.repo), "add", "tracked.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "--quiet", "-m", message],
+            check=True,
+        )
+
+    def head(self) -> str:
+        return subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def test_failed_post_pull_drain_restores_last_good_develop_source(self):
+        restored = deploy_scheduler.rollback_unactivated_pull(
+            self.repo, self.candidate, self.previous, self.journal
+        )
+
+        self.assertTrue(restored)
+        self.assertEqual(self.head(), self.previous)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(self.repo), "branch", "--show-current"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "develop",
+        )
+
+    def test_post_pull_rollback_refuses_dirty_source_or_active_journal(self):
+        with deploy_scheduler.host_reliability.operation_lock(self.journal.parent):
+            self.assertFalse(deploy_scheduler.rollback_unactivated_pull(
+                self.repo, self.candidate, self.previous, self.journal
+            ))
+        self.journal.parent.mkdir(exist_ok=True)
+        self.journal.write_text("{}", encoding="utf-8")
+        self.assertFalse(deploy_scheduler.rollback_unactivated_pull(
+            self.repo, self.candidate, self.previous, self.journal
+        ))
+        self.journal.unlink()
+        (self.repo / "tracked.txt").write_text("operator change\n", encoding="utf-8")
+
+        self.assertFalse(deploy_scheduler.rollback_unactivated_pull(
+            self.repo, self.candidate, self.previous, self.journal
+        ))
+        self.assertEqual(self.head(), self.candidate)
+
+
 if __name__ == "__main__":
     unittest.main()

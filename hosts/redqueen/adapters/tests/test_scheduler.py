@@ -31,6 +31,37 @@ from redqueen_adapters.scheduler_client import (
 )
 
 
+class SSEFrameMetricsTests(unittest.TestCase):
+    def test_stream_shape_counters_distinguish_tool_calls_without_logging_arguments(self):
+        payload = {
+            "choices": [{
+                "delta": {
+                    "content": "",
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "name": "lookup",
+                            "arguments": "private tool arguments",
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"completion_tokens": 7},
+        }
+        frame = b"data: " + json.dumps(payload).encode() + b"\n\n"
+
+        metrics = scheduler_api._sse_frame_metrics(frame)
+
+        self.assertEqual(metrics["text_chars"], 0)
+        self.assertEqual(metrics["tool_call_deltas"], 1)
+        self.assertEqual(metrics["function_call_deltas"], 0)
+        self.assertEqual(metrics["delta_fields"], {"content", "tool_calls"})
+        self.assertEqual(metrics["finish_reasons"], {"tool_calls"})
+        self.assertEqual(metrics["completion_tokens"], 7)
+        self.assertNotIn("private tool arguments", repr(metrics))
+
+
 def resource(size: int, kind: str = "text") -> dict:
     return {"gpu_bytes": size, "host_bytes": size, "kind": kind, "concurrency": 1, "context_tokens": 32768}
 
@@ -1142,6 +1173,8 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.api_ready = False
         self.expert_cache_state = {}
         self.expert_cache_post_capacity = None
+        self.progress_slots = []
+        self.progress_metrics = ""
         self.custom_nodes = {}
         self.full_catalog_requests = 0
         self.resources = {"a": resource(60), "b": resource(60), "comfyui": resource(60, "service")}
@@ -1193,8 +1226,14 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
                     else payload["capacity_bytes"]
                 )
             return web.json_response(self.expert_cache_state)
+        async def slots(_):
+            return web.json_response(self.progress_slots)
+        async def metrics(_):
+            return web.Response(text=self.progress_metrics, content_type="text/plain")
         upstream.router.add_get("/health", health)
         upstream.router.add_get("/ready", ready)
+        upstream.router.add_get("/slots", slots)
+        upstream.router.add_get("/metrics", metrics)
         upstream.router.add_get("/object_info", nodes)
         upstream.router.add_get("/object_info/{node_class}", node)
         upstream.router.add_route("*", "/expert-cache", expert_cache)
@@ -1220,6 +1259,121 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
 
     async def post(self, model, **parameters):
         return await self.client.post("/v1/chat/completions", headers={"Authorization": "Bearer secret"}, json={"model": model, **parameters})
+
+    async def test_worker_progress_probe_returns_only_slot_counters_and_known_metrics(self):
+        self.progress_slots = [{
+            "id": 0,
+            "id_task": 42,
+            "is_processing": True,
+            "n_prompt_tokens": 64,
+            "n_prompt_tokens_processed": 32,
+            "n_tokens": 0,
+            "next_token": [{"n_decoded": 0, "has_next_token": True}],
+            "n_ctx": 220160,
+            "prompt": "private request text",
+            "generated": "private generated text",
+            "oversized": 2**100,
+        }]
+        self.progress_metrics = "\n".join((
+            "# HELP llamacpp:tokens_predicted_total test",
+            "llamacpp:tokens_predicted_total 0",
+            "llamacpp:requests_processing 1",
+            "llamacpp:n_decode_total 1e99",
+            "llamacpp:unrelated_metric 999",
+        ))
+        self.resources["a"]["gateway_url"] = str(self.upstream.make_url(""))
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        progress = await runtime.inference_progress("a")
+
+        self.assertEqual(progress["slots"], [{
+            "id": 0,
+            "id_task": 42,
+            "is_processing": True,
+            "n_prompt_tokens": 64,
+            "n_prompt_tokens_processed": 32,
+            "n_tokens": 0,
+            "n_decoded": 0,
+            "n_ctx": 220160,
+        }])
+        self.assertEqual(progress["metrics"], {
+            "llamacpp:tokens_predicted_total": 0,
+            "llamacpp:requests_processing": 1,
+        })
+        self.assertIsNone(progress["slots_error"])
+        self.assertIsNone(progress["metrics_error"])
+        self.assertNotIn("private request text", repr(progress))
+        self.assertNotIn("private generated text", repr(progress))
+
+    async def test_stalled_stream_logs_correlated_worker_progress(self):
+        self.policy["heartbeat_s"] = 0.01
+        samples = [{
+            "slots": [{
+                "id": 0,
+                "is_processing": True,
+                "n_prompt_tokens": 64,
+                "n_prompt_tokens_processed": 32,
+                "n_tokens": 0,
+                "n_decoded": 0,
+                "n_ctx": 220160,
+            }],
+            "metrics": {"llamacpp:tokens_predicted_total": 0},
+            "slots_error": None,
+            "metrics_error": None,
+        }, {
+            "slots": [{
+                "id": 0,
+                "is_processing": True,
+                "n_prompt_tokens": 64,
+                "n_prompt_tokens_processed": 64,
+                "n_tokens": 64,
+                "n_decoded": 0,
+                "n_ctx": 220160,
+            }],
+            "metrics": {"llamacpp:tokens_predicted_total": 0},
+            "slots_error": None,
+            "metrics_error": None,
+        }, {
+            "slots": [{
+                "id": 0,
+                "is_processing": True,
+                "n_prompt_tokens": 64,
+                "n_prompt_tokens_processed": 64,
+                "n_tokens": 66,
+                "n_decoded": 2,
+                "n_ctx": 220160,
+            }],
+            "metrics": {"llamacpp:tokens_predicted_total": 2},
+            "slots_error": None,
+            "metrics_error": None,
+        }]
+        sample_calls = 0
+
+        def sample_progress(_model):
+            nonlocal sample_calls
+            progress = samples[min(sample_calls, len(samples) - 1)]
+            sample_calls += 1
+            return progress
+
+        probe = AsyncMock(side_effect=sample_progress)
+
+        with patch.object(self.runtime, "inference_progress", new=probe, create=True):
+            with self.assertLogs("redqueen.scheduler", level="INFO") as captured:
+                response = await self.post("a", stream=True)
+                await self.started.wait()
+                await asyncio.sleep(0.04)
+                self.release.set()
+                await asyncio.wait_for(response.read(), 1)
+
+        output = "\n".join(captured.output)
+        self.assertIn("upstream_worker_progress", output)
+        self.assertIn("prompt=32/64", output)
+        self.assertIn("worker_phase=prefill", output)
+        self.assertIn("worker_phase=decode", output)
+        self.assertIn("prefill_tps=", output)
+        self.assertIn("decode_tps=", output)
+        self.assertIn("no_progress_s=", output)
+        probe.assert_awaited()
 
     async def test_known_routes_return_405_with_allow(self):
         for method, path, allowed in (("GET", "/v1/chat/completions", "POST"), ("POST", "/v1/models", "GET"), ("DELETE", "/upstream/a/health", "GET")):
