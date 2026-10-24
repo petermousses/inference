@@ -241,7 +241,7 @@ index 923135e5..cf2331fd 100644
  const llama_model & llama_context::get_model() const {
      return model;
  }
-@@ -1492,6 +1537,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1492,6 +1573,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
  }
  
  int llama_context::encode(const llama_batch_ext & batch_inp) {
@@ -252,7 +252,7 @@ index 923135e5..cf2331fd 100644
      if (batch_inp.tokens.empty()) {
          LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
          return -1;
-@@ -1731,7 +1780,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1731,7 +1816,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
  }
  
  int llama_context::decode(const llama_batch_ext & batch_inp) {
@@ -264,7 +264,7 @@ index 923135e5..cf2331fd 100644
 +    if (model.moe_stream()) {
 +        stream_lock = lock_moe_stream_for_compute();
 +    }
-@@ -4436,6 +4489,13 @@ int32_t llama_decode(
+@@ -4436,6 +4525,13 @@ int32_t llama_decode(
      return ret;
  }
  
@@ -813,13 +813,13 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 index d1af984e..9729c02b 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -8,3 +8,5 @@
- #include <atomic>
+@@ -20,3 +20,5 @@
  
 +#include <chrono>
 +#include <condition_variable>
- #include <thread>
-@@ -931,6 +931,7 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
+ #include <algorithm>
+ #include <cstddef>
+@@ -931,6 +933,7 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
  
  struct server_context_impl {
      friend struct server_context;
@@ -827,7 +827,7 @@ index d1af984e..9729c02b 100644
  
  public:
      // only use these pointers outside of this class:
-@@ -1033,10 +1034,23 @@ private:
+@@ -1033,10 +1036,23 @@ private:
      std::set<std::string> model_tags;    // informational tags
  
      bool sleeping = false;
@@ -851,7 +851,7 @@ index d1af984e..9729c02b 100644
          spec.reset();
          spec_init.reset();
  
-@@ -1105,6 +1108,7 @@ private:
+@@ -1105,6 +1121,7 @@ private:
      // load the model and initialize llama_context
      // this may also be called to resume from sleeping state
      bool load_model(common_params & params) {
@@ -859,7 +859,7 @@ index d1af984e..9729c02b 100644
          load_progress_data load_progress_text  (this, "text_model");
          load_progress_data load_progress_mmproj(this, "mmproj_model");
          load_progress_data load_progress_spec  (this, "spec_model");
-@@ -1530,6 +1534,83 @@ private:
+@@ -1530,6 +1547,83 @@ private:
          return true;
      }
  
@@ -943,7 +943,7 @@ index d1af984e..9729c02b 100644
      // unlike load_model(), this is only called once during initialization
      bool init() {
          GGML_ASSERT(ctx_tgt   != nullptr);
-@@ -5124,6 +5138,225 @@ void server_routes::init_routes() {
+@@ -5124,6 +5218,225 @@ void server_routes::init_routes() {
          return res;
      };
  
