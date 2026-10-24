@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly repo_root="$(git rev-parse --show-toplevel)"
+readonly hostname_short="$(hostname -s 2>/dev/null || true)"
+
+[[ "$hostname_short" == redqueen ]] || exit 0
+[[ "$(id -un)" == ai ]] || exit 0
+[[ "$repo_root" == /srv/ai/inference ]] || exit 0
+
+readonly log_directory=/srv/ai/model-router/run
+readonly log_file="$log_directory/git-pull-upgrade.log"
+install -d -m 0750 -- "$log_directory"
+if [[ -f "$log_file" && "$(wc -c < "$log_file")" -ge 20971520 ]]; then
+  mv -f -- "$log_file" "$log_file.1"
+fi
+touch "$log_file"
+chmod 0640 "$log_file"
+log() {
+  printf '%s %s\n' "$(date --iso-8601=seconds)" "$*" | tee -a "$log_file" >&2
+}
+
+branch="$(git -C "$repo_root" branch --show-current)"
+if [[ "$branch" != develop ]]; then
+  log "skip hook=$1 branch=$branch"
+  exit 0
+fi
+upstream_name="$(git -C "$repo_root" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
+if [[ "$upstream_name" != origin/develop ]]; then
+  log "skip hook=$1 branch=$branch upstream=$upstream_name"
+  exit 0
+fi
+
+upstream="$(git -C "$repo_root" rev-parse --verify '@{upstream}')"
+if ! git -C "$repo_root" merge-base --is-ancestor "$upstream" HEAD; then
+  log "skip hook=$1 branch=$branch reason=origin_develop_not_ancestor"
+  exit 0
+fi
+
+log "start hook=$1 branch=$branch head=$(git -C "$repo_root" rev-parse --short HEAD) upstream=$(git -C "$repo_root" rev-parse --short "$upstream")"
+set +e
+bash "$repo_root/hosts/redqueen/model-router/deploy-scheduler.sh" --post-pull 2>&1 | tee -a "$log_file"
+pipeline_status=("${PIPESTATUS[@]}")
+set -e
+deploy_status="${pipeline_status[0]}"
+tee_status="${pipeline_status[1]}"
+log "finish hook=$1 deploy_status=$deploy_status log_status=$tee_status"
+[[ "$tee_status" -eq 0 ]] || exit "$tee_status"
+exit "$deploy_status"

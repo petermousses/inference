@@ -10,6 +10,8 @@ import io
 import json
 import os
 import shlex
+import signal
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -37,6 +39,33 @@ GENERATED_PROFILE_FIELDS = {
 
 def run(*arguments: str, check: bool = True, timeout: float = 180) -> subprocess.CompletedProcess:
     return host_reliability.command(*arguments, check=check, timeout=timeout)
+
+
+def run_streaming(*arguments: str, timeout: float) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        arguments,
+        start_new_session=True,
+        pass_fds=host_reliability.inherited_operation_fds(),
+    )
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as original:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        raise subprocess.TimeoutExpired(arguments, timeout) from original
+    result = subprocess.CompletedProcess(arguments, returncode)
+    result.check_returncode()
+    return result
 
 
 def systemctl(*arguments: str, check: bool = True):
@@ -324,7 +353,7 @@ def verify_deployed_profiles(
     try:
         marker = json.loads(marker_bytes if marker_bytes is not None else marker_path.read_bytes())
     except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError("--update requires a readable last-good deployment marker") from error
+        raise RuntimeError("deployment requires a readable last-good deployment marker") from error
     revision = marker.get("revision") if isinstance(marker, dict) else None
     if (
         not isinstance(marker, dict)
@@ -335,7 +364,7 @@ def verify_deployed_profiles(
         or len(revision) != 40
         or any(character not in "0123456789abcdef" for character in revision)
     ):
-        raise RuntimeError("--update requires a valid last-good deployment marker")
+        raise RuntimeError("deployment requires a valid last-good deployment marker")
     profile_sha256 = hashlib.sha256(profile_bytes).hexdigest()
     if "profile_sha256" in marker and (
         not isinstance(marker["profile_sha256"], str)
@@ -424,12 +453,24 @@ def verify_deployed_profiles(
     return revision, scheduler, router, "profile_sha256" in marker
 
 
-def deploy(repo: Path, previous: str | None, *, check_only: bool = False, update: bool = False) -> None:
+def deploy(
+    repo: Path,
+    previous: str | None,
+    *,
+    check_only: bool = False,
+    update: bool = False,
+    post_pull: bool = False,
+) -> None:
     if os.geteuid() == 0:
         raise RuntimeError("run this as ai")
-    if update and check_only:
-        raise RuntimeError("--update and --check cannot be combined")
+    if sum((check_only, update, post_pull)) > 1:
+        raise RuntimeError("--check, --update and --post-pull are mutually exclusive")
     repo = repo.resolve()
+    if post_pull and (
+        socket.gethostname().split(".", 1)[0] != "redqueen"
+        or repo != Path("/srv/ai/inference")
+    ):
+        raise RuntimeError("--post-pull is restricted to /srv/ai/inference on Redqueen")
     source = repo / "hosts/redqueen"
     if check_only:
         if run("git", "-C", str(repo), "status", "--porcelain").stdout.strip():
@@ -450,9 +491,9 @@ def deploy(repo: Path, previous: str | None, *, check_only: bool = False, update
         if run("git", "-C", str(repo), "status", "--porcelain").stdout.strip():
             raise RuntimeError("deployment checkout must be clean")
         if run("git", "-C", str(repo), "branch", "--show-current").stdout.strip() != "develop":
-            raise RuntimeError("--update requires the develop branch")
+            raise RuntimeError("runtime deployment requires the develop branch")
         if run("git", "-C", str(repo), "rev-parse", "--abbrev-ref", "@{upstream}").stdout.strip() != "origin/develop":
-            raise RuntimeError("--update requires tracking origin/develop")
+            raise RuntimeError("runtime deployment requires tracking origin/develop")
         head = run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()
         try:
             profile_bytes = profile_path.read_bytes()
@@ -465,16 +506,24 @@ def deploy(repo: Path, previous: str | None, *, check_only: bool = False, update
                 repo, head, profile_path, profile_bytes, profiles, marker_bytes,
             )
         except (OSError, json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as error:
-            raise RuntimeError("--update requires a valid last-good memory profile snapshot") from error
+            raise RuntimeError("runtime deployment requires a valid last-good memory profile snapshot") from error
         return head, profile_bytes, marker_bytes, profiles, revision, scheduler, router, has_digest
 
-    if update:
+    if update or post_pull:
         with host_reliability.operation_lock(directory):
             policy = json.loads((source / "model-router/scheduler.json").read_text())
             if verify_lock_directory(policy, directory) != profile_path:
                 raise RuntimeError("scheduler paths changed while acquiring the deployment lock")
             snapshot = update_state()
         head, profile_bytes, marker_bytes, profiles, previous, policy, router, has_digest = snapshot
+
+        if post_pull:
+            upstream = run("git", "-C", str(repo), "rev-parse", "--verify", "@{upstream}").stdout.strip()
+            if run("git", "-C", str(repo), "merge-base", "--is-ancestor", upstream, head, check=False).returncode:
+                raise RuntimeError("--post-pull requires develop to contain origin/develop")
+            if head == previous:
+                print(f"develop at {head[:12]} is already deployed; nothing to reconcile", flush=True)
+                return
 
         if not has_digest:
             # Rebuild every admission field against the pinned source without
@@ -502,7 +551,8 @@ def deploy(repo: Path, previous: str | None, *, check_only: bool = False, update
                 raise RuntimeError("legacy qwen38.service is active; drain and stop it explicitly before deployment")
             _activate(
                 repo, previous, source, policy, profiles, profile_path,
-                branch=branch, update=True, rollback_profile_bytes=rollback_profile_bytes,
+                branch=branch, update=True, pull_source=update,
+                rollback_profile_bytes=rollback_profile_bytes,
             )
         return
 
@@ -526,6 +576,7 @@ def deploy(repo: Path, previous: str | None, *, check_only: bool = False, update
 
 def _activate(repo: Path, previous: str, source: Path, policy: dict, profiles: dict,
               profile_path: Path, *, branch: str | None, update: bool,
+              pull_source: bool = True,
               rollback_profile_bytes: bytes | None = None) -> None:
     directory = profile_path.parent
     if (directory / "deployment.json").exists():
@@ -548,8 +599,8 @@ def _activate(repo: Path, previous: str, source: Path, policy: dict, profiles: d
         host_reliability.install_helper(Path(host_reliability.__file__),
                                         directory.parent / "libexec/host_reliability.py",
                                         bootstrap_only=True)
-        # This fsynced journal precedes both git pull and service mutation.
-        # SIGKILL/power loss recovery uses the installed stdlib-only helper.
+        # This fsynced journal precedes service mutation and any in-transaction
+        # pull. SIGKILL/power loss recovery uses the stdlib-only helper.
         previous_sha = run("git", "-C", str(repo), "rev-parse", "--verify", f"{previous}^{{commit}}").stdout.strip() or previous
         definition = host_reliability.preflight_snapshot()
         journal = host_reliability.begin_journal(
@@ -557,9 +608,19 @@ def _activate(repo: Path, previous: str, source: Path, policy: dict, profiles: d
         )
         if update:
             host_reliability.bootstrap_preflight(directory.parent.parent)
-            host_reliability.deployment_phase(directory, journal, "updating_source")
-            run("git", "-C", str(repo), "pull", "--ff-only", "origin", "develop")
+            host_reliability.deployment_phase(
+                directory, journal, "updating_source" if pull_source else "reconciling_pulled_source",
+            )
+            if pull_source:
+                # The transaction itself owns deployment; suppress the tracked
+                # post-pull hook to avoid re-entering the operation lock.
+                run("git", "-C", str(repo), "-c", "core.hooksPath=/dev/null",
+                    "pull", "--ff-only", "origin", "develop")
             run("bash", str(source / "model-router/create-venv.sh"))
+            _stop_active_units(active)
+            for installer in ("install-moe-runtime.sh", "install-deepseek41-runtime.sh"):
+                print(f"installing pinned inference runtime: {installer}", flush=True)
+                run_streaming("bash", str(source / "model-router" / installer), timeout=4 * 60 * 60)
             policy, profiles = validate(source, fresh_profiler=True)
             if verify_lock_directory(policy, directory) != profile_path:
                 raise RuntimeError("scheduler path migration requires an explicit deployment migration")
@@ -573,12 +634,8 @@ def _activate(repo: Path, previous: str, source: Path, policy: dict, profiles: d
                 locks.append(lock)
         host_reliability.deployment_phase(directory, journal, "activating")
         print("idle window acquired; applying user units", flush=True)
-        running_fronts = [unit for unit in active if unit in FRONTS]
-        if running_fronts:
-            systemctl("stop", *running_fronts)
-        running_backends = [unit for unit in active if unit in MANAGED and unit not in FRONTS]
-        if running_backends:
-            systemctl("stop", *running_backends)
+        if not update:
+            _stop_active_units(active)
         run("bash", str(source / "link-runtime.sh"))
         host_reliability.atomic_json(profile_path, profiles)
         systemctl("disable", *MANAGED)
@@ -622,15 +679,25 @@ def _activate(repo: Path, previous: str, source: Path, policy: dict, profiles: d
     print(f"deployed {run('git', '-C', str(repo), 'rev-parse', 'HEAD').stdout.strip()}; APIs healthy", flush=True)
 
 
+def _stop_active_units(active: list[str]) -> None:
+    running_fronts = [unit for unit in active if unit in FRONTS]
+    if running_fronts:
+        systemctl("stop", *running_fronts)
+    running_backends = [unit for unit in active if unit in MANAGED and unit not in FRONTS]
+    if running_backends:
+        systemctl("stop", *running_backends)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rollback-ref")
     parser.add_argument("--check", action="store_true")
     parser.add_argument("--update", action="store_true", help="drain, journal, pull origin/develop, validate and activate under one lock")
+    parser.add_argument("--post-pull", action="store_true", help="reconcile a completed develop pull transactionally on Redqueen")
     parser.add_argument("--repo", type=Path, help="deployment checkout (supports a verified staged helper during first migration)")
     args = parser.parse_args()
     repo = args.repo.resolve() if args.repo is not None else Path(__file__).resolve().parents[4]
-    deploy(repo, args.rollback_ref, check_only=args.check, update=args.update)
+    deploy(repo, args.rollback_ref, check_only=args.check, update=args.update, post_pull=args.post_pull)
 
 
 if __name__ == "__main__":

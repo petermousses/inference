@@ -16,6 +16,21 @@ fi
   exit 1
 }
 
+if [[ "$(hostname -s 2>/dev/null || true)" == redqueen && "$repo_root" == /srv/ai/inference ]]; then
+  [[ -x "$repo_root/.githooks/post-merge" && -x "$repo_root/.githooks/post-rewrite" ]] || {
+    printf 'tracked Redqueen Git hooks are missing or not executable\n' >&2
+    exit 1
+  }
+  hook_root=/srv/ai/model-router/git-hooks
+  install -d -m 0755 -- "$hook_root"
+  for hook in post-merge post-rewrite redqueen-pull-upgrade; do
+    temporary="$hook_root/.${hook}.$$"
+    install -m 0755 -- "$repo_root/.githooks/$hook" "$temporary"
+    mv -f -- "$temporary" "$hook_root/$hook"
+  done
+  git -C "$repo_root" config --local core.hooksPath "$hook_root"
+fi
+
 backup_target() {
   local target="$1"
   local relative backup
