@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index a46de8e1..ca3fbd09 100644
+index a46de8e..ca3fbd0 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -2837,6 +2837,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -38,7 +38,7 @@ index a46de8e1..ca3fbd09 100644
          {"--moe-stream-io-threads"}, "N",
          "I/O threads for --moe-stream expert loads; implies --moe-stream (default: auto)",
 diff --git a/common/common.cpp b/common/common.cpp
-index de780411..5545c574 100644
+index de78041..5545c57 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1673,6 +1673,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
@@ -50,7 +50,7 @@ index de780411..5545c574 100644
      mparams.moe_stream_direct     = params.moe_stream_direct;
  
 diff --git a/common/common.h b/common/common.h
-index afcbb962..ee2f0207 100644
+index afcbb96..ee2f020 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -591,6 +591,7 @@ struct common_params {
@@ -62,7 +62,7 @@ index afcbb962..ee2f0207 100644
      bool     moe_stream_direct     = false; // use O_DIRECT for expert reads (bypass page cache)
  
 diff --git a/common/fit.cpp b/common/fit.cpp
-index 7a030082..ad2b50af 100644
+index 7a03008..ad2b50a 100644
 --- a/common/fit.cpp
 +++ b/common/fit.cpp
 @@ -35,7 +35,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
@@ -110,7 +110,7 @@ index 7a030082..ad2b50af 100644
 +    }
  }
 diff --git a/include/llama.h b/include/llama.h
-index ebcc6189..bbe4c367 100644
+index ebcc618..bbe4c36 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -351,6 +351,7 @@ extern "C" {
@@ -143,7 +143,7 @@ index ebcc6189..bbe4c367 100644
      // print MoE expert streaming statistics (no-op when streaming is not enabled)
      LLAMA_API void llama_moe_stream_print_stats(const struct llama_model * model);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 923135e5..cf2331fd 100644
+index 923135e..8c337bc 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -783,6 +783,10 @@ void llama_context::sched_reserve() {
@@ -252,11 +252,7 @@ index 923135e5..cf2331fd 100644
      if (batch_inp.tokens.empty()) {
          LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
          return -1;
-@@ -1731,7 +1816,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
- }
- 
- int llama_context::decode(const llama_batch_ext & batch_inp) {
-     if (!memory) {
+@@ -1735,6 +1820,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
          LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
          return encode(batch_inp);
      }
@@ -264,6 +260,9 @@ index 923135e5..cf2331fd 100644
 +    if (model.moe_stream()) {
 +        stream_lock = lock_moe_stream_for_compute();
 +    }
+ 
+     if (batch_inp.tokens.empty()) {
+         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
 @@ -4436,6 +4525,13 @@ int32_t llama_decode(
      return ret;
  }
@@ -279,7 +278,7 @@ index 923135e5..cf2331fd 100644
  // perf
  //
 diff --git a/src/llama-context.h b/src/llama-context.h
-index ad5aaace..b9634be4 100644
+index ad5aaac..ae9b48e 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -13,6 +13,8 @@
@@ -291,7 +290,7 @@ index ad5aaace..b9634be4 100644
  #include <vector>
  
  struct llama_model;
-@@ -59,6 +60,9 @@ struct llama_context {
+@@ -59,6 +61,9 @@ struct llama_context {
  
      void synchronize();
  
@@ -301,7 +300,7 @@ index ad5aaace..b9634be4 100644
      const llama_model   & get_model()   const;
      const llama_cparams & get_cparams() const;
  
-@@ -289,6 +292,10 @@ private:
+@@ -289,6 +294,10 @@ private:
  
      const llama_model & model;
      std::unique_ptr<llama_moe_stream_context_lease> moe_stream_context;
@@ -313,7 +312,7 @@ index ad5aaace..b9634be4 100644
      llama_cparams cparams;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 214d62b4..a3b44aff 100644
+index 5da36f7..d8f9b2c 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1712,9 +1712,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -341,7 +340,7 @@ index 214d62b4..a3b44aff 100644
          /*.moe_stream_direct           =*/ false,
          /*.vocab_only                  =*/ false,
 diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
-index 9bd9448a..c153f201 100644
+index 9693b40..89aa506 100644
 --- a/src/llama-moe-stream.cpp
 +++ b/src/llama-moe-stream.cpp
 @@ -10,6 +10,7 @@
@@ -728,7 +727,7 @@ index 9bd9448a..c153f201 100644
  #if !defined(__linux__)
  [[noreturn]]
  #endif
-@@ -439,6 +780,7 @@ void llama_moe_stream::worker_loop(int32_t worker_idx) {
+@@ -439,6 +793,7 @@ void llama_moe_stream::worker_loop(int32_t worker_idx) {
              sl.slot_state[w.slot] != LLAMA_MOE_STREAM_SLOT_LOADING ||
              sl.slot_expert[w.slot] != w.expert ||
              sl.slot_claimed[w.slot]) {
@@ -736,7 +735,7 @@ index 9bd9448a..c153f201 100644
              continue; // stale or duplicate item
          }
          sl.slot_claimed[w.slot] = 1;
-@@ -563,12 +905,16 @@ void llama_moe_stream::get_info(llama_moe_stream_info & info) const {
+@@ -563,12 +918,16 @@ void llama_moe_stream::get_info(llama_moe_stream_info & info) const {
      }
      info.host_overhead_bytes = host_overhead_bytes();
      info.cache_bytes -= info.host_overhead_bytes;
@@ -754,7 +753,7 @@ index 9bd9448a..c153f201 100644
          if (layer) {
              for (auto state : layer->slot_state) {
 diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
-index 06d395e3..602f460d 100644
+index 06d395e..602f460 100644
 --- a/src/llama-moe-stream.h
 +++ b/src/llama-moe-stream.h
 @@ -17,7 +17,7 @@
@@ -810,15 +809,18 @@ index 06d395e3..602f460d 100644
  };
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index d1af984e..9729c02b 100644
+index d1af984..4ac4d65 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -20,3 +20,5 @@
+@@ -18,6 +18,8 @@
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
  
 +#include <chrono>
 +#include <condition_variable>
  #include <algorithm>
  #include <cstddef>
+ #include <cinttypes>
 @@ -931,6 +933,7 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
  
  struct server_context_impl {
@@ -1170,7 +1172,7 @@ index d1af984e..9729c02b 100644
          auto res = create_response();
          if (params.slot_save_path.empty()) {
 diff --git a/tools/server/server-context.h b/tools/server/server-context.h
-index 7fe00353..672ea7b8 100644
+index 7fe0035..672ea7b 100644
 --- a/tools/server/server-context.h
 +++ b/tools/server/server-context.h
 @@ -133,6 +133,8 @@ struct server_routes {
@@ -1183,7 +1185,7 @@ index 7fe00353..672ea7b8 100644
      server_http_context::handler_t post_props;
      server_http_context::handler_t post_infill;
 diff --git a/tools/server/server.cpp b/tools/server/server.cpp
-index 6e2d8ff9..c5134ed8 100644
+index 6e2d8ff..c5134ed 100644
 --- a/tools/server/server.cpp
 +++ b/tools/server/server.cpp
 @@ -248,6 +248,8 @@ int llama_server(common_params & params, int argc, char ** argv, server_child &
