@@ -2829,7 +2829,10 @@ class DeploymentTest(unittest.TestCase):
         self.profile_path = self.repo / "run/profiles.json"
         self.profile_path.parent.mkdir()
         self.profile_path.write_text("old profiles")
-        self.policy = {"profile_path": str(self.profile_path)}
+        self.policy = {
+            "profile_path": str(self.profile_path),
+            "socket_path": str(self.profile_path.parent / "scheduler.sock"),
+        }
         (source / "model-router/scheduler.json").write_text(json.dumps(self.policy))
         self.lease = Mock()
         self.commands = []
