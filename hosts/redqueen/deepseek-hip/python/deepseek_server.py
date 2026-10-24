@@ -582,6 +582,7 @@ class DeepSeekEngine:
         self._cache_resize_sequence = 0
         self._cache_resize_completed = 0
         self._cache_resize_target: int | None = None
+        self._cache_resize_operation_id: str | None = None
         self._cache_resize_error: BaseException | None = None
         self.checkpoint_root = Path(service["artifact_root"]).resolve(strict=True)
         self.inference_dir = Path(service["inference_dir"]).resolve(strict=True)
@@ -853,8 +854,24 @@ class DeepSeekEngine:
         with self._cache_resize_condition:
             target = self._cache_resize_target
             sequence = self._cache_resize_sequence
+            operation_id = self._cache_resize_operation_id or "-"
         if target is None:
             return
+        started = time.monotonic()
+        before = self._cache_info()
+        LOG.info(
+            "expert_cache_resize_safe_point_start operation_id=%s requested_bytes=%d capacity_bytes=%d resident_bytes=%d releasing_bytes=%d leased_bytes=%d pending_loads=%d pending_backing_release=%s quarantined=%s active_requests=%d",
+            operation_id,
+            target,
+            before["capacity_bytes"],
+            before["resident_bytes"],
+            before["releasing_bytes"],
+            before["leased_bytes"],
+            before["pending_loads"],
+            before["pending_backing_release"],
+            before["quarantined"],
+            self._active_requests,
+        )
         error = None
         try:
             self.cache.resize_when_idle(target, after_drop=self._request_release_allocator)
@@ -869,21 +886,70 @@ class DeepSeekEngine:
                 self._cache_resize_error = error
                 self._cache_resize_completed = sequence
                 self._cache_resize_target = None
+                self._cache_resize_operation_id = None
                 self._cache_resize_condition.notify_all()
+        after = self._cache_info()
+        if error is None:
+            LOG.info(
+                "expert_cache_resize_safe_point_complete operation_id=%s requested_bytes=%d capacity_bytes=%d resident_bytes=%d loading_bytes=%d releasing_bytes=%d leased_bytes=%d pending_loads=%d pending_backing_release=%s quarantined=%s active_requests=%d duration_s=%.3f",
+                operation_id,
+                target,
+                after["capacity_bytes"],
+                after["resident_bytes"],
+                after["loading_bytes"],
+                after["releasing_bytes"],
+                after["leased_bytes"],
+                after["pending_loads"],
+                after["pending_backing_release"],
+                after["quarantined"],
+                self._active_requests,
+                time.monotonic() - started,
+            )
+        else:
+            LOG.error(
+                "expert_cache_resize_safe_point_failed operation_id=%s requested_bytes=%d capacity_bytes=%d resident_bytes=%d releasing_bytes=%d leased_bytes=%d pending_loads=%d pending_backing_release=%s quarantined=%s active_requests=%d reason=%s duration_s=%.3f",
+                operation_id,
+                target,
+                after["capacity_bytes"],
+                after["resident_bytes"],
+                after["releasing_bytes"],
+                after["leased_bytes"],
+                after["pending_loads"],
+                after["pending_backing_release"],
+                after["quarantined"],
+                self._active_requests,
+                type(error).__name__,
+                time.monotonic() - started,
+            )
         if error is not None:
             raise error
 
-    def _request_cache_resize(self, capacity_bytes: int, timeout: float = 120.0) -> dict:
+    def _request_cache_resize(
+        self,
+        capacity_bytes: int,
+        timeout: float = 120.0,
+        *,
+        operation_id: str = "-",
+    ) -> dict:
         if type(capacity_bytes) is not int or not self.cache_min_capacity <= capacity_bytes <= self.cache_max_capacity:
             raise ValueError("expert cache capacity is outside the configured limits")
         if self._closed:
             raise RuntimeError("DeepSeek worker is shutting down")
         if capacity_bytes == self.cache.stats.capacity_bytes:
+            LOG.info(
+                "expert_cache_resize_noop operation_id=%s requested_bytes=%d capacity_bytes=%d",
+                operation_id,
+                capacity_bytes,
+                self.cache.stats.capacity_bytes,
+            )
             return self._cache_info()
+        started = time.monotonic()
+        last_wait_log = started
         with self._cache_resize_condition:
             self._cache_resize_sequence += 1
             sequence = self._cache_resize_sequence
             self._cache_resize_target = capacity_bytes
+            self._cache_resize_operation_id = operation_id
             self._cache_resize_error = None
             self._cache_resize_condition.notify_all()
             deadline = time.monotonic() + timeout
@@ -892,24 +958,76 @@ class DeepSeekEngine:
                 if remaining <= 0:
                     if self._cache_resize_sequence == sequence:
                         self._cache_resize_target = None
+                        self._cache_resize_operation_id = None
+                    current = self._cache_info()
+                    LOG.error(
+                        "expert_cache_resize_wait_timeout operation_id=%s requested_bytes=%d capacity_bytes=%d resident_bytes=%d releasing_bytes=%d leased_bytes=%d pending_loads=%d pending_backing_release=%s quarantined=%s active_requests=%d elapsed_s=%.1f",
+                        operation_id,
+                        capacity_bytes,
+                        current["capacity_bytes"],
+                        current["resident_bytes"],
+                        current["releasing_bytes"],
+                        current["leased_bytes"],
+                        current["pending_loads"],
+                        current["pending_backing_release"],
+                        current["quarantined"],
+                        self._active_requests,
+                        time.monotonic() - started,
+                    )
                     raise TimeoutError("DeepSeek did not reach a safe expert-cache resize point")
-                self._cache_resize_condition.wait(remaining)
+                self._cache_resize_condition.wait(min(remaining, 10.0))
+                if self._cache_resize_completed < sequence:
+                    now = time.monotonic()
+                    if now - last_wait_log >= 10.0:
+                        current = self._cache_info()
+                        LOG.info(
+                            "expert_cache_resize_waiting operation_id=%s requested_bytes=%d capacity_bytes=%d resident_bytes=%d releasing_bytes=%d leased_bytes=%d pending_loads=%d pending_backing_release=%s quarantined=%s active_requests=%d elapsed_s=%.1f remaining_s=%.1f",
+                            operation_id,
+                            capacity_bytes,
+                            current["capacity_bytes"],
+                            current["resident_bytes"],
+                            current["releasing_bytes"],
+                            current["leased_bytes"],
+                            current["pending_loads"],
+                            current["pending_backing_release"],
+                            current["quarantined"],
+                            self._active_requests,
+                            now - started,
+                            max(0.0, deadline - now),
+                        )
+                        last_wait_log = now
             error = self._cache_resize_error
         if error is not None:
             raise RuntimeError("DeepSeek expert-cache resize failed") from error
         return self._cache_info()
 
-    def _resize_idle_cache(self, capacity_bytes: int) -> dict:
+    def _resize_idle_cache(
+        self, capacity_bytes: int, *, operation_id: str = "-"
+    ) -> dict:
         """Resize with a short worker lease while no request owns the model."""
         if self._request_active.is_set() or self._active_requests:
             raise RuntimeError("DeepSeek cache is not idle")
+        started = time.monotonic()
         self.memory["active_leases"] += 1
         self._request_active.set()
         try:
             self._request_fence()
             self.cache.resize_when_idle(capacity_bytes, after_drop=self._request_release_allocator)
             self.cache_capacity = capacity_bytes
-            return self._cache_info()
+            info = self._cache_info()
+            LOG.info(
+                "expert_cache_resize_idle_complete operation_id=%s requested_bytes=%d capacity_bytes=%d resident_bytes=%d releasing_bytes=%d pending_loads=%d pending_backing_release=%s quarantined=%s duration_s=%.3f",
+                operation_id,
+                capacity_bytes,
+                info["capacity_bytes"],
+                info["resident_bytes"],
+                info["releasing_bytes"],
+                info["pending_loads"],
+                info["pending_backing_release"],
+                info["quarantined"],
+                time.monotonic() - started,
+            )
+            return info
         finally:
             self._request_active.clear()
             self.memory["active_leases"] -= 1
@@ -1082,14 +1200,54 @@ class DeepSeekEngine:
         return result
 
     async def infer(self, request: web.Request, body: dict, options: dict) -> dict:
+        request_id = request.headers.get("X-Request-ID", "-")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", request_id):
+            request_id = "-"
+        candidate_model = body.get("model")
+        model_name = (
+            candidate_model
+            if isinstance(candidate_model, str)
+            and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", candidate_model)
+            else "deepseek-v4.1-flash-1017"
+        )
         if self._closed:
+            LOG.warning(
+                "inference_rejected id=%s model=%s reason=worker_shutting_down",
+                request_id,
+                model_name,
+            )
             raise RequestError(503, "model_unavailable", "DeepSeek worker is shutting down")
         if self._request_guard.locked():
+            LOG.warning(
+                "inference_rejected id=%s model=%s reason=worker_busy active_requests=%d",
+                request_id,
+                model_name,
+                self._active_requests,
+            )
             raise RequestError(429, "model_busy", "DeepSeek is serving its single active request")
         stream_tokens = queue.Queue(maxsize=64) if options["stream"] else None
         decoder = _IncrementalTextDecoder(self.tokenizer) if options["stream"] else None
+        inference_started = time.monotonic()
         await self._request_guard.acquire()
         self._active_requests += 1
+        cache_start = self._cache_info()
+        LOG.info(
+            "inference_start id=%s model=%s stream=%s thinking_mode=%s max_tokens=%d active_requests=%d cache_capacity_bytes=%d cache_resident_bytes=%d cache_loading_bytes=%d cache_releasing_bytes=%d cache_leased_bytes=%d cache_pending_loads=%d cache_pending_backing_release=%s cache_quarantined=%s",
+            request_id,
+            model_name,
+            options["stream"],
+            options["thinking_mode"],
+            options["max_tokens"],
+            self._active_requests,
+            cache_start["capacity_bytes"],
+            cache_start["resident_bytes"],
+            cache_start["loading_bytes"],
+            cache_start["releasing_bytes"],
+            cache_start["leased_bytes"],
+            cache_start["pending_loads"],
+            cache_start["pending_backing_release"],
+            cache_start["quarantined"],
+        )
         cancel = threading.Event()
         task = asyncio.create_task(
             self.installation.run_reserved_sync(
@@ -1099,11 +1257,13 @@ class DeepSeekEngine:
             )
         )
         response = None
+        result = None
+        outcome = "failed"
+        failure_code = "-"
         try:
             last_heartbeat = time.monotonic()
             response_id = "chatcmpl-" + secrets.token_urlsafe(18)
             created = int(time.time())
-            model_name = body.get("model") if isinstance(body.get("model"), str) else "deepseek-v4.1-flash-1017"
             if options["stream"]:
                 response = web.StreamResponse(
                     status=200,
@@ -1156,27 +1316,43 @@ class DeepSeekEngine:
             try:
                 result = task.result()
             except RequestError as error:
+                failure_code = error.code
                 if response is None:
                     raise
+                LOG.warning(
+                    "inference_generation_failed id=%s model=%s code=%s duration_s=%.3f",
+                    request_id,
+                    model_name,
+                    error.code,
+                    time.monotonic() - inference_started,
+                )
                 payload = {"error": {"message": str(error), "type": "invalid_request_error", "code": error.code}}
                 await self._write_stream_bytes(response, b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n")
                 await self._write_stream_bytes(response, b"data: [DONE]\n\n")
                 await self._finish_stream(response)
                 return response
             except Exception:
+                failure_code = "inference_failed"
                 if response is None:
                     raise
-                LOG.exception("DeepSeek streaming request failed")
+                LOG.exception(
+                    "inference_generation_failed id=%s model=%s code=inference_failed",
+                    request_id,
+                    model_name,
+                )
                 payload = {"error": {"message": "DeepSeek inference failed", "type": "server_error", "code": "inference_failed"}}
                 await self._write_stream_bytes(response, b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n")
                 await self._write_stream_bytes(response, b"data: [DONE]\n\n")
                 await self._finish_stream(response)
                 return response
+            outcome = "completed"
             result.update(id=response_id, created=created, model=model_name)
             if response is not None:
                 return await self._write_stream_result(response, result)
             return result
         except asyncio.CancelledError:
+            outcome = "cancelled"
+            failure_code = "cancelled"
             cancel.set()
             try:
                 await finish_shielded(task)
@@ -1184,6 +1360,8 @@ class DeepSeekEngine:
                 pass
             raise
         except ConnectionError:
+            outcome = "client_disconnected"
+            failure_code = "client_disconnected"
             if response is None:
                 raise
             cancel.set()
@@ -1204,6 +1382,28 @@ class DeepSeekEngine:
                     pass
             self._active_requests -= 1
             self._request_guard.release()
+            cache_end = self._cache_info()
+            prompt_tokens = result.get("prompt_tokens") if isinstance(result, dict) else None
+            completion_tokens = result.get("completion_tokens") if isinstance(result, dict) else None
+            LOG.info(
+                "inference_end id=%s model=%s outcome=%s code=%s duration_s=%.3f active_requests=%d prompt_tokens=%s completion_tokens=%s cache_capacity_bytes=%d cache_resident_bytes=%d cache_loading_bytes=%d cache_releasing_bytes=%d cache_leased_bytes=%d cache_pending_loads=%d cache_pending_backing_release=%s cache_quarantined=%s",
+                request_id,
+                model_name,
+                outcome,
+                failure_code,
+                time.monotonic() - inference_started,
+                self._active_requests,
+                prompt_tokens if isinstance(prompt_tokens, int) else "unknown",
+                completion_tokens if isinstance(completion_tokens, int) else "unknown",
+                cache_end["capacity_bytes"],
+                cache_end["resident_bytes"],
+                cache_end["loading_bytes"],
+                cache_end["releasing_bytes"],
+                cache_end["leased_bytes"],
+                cache_end["pending_loads"],
+                cache_end["pending_backing_release"],
+                cache_end["quarantined"],
+            )
 
     async def _drain_stream_tokens(self, tokens, decoder, response, response_id, created, model_name):
         while True:
@@ -1364,6 +1564,9 @@ def create_app(engine: DeepSeekEngine, api_key: str) -> web.Application:
         return web.json_response(engine._cache_info())
 
     async def resize_expert_cache(request: web.Request):
+        operation_id = request.headers.get("X-Expert-Cache-Operation-ID", "-")
+        if not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+            operation_id = "-"
         try:
             body = await request.json(loads=json.loads)
         except (json.JSONDecodeError, UnicodeDecodeError, web.HTTPException):
@@ -1373,18 +1576,75 @@ def create_app(engine: DeepSeekEngine, api_key: str) -> web.Application:
         capacity = body["capacity_bytes"]
         if type(capacity) is not int or not engine.cache_min_capacity <= capacity <= engine.cache_max_capacity:
             return _error(400, "invalid_request", "capacity_bytes is outside the configured limits")
+        started = time.monotonic()
+        before = engine._cache_info()
+        LOG.info(
+            "expert_cache_resize_start operation_id=%s requested_bytes=%d capacity_bytes=%d resident_bytes=%d releasing_bytes=%d leased_bytes=%d pending_loads=%d pending_backing_release=%s quarantined=%s active_requests=%d",
+            operation_id,
+            capacity,
+            before["capacity_bytes"],
+            before["resident_bytes"],
+            before["releasing_bytes"],
+            before["leased_bytes"],
+            before["pending_loads"],
+            before["pending_backing_release"],
+            before["quarantined"],
+            engine._active_requests,
+        )
         try:
             if engine._request_guard.locked():
-                info = await asyncio.to_thread(engine._request_cache_resize, capacity)
+                info = await asyncio.to_thread(
+                    engine._request_cache_resize,
+                    capacity,
+                    operation_id=operation_id,
+                )
             else:
                 async with engine._request_guard:
                     if engine._active_requests:
-                        info = await asyncio.to_thread(engine._request_cache_resize, capacity)
+                        info = await asyncio.to_thread(
+                            engine._request_cache_resize,
+                            capacity,
+                            operation_id=operation_id,
+                        )
                     else:
-                        info = await asyncio.to_thread(engine._resize_idle_cache, capacity)
+                        info = await asyncio.to_thread(
+                            engine._resize_idle_cache,
+                            capacity,
+                            operation_id=operation_id,
+                        )
         except (RuntimeError, TimeoutError, ValueError) as error:
-            LOG.warning("expert cache resize rejected capacity_bytes=%s reason=%s", capacity, type(error).__name__)
+            current = engine._cache_info()
+            LOG.warning(
+                "expert_cache_resize_rejected operation_id=%s requested_bytes=%d capacity_bytes=%d resident_bytes=%d releasing_bytes=%d leased_bytes=%d pending_loads=%d pending_backing_release=%s quarantined=%s active_requests=%d reason=%s duration_s=%.3f",
+                operation_id,
+                capacity,
+                current["capacity_bytes"],
+                current["resident_bytes"],
+                current["releasing_bytes"],
+                current["leased_bytes"],
+                current["pending_loads"],
+                current["pending_backing_release"],
+                current["quarantined"],
+                engine._active_requests,
+                type(error).__name__,
+                time.monotonic() - started,
+            )
             return _error(503, "expert_cache_resize_failed", "expert cache could not safely reach the requested capacity")
+        LOG.info(
+            "expert_cache_resize_complete operation_id=%s requested_bytes=%d capacity_bytes=%d resident_bytes=%d loading_bytes=%d releasing_bytes=%d leased_bytes=%d pending_loads=%d pending_backing_release=%s quarantined=%s active_requests=%d duration_s=%.3f",
+            operation_id,
+            capacity,
+            info["capacity_bytes"],
+            info["resident_bytes"],
+            info["loading_bytes"],
+            info["releasing_bytes"],
+            info["leased_bytes"],
+            info["pending_loads"],
+            info["pending_backing_release"],
+            info["quarantined"],
+            engine._active_requests,
+            time.monotonic() - started,
+        )
         return web.json_response(info)
 
     async def shutdown(_app: web.Application):

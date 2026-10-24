@@ -140,7 +140,7 @@ class FakeAdaptiveRuntime(FakeRuntime):
             "quarantined": False,
         }
 
-    async def resize_expert_cache(self, name, capacity_bytes):
+    async def resize_expert_cache(self, name, capacity_bytes, *, operation_id=None):
         self.resize_calls.append((name, capacity_bytes))
         reject_above = self.reject_cache_above.get(name)
         if reject_above is not None and capacity_bytes > reject_above:
@@ -457,9 +457,11 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_cache_growth_stops_when_physical_usage_no_longer_fits(self):
         class RuntimeWithExternalPressure(FakeAdaptiveRuntime):
-            async def resize_expert_cache(self, name, capacity_bytes):
+            async def resize_expert_cache(self, name, capacity_bytes, *, operation_id=None):
                 try:
-                    return await super().resize_expert_cache(name, capacity_bytes)
+                    return await super().resize_expert_cache(
+                        name, capacity_bytes, operation_id=operation_id
+                    )
                 except ExpertCacheResizeError:
                     self.external = Memory(141, 141)
                     raise

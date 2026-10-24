@@ -182,12 +182,12 @@ class DeepSeekExpertCacheEndpointTest(unittest.IsolatedAsyncioTestCase):
                 "quarantined": False,
             }
 
-        def _resize_idle_cache(self, capacity):
+        def _resize_idle_cache(self, capacity, *, operation_id="-"):
             self.resizes.append(("idle", capacity))
             self.capacity = capacity
             return self._cache_info()
 
-        def _request_cache_resize(self, capacity):
+        def _request_cache_resize(self, capacity, *, operation_id="-"):
             self.resizes.append(("active", capacity))
             self.capacity = capacity
             return self._cache_info()
