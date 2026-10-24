@@ -338,9 +338,15 @@ def non_image_media_kind(value: object) -> str | None:
                 if "video" in content_type:
                     return "video"
                 return "file"
-            pending.append(
-                iter(item[key] for key in ("messages", "input", "content", "prompt") if key in item)
-            )
+            # Materialize child references before `item` is rebound by the next
+            # traversal step. A generator expression would close over this local
+            # and could test keys against a later child value (including None).
+            children = [
+                item[key]
+                for key in ("messages", "input", "content", "prompt")
+                if key in item
+            ]
+            pending.append(iter(children))
         elif isinstance(item, list):
             pending.append(iter(item))
     return None

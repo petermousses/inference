@@ -62,6 +62,39 @@ class SSEFrameMetricsTests(unittest.TestCase):
         self.assertNotIn("private tool arguments", repr(metrics))
 
 
+class RequestShapeTests(unittest.TestCase):
+    def test_chat_history_with_null_assistant_content_is_classified(self):
+        body = {
+            "messages": [
+                {"role": "assistant", "content": None, "tool_calls": [{"type": "function"}]},
+                {"role": "tool", "content": "done"},
+                {"role": "user", "content": "continue"},
+            ]
+        }
+
+        self.assertEqual(
+            scheduler_api.request_shape("/v1/chat/completions", body),
+            "openai.chat",
+        )
+
+    def test_nested_audio_content_is_still_detected(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_audio", "input_audio": {"data": "..."}}
+                    ],
+                }
+            ]
+        }
+
+        self.assertEqual(
+            scheduler_api.request_shape("/v1/chat/completions", body),
+            "openai.multimodal_audio",
+        )
+
+
 def resource(size: int, kind: str = "text") -> dict:
     return {"gpu_bytes": size, "host_bytes": size, "kind": kind, "concurrency": 1, "context_tokens": 32768}
 
