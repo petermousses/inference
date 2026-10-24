@@ -157,49 +157,85 @@ index cc8fae93..30a1ad1a 100644
      if (!sched) {
          return;
      }
-@@ -816,6 +820,47 @@ void llama_context::synchronize() {
+@@ -816,6 +820,83 @@ void llama_context::synchronize() {
      t_compute_start_us = 0;
  }
  
++std::unique_lock<std::recursive_mutex> llama_context::lock_moe_stream_for_compute() {
++    while (true) {
++        {
++            std::unique_lock<std::mutex> state_lock(moe_stream_resize_state_mutex);
++            moe_stream_resize_cv.wait(state_lock, [this]() { return !moe_stream_resize_pending; });
++        }
++        std::unique_lock<std::recursive_mutex> stream_lock(moe_stream_resize_mutex);
++        {
++            std::lock_guard<std::mutex> state_lock(moe_stream_resize_state_mutex);
++            if (moe_stream_resize_pending) {
++                stream_lock.unlock();
++                continue;
++            }
++        }
++        return stream_lock;
++    }
++}
++
 +bool llama_context::resize_moe_stream_cache(uint64_t capacity_bytes, llama_moe_stream_info * info) {
-+    std::lock_guard<std::recursive_mutex> lock(moe_stream_resize_mutex);
 +    auto * stream = model.moe_stream();
 +    if (!stream || !info) {
 +        return false;
 +    }
++    {
++        std::lock_guard<std::mutex> state_lock(moe_stream_resize_state_mutex);
++        if (moe_stream_resize_pending) {
++            return false;
++        }
++        moe_stream_resize_pending = true;
++    }
++    const auto clear_pending = [this]() {
++        {
++            std::lock_guard<std::mutex> state_lock(moe_stream_resize_state_mutex);
++            moe_stream_resize_pending = false;
++        }
++        moe_stream_resize_cv.notify_all();
++    };
++
++    bool success = false;
 +    try {
++        std::unique_lock<std::recursive_mutex> lock(moe_stream_resize_mutex);
 +        llama_moe_stream_info before{};
 +        stream->get_info(before);
 +        synchronize();
 +        stream->resize_cache(capacity_bytes);
 +        stream->get_info(*info);
-+        if (info->slots_per_layer == before.slots_per_layer) {
-+            return !info->load_failed;
-+        }
-+        try {
-+            sched_need_reserve = true;
-+            sched_reserve();
-+        } catch (...) {
-+            const std::exception_ptr reserve_error = std::current_exception();
++        if (info->slots_per_layer != before.slots_per_layer) {
 +            try {
-+                stream->resize_cache(before.cache_bytes);
 +                sched_need_reserve = true;
 +                sched_reserve();
-+            } catch (const std::exception & rollback_error) {
-+                stream->quarantine();
-+                LLAMA_LOG_ERROR("%s: expert-cache rollback failed: %s\n", __func__, rollback_error.what());
 +            } catch (...) {
-+                stream->quarantine();
-+                LLAMA_LOG_ERROR("%s: expert-cache rollback failed with an unknown error\n", __func__);
++                const std::exception_ptr reserve_error = std::current_exception();
++                try {
++                    stream->resize_cache(before.cache_bytes);
++                    sched_need_reserve = true;
++                    sched_reserve();
++                } catch (const std::exception & rollback_error) {
++                    stream->quarantine();
++                    LLAMA_LOG_ERROR("%s: expert-cache rollback failed: %s\n", __func__, rollback_error.what());
++                } catch (...) {
++                    stream->quarantine();
++                    LLAMA_LOG_ERROR("%s: expert-cache rollback failed with an unknown error\n", __func__);
++                }
++                std::rethrow_exception(reserve_error);
 +            }
-+            std::rethrow_exception(reserve_error);
++            stream->get_info(*info);
 +        }
-+        stream->get_info(*info);
-+        return !info->load_failed;
++        success = !info->load_failed;
 +    } catch (const std::exception & error) {
 +        LLAMA_LOG_ERROR("%s: expert-cache resize failed: %s\n", __func__, error.what());
-+        return false;
++    } catch (...) {
++        LLAMA_LOG_ERROR("%s: expert-cache resize failed with an unknown error\n", __func__);
 +    }
++    clear_pending();
++    return success;
 +}
 +
  const llama_model & llama_context::get_model() const {
@@ -211,22 +247,23 @@ index cc8fae93..30a1ad1a 100644
  int llama_context::encode(const llama_batch_ext & batch_inp) {
 +    std::unique_lock<std::recursive_mutex> stream_lock(moe_stream_resize_mutex, std::defer_lock);
 +    if (model.moe_stream()) {
-+        stream_lock.lock();
++        stream_lock = lock_moe_stream_for_compute();
 +    }
      if (batch_inp.tokens.empty()) {
          LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
          return -1;
-@@ -1731,6 +1780,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1731,7 +1780,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
  }
  
  int llama_context::decode(const llama_batch_ext & batch_inp) {
-+    std::unique_lock<std::recursive_mutex> stream_lock(moe_stream_resize_mutex, std::defer_lock);
-+    if (model.moe_stream()) {
-+        stream_lock.lock();
-+    }
      if (!memory) {
          LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
          return encode(batch_inp);
+     }
++    std::unique_lock<std::recursive_mutex> stream_lock(moe_stream_resize_mutex, std::defer_lock);
++    if (model.moe_stream()) {
++        stream_lock = lock_moe_stream_for_compute();
++    }
 @@ -4435,6 +4488,13 @@ int32_t llama_decode(
      return ret;
  }
@@ -245,28 +282,33 @@ diff --git a/src/llama-context.h b/src/llama-context.h
 index ad5aaace..b9634be4 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -13,6 +13,7 @@
+@@ -13,6 +13,8 @@
  
  #include <array>
  #include <map>
++#include <condition_variable>
 +#include <mutex>
  #include <vector>
  
  struct llama_model;
-@@ -59,6 +60,8 @@ struct llama_context {
+@@ -59,6 +60,9 @@ struct llama_context {
  
      void synchronize();
  
 +    bool resize_moe_stream_cache(uint64_t capacity_bytes, llama_moe_stream_info * info);
++    std::unique_lock<std::recursive_mutex> lock_moe_stream_for_compute();
 +
      const llama_model   & get_model()   const;
      const llama_cparams & get_cparams() const;
  
-@@ -289,6 +292,7 @@ private:
+@@ -289,6 +292,10 @@ private:
  
      const llama_model & model;
      std::unique_ptr<llama_moe_stream_context_lease> moe_stream_context;
 +    std::recursive_mutex moe_stream_resize_mutex;
++    std::mutex moe_stream_resize_state_mutex;
++    std::condition_variable moe_stream_resize_cv;
++    bool moe_stream_resize_pending = false;
  
      llama_cparams cparams;
  
@@ -758,6 +800,12 @@ diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
 index d1af984e..9729c02b 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
+@@ -8,3 +8,5 @@
+ #include <atomic>
+ 
++#include <chrono>
++#include <condition_variable>
+ #include <thread>
 @@ -931,6 +931,7 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
  
  struct server_context_impl {
@@ -766,10 +814,21 @@ index d1af984e..9729c02b 100644
  
  public:
      // only use these pointers outside of this class:
-@@ -1033,10 +1034,12 @@ private:
+@@ -1033,10 +1034,23 @@ private:
      std::set<std::string> model_tags;    // informational tags
  
      bool sleeping = false;
++    struct expert_cache_resize_operation {
++        std::mutex mutex;
++        std::condition_variable changed;
++        std::string id;
++        uint64_t requested_capacity_bytes = 0;
++        std::string status = "accepted";
++        int status_code = 0;
++        json payload;
++    };
++    mutable std::mutex mutex_expert_cache_operation;
++    std::shared_ptr<expert_cache_resize_operation> expert_cache_operation;
 +    mutable std::mutex mutex_context_lifecycle;
  
      int64_t t_last_load_progress_ms = 0;
@@ -787,10 +846,77 @@ index d1af984e..9729c02b 100644
          load_progress_data load_progress_text  (this, "text_model");
          load_progress_data load_progress_mmproj(this, "mmproj_model");
          load_progress_data load_progress_spec  (this, "spec_model");
-@@ -1530,6 +1534,16 @@ private:
+@@ -1530,6 +1534,83 @@ private:
          return true;
      }
  
++    std::shared_ptr<expert_cache_resize_operation> begin_expert_cache_operation(
++            const std::string & id, uint64_t capacity_bytes) {
++        std::lock_guard<std::mutex> operations_lock(mutex_expert_cache_operation);
++        if (expert_cache_operation) {
++            std::lock_guard<std::mutex> state_lock(expert_cache_operation->mutex);
++            if (expert_cache_operation->id == id || expert_cache_operation->status == "accepted" ||
++                expert_cache_operation->status == "running") {
++                return nullptr;
++            }
++        }
++        auto operation = std::make_shared<expert_cache_resize_operation>();
++        operation->id = id;
++        operation->requested_capacity_bytes = capacity_bytes;
++        expert_cache_operation = operation;
++        return operation;
++    }
++
++    std::shared_ptr<expert_cache_resize_operation> find_expert_cache_operation(const std::string & id) const {
++        std::lock_guard<std::mutex> operations_lock(mutex_expert_cache_operation);
++        if (!expert_cache_operation || expert_cache_operation->id != id) {
++            return nullptr;
++        }
++        return expert_cache_operation;
++    }
++
++    void set_expert_cache_operation(
++            const std::shared_ptr<expert_cache_resize_operation> & operation,
++            const std::string & status, int status_code, const json & payload) {
++        {
++            std::lock_guard<std::mutex> state_lock(operation->mutex);
++            if (operation->status == "completed" || operation->status == "failed" ||
++                operation->status == "cancelled") {
++                return;
++            }
++            operation->status = status;
++            operation->status_code = status_code;
++            operation->payload = payload;
++        }
++        operation->changed.notify_all();
++    }
++
++    void cancel_expert_cache_operation(
++            const std::shared_ptr<expert_cache_resize_operation> & operation) {
++        {
++            std::lock_guard<std::mutex> state_lock(operation->mutex);
++            if (operation->status != "accepted") {
++                return;
++            }
++            operation->status = "cancelled";
++            operation->status_code = 499;
++            operation->payload = {{"reason", "request_disconnected_before_resize"}};
++        }
++        operation->changed.notify_all();
++    }
++
++    json expert_cache_operation_info(
++            const std::shared_ptr<expert_cache_resize_operation> & operation) const {
++        std::lock_guard<std::mutex> state_lock(operation->mutex);
++        return {
++            {"operation_id", operation->id},
++            {"requested_capacity_bytes", operation->requested_capacity_bytes},
++            {"status", operation->status},
++            {"status_code", operation->status_code},
++            {"result", operation->payload},
++        };
++    }
++
 +    bool expert_cache_info(llama_moe_stream_info & info) const {
 +        std::lock_guard<std::mutex> lock(mutex_context_lifecycle);
 +        return llama_moe_stream_get_info(model_tgt, &info);
@@ -804,12 +930,64 @@ index d1af984e..9729c02b 100644
      // unlike load_model(), this is only called once during initialization
      bool init() {
          GGML_ASSERT(ctx_tgt   != nullptr);
-@@ -5124,6 +5138,80 @@ void server_routes::init_routes() {
+@@ -5124,6 +5138,225 @@ void server_routes::init_routes() {
          return res;
      };
  
-+    this->get_expert_cache = [this](const server_http_req &) {
++    this->get_expert_cache = [this](const server_http_req & req) -> server_http_res_ptr {
 +        auto res = create_response();
++        const std::string operation_id = req.get_param("operation_id");
++        if (!operation_id.empty()) {
++            auto operation = ctx_server.find_expert_cache_operation(operation_id);
++            if (!operation) {
++                res->error(format_error_response("expert-cache operation was not found", ERROR_TYPE_INVALID_REQUEST));
++                return res;
++            }
++            if (req.get_param("events") != "1") {
++                res->ok(ctx_server.expert_cache_operation_info(operation));
++                return res;
++            }
++            auto event_res = std::make_unique<server_http_res>();
++            event_res->content_type = "text/event-stream; charset=utf-8";
++            event_res->headers["Cache-Control"] = "no-store";
++            event_res->headers["X-Accel-Buffering"] = "no";
++            auto sent = std::make_shared<bool>(false);
++            event_res->next = [operation, &req, sent](std::string & output) {
++                if (*sent || req.should_stop()) {
++                    return false;
++                }
++                std::unique_lock<std::mutex> state_lock(operation->mutex);
++                const bool terminal = operation->changed.wait_for(state_lock, std::chrono::seconds(15), [&]() {
++                    return operation->status == "completed" || operation->status == "failed" ||
++                           operation->status == "cancelled" || req.should_stop();
++                });
++                if (req.should_stop()) {
++                    return false;
++                }
++                if (!terminal) {
++                    output = ": ping";
++                    output.push_back(static_cast<char>(10));
++                    output.push_back(static_cast<char>(10));
++                    return true;
++                }
++                const std::string status = operation->status;
++                json event = operation->payload;
++                event["operation_id"] = operation->id;
++                event["requested_capacity_bytes"] = operation->requested_capacity_bytes;
++                event["status_code"] = operation->status_code;
++                *sent = true;
++                state_lock.unlock();
++                output = status == "completed" ? "event: resize.completed" :
++                         status == "cancelled" ? "event: resize.cancelled" : "event: resize.failed";
++                output.push_back(static_cast<char>(10));
++                output += "data: ";
++                output += event.dump();
++                output.push_back(static_cast<char>(10));
++                output.push_back(static_cast<char>(10));
++                return true;
++            };
++            return event_res;
++        }
 +        llama_moe_stream_info info{};
 +        if (!ctx_server.expert_cache_info(info)) {
 +            res->error(format_error_response("This model does not expose an adaptive expert cache", ERROR_TYPE_NOT_SUPPORTED));
@@ -830,20 +1008,33 @@ index d1af984e..9729c02b 100644
 +        return res;
 +    };
 +
-+    this->post_expert_cache = [this](const server_http_req & req) {
++    this->post_expert_cache = [this](const server_http_req & req) -> server_http_res_ptr {
 +        auto res = create_response();
 +        json body;
 +        int64_t signed_capacity = 0;
++        std::string operation_id;
 +        try {
 +            body = json::parse(req.body);
-+            if (!body.is_object() || body.size() != 1 || !body.contains("capacity_bytes") ||
-+                !body["capacity_bytes"].is_number_integer()) {
-+                res->error(format_error_response("expected a positive integer capacity_bytes", ERROR_TYPE_INVALID_REQUEST));
++            if (!body.is_object() || (body.size() != 1 && body.size() != 2) ||
++                !body.contains("capacity_bytes") || !body["capacity_bytes"].is_number_integer() ||
++                (body.size() == 2 && !body.contains("operation_id"))) {
++                res->error(format_error_response("expected capacity_bytes and optional operation_id", ERROR_TYPE_INVALID_REQUEST));
 +                return res;
 +            }
 +            signed_capacity = body["capacity_bytes"].get<int64_t>();
++            if (body.contains("operation_id")) {
++                if (!body["operation_id"].is_string()) {
++                    res->error(format_error_response("operation_id must be 32 lowercase hexadecimal characters", ERROR_TYPE_INVALID_REQUEST));
++                    return res;
++                }
++                operation_id = body["operation_id"].get<std::string>();
++                if (operation_id.size() != 32 || operation_id.find_first_not_of("0123456789abcdef") != std::string::npos) {
++                    res->error(format_error_response("operation_id must be 32 lowercase hexadecimal characters", ERROR_TYPE_INVALID_REQUEST));
++                    return res;
++                }
++            }
 +        } catch (const std::exception &) {
-+            res->error(format_error_response("expected a positive integer capacity_bytes", ERROR_TYPE_INVALID_REQUEST));
++            res->error(format_error_response("expected capacity_bytes and optional operation_id", ERROR_TYPE_INVALID_REQUEST));
 +            return res;
 +        }
 +        if (signed_capacity <= 0) {
@@ -860,6 +1051,86 @@ index d1af984e..9729c02b 100644
 +        if (capacity_bytes < before.minimum_capacity_bytes || capacity_bytes > before.maximum_capacity_bytes) {
 +            res->error(format_error_response("capacity_bytes is outside the configured expert-cache limits", ERROR_TYPE_INVALID_REQUEST));
 +            return res;
++        }
++
++        if (!operation_id.empty()) {
++            auto operation = ctx_server.begin_expert_cache_operation(operation_id, capacity_bytes);
++            if (!operation) {
++                res->error(format_error_response("another expert-cache resize is active or this operation_id was already used", ERROR_TYPE_UNAVAILABLE));
++                return res;
++            }
++            struct operation_response final : server_http_res {
++                std::function<void()> completed;
++                void on_complete() override {
++                    if (completed) {
++                        completed();
++                    }
++                }
++            };
++            auto stream_res = std::make_unique<operation_response>();
++            stream_res->content_type = "text/event-stream; charset=utf-8";
++            stream_res->headers["Cache-Control"] = "no-store";
++            stream_res->headers["X-Accel-Buffering"] = "no";
++            stream_res->completed = [this, operation]() {
++                ctx_server.cancel_expert_cache_operation(operation);
++            };
++            auto phase = std::make_shared<int>(0);
++            stream_res->next = [this, &req, operation_id, capacity_bytes, operation, phase](std::string & output) {
++                if (req.should_stop()) {
++                    return false;
++                }
++                if (*phase == 0) {
++                    ++*phase;
++                    json event = {{"operation_id", operation_id}, {"capacity_bytes", capacity_bytes}};
++                    output = "event: resize.accepted";
++                    output.push_back(static_cast<char>(10));
++                    output += "data: ";
++                    output += event.dump();
++                    output.push_back(static_cast<char>(10));
++                    output.push_back(static_cast<char>(10));
++                    return true;
++                }
++                if (*phase != 1) {
++                    return false;
++                }
++                ++*phase;
++                ctx_server.set_expert_cache_operation(operation, "running", 0, {{"reason", "waiting_for_decode_boundary"}});
++                llama_moe_stream_info info{};
++                if (!ctx_server.resize_expert_cache(capacity_bytes, info)) {
++                    json event = {{"reason", "runtime_resize_failed"}};
++                    ctx_server.set_expert_cache_operation(operation, "failed", 503, event);
++                    event["operation_id"] = operation_id;
++                    event["requested_capacity_bytes"] = capacity_bytes;
++                    event["status_code"] = 503;
++                    output = "event: resize.failed";
++                    output.push_back(static_cast<char>(10));
++                    output += "data: ";
++                    output += event.dump();
++                    output.push_back(static_cast<char>(10));
++                    output.push_back(static_cast<char>(10));
++                    return true;
++                }
++                json event = {
++                    {"minimum_capacity_bytes", info.minimum_capacity_bytes},
++                    {"maximum_capacity_bytes", info.maximum_capacity_bytes},
++                    {"capacity_bytes", info.cache_bytes},
++                    {"pending_loads", info.pending_reads},
++                    {"pending_backing_release", info.pending_backing_release},
++                    {"quarantined", info.quarantined},
++                };
++                ctx_server.set_expert_cache_operation(operation, "completed", 200, event);
++                event["operation_id"] = operation_id;
++                event["requested_capacity_bytes"] = capacity_bytes;
++                event["status_code"] = 200;
++                output = "event: resize.completed";
++                output.push_back(static_cast<char>(10));
++                output += "data: ";
++                output += event.dump();
++                output.push_back(static_cast<char>(10));
++                output.push_back(static_cast<char>(10));
++                return true;
++            };
++            return server_http_res_ptr(std::move(stream_res));
 +        }
 +
 +        llama_moe_stream_info info{};

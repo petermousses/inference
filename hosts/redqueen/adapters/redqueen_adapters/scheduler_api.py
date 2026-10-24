@@ -10,6 +10,7 @@ import math
 import os
 import re
 import time
+import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -335,27 +336,145 @@ class Runtime:
         url = self.expert_cache_url(name)
         if not url:
             raise ExpertCacheStateError("missing_endpoint")
-        timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_connect=5, sock_read=None)
-        async with self.session.post(
-            url,
-            headers=self.headers,
-            json={"capacity_bytes": capacity_bytes},
-            timeout=timeout,
-        ) as response:
-            try:
-                body = decode_json(await read_limited(response, 64 * 1024, check_status=False))
-            except (ValueError, UnicodeDecodeError) as error:
-                raise ExpertCacheStateError("invalid_resize_response") from error
-            if response.status != 200:
-                raise ExpertCacheResizeError(response.status)
-            if not isinstance(body, dict):
-                raise ExpertCacheStateError("invalid_resize_response")
+        operation_id = uuid.uuid4().hex
+        timeout_seconds = self.policy.get("expert_cache_resize_timeout_s", 120)
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ExpertCacheStateError("invalid_resize_timeout")
+        timeout = aiohttp.ClientTimeout(
+            total=timeout_seconds,
+            connect=5,
+            sock_connect=5,
+            sock_read=timeout_seconds,
+        )
+        started_at = time.monotonic()
+        try:
+            async with self.session.post(
+                url,
+                headers=self.headers,
+                json={"capacity_bytes": capacity_bytes, "operation_id": operation_id},
+                timeout=timeout,
+            ) as response:
+                if response.status != 200:
+                    await read_limited(response, 64 * 1024, check_status=False)
+                    raise ExpertCacheResizeError(response.status)
+                content_type = response.headers.get("Content-Type", "")
+                if "text/event-stream" in content_type:
+                    await self._await_expert_cache_resize(response, operation_id)
+                else:
+                    # Permit compatible workers to return a one-shot JSON result.
+                    try:
+                        body = decode_json(await read_limited(response, 64 * 1024, check_status=False))
+                    except (ValueError, UnicodeDecodeError) as error:
+                        raise ExpertCacheStateError("invalid_resize_response") from error
+                    if not isinstance(body, dict):
+                        raise ExpertCacheStateError("invalid_resize_response")
+        except (aiohttp.ClientError, TimeoutError, ExpertCacheStateError) as stream_error:
+            remaining = timeout_seconds - (time.monotonic() - started_at)
+            if remaining <= 0:
+                raise
+            await self._resume_expert_cache_resize(url, operation_id, remaining, stream_error)
         info = await self.expert_cache_info(name)
         # Backends can report allocator-rounded capacity above the requested
         # byte target. The scheduler accounts for the reported capacity and
         # checks physical fit before dispatch; cache shrinks probe a lower
         # representable target when this overshoots.
         return info
+
+    async def _resume_expert_cache_resize(
+        self,
+        url: str,
+        operation_id: str,
+        timeout_seconds: float,
+        original_error: Exception,
+    ) -> None:
+        """Reconnect to a running operation after its POST event stream breaks."""
+        timeout = aiohttp.ClientTimeout(
+            total=timeout_seconds,
+            connect=min(5, timeout_seconds),
+            sock_connect=min(5, timeout_seconds),
+            sock_read=timeout_seconds,
+        )
+        try:
+            async with self.session.get(
+                url,
+                params={"operation_id": operation_id, "events": "1"},
+                headers=self.headers,
+                timeout=timeout,
+            ) as response:
+                if response.status != 200:
+                    await read_limited(response, 64 * 1024, check_status=False)
+                    raise ExpertCacheStateError("resize_operation_unavailable")
+                if "text/event-stream" not in response.headers.get("Content-Type", ""):
+                    raise ExpertCacheStateError("invalid_resize_operation_stream")
+                await self._await_expert_cache_resize(response, operation_id)
+        except (aiohttp.ClientError, TimeoutError, ExpertCacheStateError) as resume_error:
+            failure = ExpertCacheStateError("resize_operation_unresolved")
+            failure.add_note(f"resume failed with {type(resume_error).__name__}")
+            raise failure from original_error
+
+    async def _await_expert_cache_resize(
+        self, response: aiohttp.ClientResponse, operation_id: str
+    ) -> None:
+        """Consume the worker's correlated resize events through completion."""
+        pending = bytearray()
+
+        async def consume_frame(frame: bytes) -> bool:
+            event_name = "message"
+            data_lines = []
+            for raw_line in frame.splitlines():
+                line = raw_line.decode("utf-8", errors="strict")
+                if not line or line.startswith(":"):
+                    continue
+                field, separator, value = line.partition(":")
+                if separator and value.startswith(" "):
+                    value = value[1:]
+                if field == "event":
+                    event_name = value
+                elif field == "data":
+                    data_lines.append(value)
+            if not data_lines:
+                return False
+            try:
+                payload = json.loads("\n".join(data_lines))
+            except (json.JSONDecodeError, TypeError) as error:
+                raise ExpertCacheStateError("invalid_resize_event") from error
+            if not isinstance(payload, dict) or payload.get("operation_id") != operation_id:
+                raise ExpertCacheStateError("resize_event_mismatch")
+            if event_name == "resize.failed":
+                status = payload.get("status_code")
+                if isinstance(status, int) and not isinstance(status, bool) and status == 503:
+                    raise ExpertCacheResizeError(status)
+                raise ExpertCacheStateError("resize_failed")
+            if event_name == "resize.cancelled":
+                raise ExpertCacheStateError("resize_cancelled")
+            if event_name == "resize.completed":
+                return True
+            if event_name not in {"resize.accepted", "resize.running", "message"}:
+                raise ExpertCacheStateError("unknown_resize_event")
+            return False
+
+        async for chunk in response.content.iter_chunked(4096):
+            pending.extend(chunk)
+            while True:
+                boundary = SSE_BOUNDARY.search(bytes(pending))
+                if boundary is None:
+                    if len(pending) > MAX_SSE_FRAME:
+                        raise ExpertCacheStateError("resize_event_too_large")
+                    break
+                if boundary.start() > MAX_SSE_FRAME:
+                    raise ExpertCacheStateError("resize_event_too_large")
+                frame = bytes(pending[: boundary.start()])
+                del pending[: boundary.end()]
+                if await consume_frame(frame):
+                    return
+        if pending.strip():
+            raise ExpertCacheStateError("incomplete_resize_event")
+        raise ExpertCacheStateError("resize_event_stream_ended")
 
     async def generation(self, name: str) -> str | None:
         units = self.resources[name].get("units", [])
