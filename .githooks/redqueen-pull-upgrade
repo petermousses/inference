@@ -2,11 +2,10 @@
 set -euo pipefail
 
 readonly repo_root="$(git rev-parse --show-toplevel)"
-readonly hostname_short="$(hostname -s 2>/dev/null || true)"
-
-[[ "$hostname_short" == redqueen ]] || exit 0
 [[ "$(id -un)" == ai ]] || exit 0
 [[ "$repo_root" == /srv/ai/inference ]] || exit 0
+[[ -x "$repo_root/hosts/redqueen/is-redqueen-host.sh" ]] || exit 0
+bash "$repo_root/hosts/redqueen/is-redqueen-host.sh" || exit 0
 
 readonly log_directory=/srv/ai/model-router/run
 readonly log_file="$log_directory/git-pull-upgrade.log"

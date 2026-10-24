@@ -11,7 +11,6 @@ import json
 import os
 import shlex
 import signal
-import socket
 import subprocess
 import tarfile
 import tempfile
@@ -466,12 +465,11 @@ def deploy(
     if sum((check_only, update, post_pull)) > 1:
         raise RuntimeError("--check, --update and --post-pull are mutually exclusive")
     repo = repo.resolve()
-    if post_pull and (
-        socket.gethostname().split(".", 1)[0] != "redqueen"
-        or repo != Path("/srv/ai/inference")
-    ):
+    if post_pull and repo != Path("/srv/ai/inference"):
         raise RuntimeError("--post-pull is restricted to /srv/ai/inference on Redqueen")
     source = repo / "hosts/redqueen"
+    if post_pull and run("bash", str(source / "is-redqueen-host.sh"), check=False, timeout=5).returncode:
+        raise RuntimeError("--post-pull host identity check failed")
     if check_only:
         if run("git", "-C", str(repo), "status", "--porcelain").stdout.strip():
             raise RuntimeError("deployment checkout must be clean")

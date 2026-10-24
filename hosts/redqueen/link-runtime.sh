@@ -16,7 +16,8 @@ fi
   exit 1
 }
 
-if [[ "$(hostname -s 2>/dev/null || true)" == redqueen && "$repo_root" == /srv/ai/inference ]]; then
+if [[ "$repo_root" == /srv/ai/inference ]] && \
+  bash "$repo_root/hosts/redqueen/is-redqueen-host.sh"; then
   [[ -x "$repo_root/.githooks/post-merge" && -x "$repo_root/.githooks/post-rewrite" ]] || {
     printf 'tracked Redqueen Git hooks are missing or not executable\n' >&2
     exit 1
