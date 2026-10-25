@@ -83,6 +83,30 @@ class SSEFrameMetricsTests(unittest.TestCase):
         self.assertNotIn("private tool arguments", repr(metrics))
 
 
+class CacheReservationRoundingTests(unittest.TestCase):
+    def test_decimal_multiplier_does_not_overreserve_on_integer_product(self):
+        multiplier = 1.08
+        available_bytes = 56_969_981_176
+        deepseek_delta = 25_883_320_320
+        glm_delta = 26_866_662_250
+
+        deepseek_reservation = scheduler_api._reservation_for_cache_delta(
+            deepseek_delta, multiplier
+        )
+        glm_reservation = scheduler_api._reservation_for_cache_delta(
+            glm_delta, multiplier
+        )
+
+        self.assertEqual(deepseek_reservation, 27_953_985_946)
+        self.assertEqual(glm_reservation, 29_015_995_230)
+        self.assertEqual(math.ceil(glm_delta * multiplier), glm_reservation + 1)
+        self.assertEqual(deepseek_reservation + glm_reservation, available_bytes)
+        self.assertEqual(
+            scheduler_api._cache_delta_for_reservation(glm_reservation, multiplier),
+            glm_delta,
+        )
+
+
 class RequestShapeTests(unittest.TestCase):
     def test_chat_history_with_null_assistant_content_is_classified(self):
         body = {

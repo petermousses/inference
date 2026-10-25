@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from urllib.parse import quote
 
@@ -91,6 +92,27 @@ OPENAI_STREAM_ENDPOINTS = {
     "/v1/responses",
     "/completion",
 }
+
+
+def _reservation_for_cache_delta(
+    capacity_bytes: int, multiplier: int | float
+) -> int:
+    """Return the conservatively rounded reservation using the profile's decimal rate."""
+    if capacity_bytes <= 0:
+        return 0
+    rate = Fraction(str(multiplier))
+    product = capacity_bytes * rate.numerator
+    return (product + rate.denominator - 1) // rate.denominator
+
+
+def _cache_delta_for_reservation(
+    reservation_bytes: int, multiplier: int | float
+) -> int:
+    """Return the largest cache delta whose reservation fits the given byte budget."""
+    if reservation_bytes <= 0:
+        return 0
+    rate = Fraction(str(multiplier))
+    return reservation_bytes * rate.denominator // rate.numerator
 
 
 @dataclass(frozen=True)
@@ -1348,7 +1370,9 @@ class Scheduler:
         if isinstance(adaptive, dict):
             minimum = adaptive["minimum_capacity_bytes"]
             capacity = self.cache_allocations.get(name, adaptive["maximum_capacity_bytes"])
-            delta = math.ceil(max(0, capacity - minimum) * adaptive["reservation_multiplier"])
+            delta = _reservation_for_cache_delta(
+                max(0, capacity - minimum), adaptive["reservation_multiplier"]
+            )
             result += Memory(delta, delta)
         else:
             reclaimable = profile["reclaimable"]
@@ -1540,7 +1564,10 @@ class Scheduler:
                 if isinstance(adaptive, dict) and name not in adjustable_names:
                     minimum = adaptive["minimum_capacity_bytes"]
                     allocated = self.cache_allocations.get(name, adaptive["maximum_capacity_bytes"])
-                    extra = math.ceil(max(0, allocated - minimum) * adaptive["reservation_multiplier"])
+                    extra = _reservation_for_cache_delta(
+                        max(0, allocated - minimum),
+                        adaptive["reservation_multiplier"],
+                    )
                     fixed += Memory(extra, extra)
                 elif not adaptive:
                     reclaimable = profile["reclaimable"]
@@ -1601,9 +1628,8 @@ class Scheduler:
                             name, limits["maximum_capacity_bytes"]
                         ),
                     )
-                    maximum_extra = math.ceil(
-                        (maximum - minimum)
-                        * limits["reservation_multiplier"]
+                    maximum_extra = _reservation_for_cache_delta(
+                        maximum - minimum, limits["reservation_multiplier"]
                     )
                     if maximum_extra <= share:
                         targets[name] = maximum
@@ -1620,8 +1646,11 @@ class Scheduler:
                                 name, limits["maximum_capacity_bytes"]
                             ),
                         )
-                        targets[name] = limits["minimum_capacity_bytes"] + math.floor(
-                            share / limits["reservation_multiplier"]
+                        targets[name] = (
+                            limits["minimum_capacity_bytes"]
+                            + _cache_delta_for_reservation(
+                                share, limits["reservation_multiplier"]
+                            )
                         )
                         targets[name] = min(targets[name], maximum)
                     break
@@ -2179,9 +2208,9 @@ class Scheduler:
                 planned_extra = Memory(0, 0)
                 for name in adjustable_names:
                     limits = self.resources[name]["adaptive_cache"]
-                    extra = math.ceil(
-                        max(0, targets[name] - limits["minimum_capacity_bytes"])
-                        * limits["reservation_multiplier"]
+                    extra = _reservation_for_cache_delta(
+                        max(0, targets[name] - limits["minimum_capacity_bytes"]),
+                        limits["reservation_multiplier"],
                     )
                     planned_extra += Memory(extra, extra)
                 LOG.info(
