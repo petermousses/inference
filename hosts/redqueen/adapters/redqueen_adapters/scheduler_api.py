@@ -739,7 +739,7 @@ class Runtime:
                     f"usage_gpu_bytes={usage.gpu} "
                     f"usage_host_bytes={usage.host}"
                 )
-            except (OSError, RuntimeError, ValueError) as error:
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
                 memory_fields = f"memory_snapshot_error={type(error).__name__}"
             try:
                 async with self.session.get(
@@ -1355,6 +1355,30 @@ class Scheduler:
     def reserved(self) -> Memory:
         return sum((self.reservation(name) for name in self.states), Memory(0, 0))
 
+    def committed_reservation(self, incoming: str | None = None) -> Memory:
+        """Include active/pending demand even before its worker is resident."""
+        committed = Memory(0, 0)
+        for name in self.states:
+            spec = self.resources[name]
+            needs_peak = (
+                self.active.get(name, 0) > 0
+                or self.pending_requests.get(name, 0) > 0
+                or name == incoming
+                or not is_openai_worker(spec)
+            )
+            committed += self.reservation(name, include_transient=needs_peak)
+
+        demand_names = {
+            name
+            for name, count in (*self.active.items(), *self.pending_requests.items())
+            if count > 0 and name not in self.states
+        }
+        if incoming is not None and incoming not in self.states:
+            demand_names.add(incoming)
+        for name in demand_names:
+            committed += self.minimum_reservation(name, active=True)
+        return committed
+
     def reservation(self, name: str, *, include_transient: bool | None = None) -> Memory:
         """Current reservation; adapter-only workers keep their legacy full peak."""
         spec = self.resources[name]
@@ -1505,11 +1529,21 @@ class Scheduler:
                     max(0, final_usage.gpu - final_reserved.gpu),
                     max(0, final_usage.host - final_reserved.host),
                 )
+                final_committed = self.committed_reservation(incoming)
+                final_fits = (final_committed + final_unknown).fits(final_capacity)
+                if result and not final_fits:
+                    outcome = "live_commitment_exceeds_capacity"
+                result = result and final_fits
                 final_fields = _memory_log_fields(
                     final_capacity, final_usage, final_reserved, final_unknown
                 )
-            except (OSError, RuntimeError, ValueError) as error:
+                final_fields += (
+                    f" committed_gpu_bytes={final_committed.gpu}"
+                    f" committed_host_bytes={final_committed.host}"
+                )
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
                 final_fields = f"snapshot_error={type(error).__name__}"
+                result = False
             LOG.info(
                 "cache_rebalance_complete id=%s request_id=%s reason=%s outcome=%s fits=%s demand=%s allocations=%s attempts=%d duration_s=%.3f %s",
                 rebalance_id,
@@ -1673,6 +1707,54 @@ class Scheduler:
 
         last_operation_id = "-"
 
+        def safe_growth_target(
+            name: str, requested: int
+        ) -> tuple[int | None, Memory, Memory, Memory, Memory, Memory]:
+            """Recompute the cache ceiling from the live host/GPU snapshot."""
+            capacity_now, usage_now = self.runtime.capacity()
+            reserved_now = self.reserved()
+            unknown_now = Memory(
+                max(0, usage_now.gpu - reserved_now.gpu),
+                max(0, usage_now.host - reserved_now.host),
+            )
+            fixed_now = fixed_reservation()
+            other_extra = Memory(0, 0)
+            for other in adjustable_names:
+                if other == name:
+                    continue
+                limits = self.resources[other]["adaptive_cache"]
+                planned = targets.get(other, limits["minimum_capacity_bytes"])
+                extra = _reservation_for_cache_delta(
+                    max(0, planned - limits["minimum_capacity_bytes"]),
+                    limits["reservation_multiplier"],
+                )
+                other_extra += Memory(extra, extra)
+
+            base = fixed_now + unknown_now + other_extra
+            limits = self.resources[name]["adaptive_cache"]
+            minimum = limits["minimum_capacity_bytes"]
+            if not base.fits(capacity_now):
+                safe_target = None
+            else:
+                available = capacity_now - base
+                safe_target = min(
+                    requested,
+                    limits["maximum_capacity_bytes"],
+                    minimum
+                    + _cache_delta_for_reservation(
+                        min(available.gpu, available.host),
+                        limits["reservation_multiplier"],
+                    ),
+                )
+            return (
+                safe_target,
+                capacity_now,
+                usage_now,
+                reserved_now,
+                unknown_now,
+                fixed_now,
+            )
+
         async def issue_resize(
             name: str, target: int, phase: str
         ) -> tuple[bool, dict]:
@@ -1693,6 +1775,93 @@ class Scheduler:
                 target,
                 ",".join(demand_signature) or "none",
             )
+            if target > previous:
+                requested = target
+                try:
+                    (
+                        safe_target,
+                        budget_capacity,
+                        budget_usage,
+                        budget_reserved,
+                        budget_unknown,
+                        budget_fixed,
+                    ) = safe_growth_target(name, requested)
+                except (OSError, RuntimeError, ValueError, KeyError) as error:
+                    LOG.error(
+                        "cache_resize_budget_unavailable id=%s operation_id=%s request_id=%s model=%s phase=%s requested_bytes=%d reason=%s",
+                        rebalance_id,
+                        operation_id,
+                        request_id or "-",
+                        name,
+                        phase,
+                        requested,
+                        type(error).__name__,
+                    )
+                    raise AdmissionError(
+                        503,
+                        "host memory budget could not be verified before cache growth",
+                        "capacity_unavailable",
+                    ) from error
+                if safe_target is None or safe_target <= previous:
+                    try:
+                        info = await self.runtime.expert_cache_info(name)
+                    except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError, KeyError) as error:
+                        self.cache_allocations[name] = self.resources[name]["adaptive_cache"]["maximum_capacity_bytes"]
+                        self.cache_unready.add(name)
+                        raise AdmissionError(
+                            503,
+                            "expert-cache state could not be verified before growth",
+                            "cache_resize_failed",
+                        ) from error
+                    self.cache_allocations[name] = info["capacity_bytes"]
+                    info = dict(info)
+                    info["growth_budget_blocked"] = True
+                    LOG.warning(
+                        "cache_resize_budget_blocked id=%s operation_id=%s request_id=%s model=%s phase=%s requested_bytes=%d current_bytes=%d fixed_gpu_bytes=%d fixed_host_bytes=%d unknown_gpu_bytes=%d unknown_host_bytes=%d %s",
+                        rebalance_id,
+                        operation_id,
+                        request_id or "-",
+                        name,
+                        phase,
+                        requested,
+                        info["capacity_bytes"],
+                        budget_fixed.gpu,
+                        budget_fixed.host,
+                        budget_unknown.gpu,
+                        budget_unknown.host,
+                        _memory_log_fields(
+                            budget_capacity,
+                            budget_usage,
+                            budget_reserved,
+                            budget_unknown,
+                        ),
+                    )
+                    current_reserved = self.reserved()
+                    current_unknown = Memory(
+                        max(0, budget_usage.gpu - current_reserved.gpu),
+                        max(0, budget_usage.host - current_reserved.host),
+                    )
+                    info["growth_budget_capacity"] = budget_capacity
+                    info["growth_budget_unknown"] = current_unknown
+                    return False, info
+                if safe_target < requested:
+                    LOG.warning(
+                        "cache_resize_budget_clamped id=%s operation_id=%s request_id=%s model=%s phase=%s requested_bytes=%d allowed_bytes=%d %s",
+                        rebalance_id,
+                        operation_id,
+                        request_id or "-",
+                        name,
+                        phase,
+                        requested,
+                        safe_target,
+                        _memory_log_fields(
+                            budget_capacity,
+                            budget_usage,
+                            budget_reserved,
+                            budget_unknown,
+                        ),
+                    )
+                    target = safe_target
             task = asyncio.create_task(
                 self.runtime.resize_expert_cache(
                     name, target, operation_id=operation_id
@@ -1729,7 +1898,14 @@ class Scheduler:
                         info = None
                 if info is not None:
                     self.cache_allocations[name] = info["capacity_bytes"]
-                    self.cache_unready.discard(name)
+                    if target > previous:
+                        # The resize may have completed, but cancellation
+                        # skipped its post-resize budget check. Keep the
+                        # reported backing reserved and block transfers until
+                        # refresh/rebalance verifies the live host budget.
+                        self.cache_unready.add(name)
+                    else:
+                        self.cache_unready.discard(name)
                 raise
             except ExpertCacheResizeError as error:
                 if error.status_code != 503:
@@ -1835,9 +2011,10 @@ class Scheduler:
                 max(0, usage_now.gpu - reserved_now.gpu),
                 max(0, usage_now.host - reserved_now.host),
             )
-            fits = (reserved_now + unknown_now).fits(capacity_now)
+            committed_now = self.committed_reservation(incoming)
+            fits = (committed_now + unknown_now).fits(capacity_now)
             LOG.info(
-                "cache_resize_memory_check id=%s operation_id=%s request_id=%s model=%s phase=%s requested_bytes=%d capacity_bytes=%d pending_loads=%s pending_backing_release=%s quarantined=%s fits=%s %s",
+                "cache_resize_memory_check id=%s operation_id=%s request_id=%s model=%s phase=%s requested_bytes=%d capacity_bytes=%d pending_loads=%s pending_backing_release=%s quarantined=%s committed_gpu_bytes=%d committed_host_bytes=%d fits=%s %s",
                 rebalance_id,
                 last_operation_id,
                 request_id or "-",
@@ -1848,12 +2025,62 @@ class Scheduler:
                 info.get("pending_loads", "unknown"),
                 info.get("pending_backing_release", "unknown"),
                 info.get("quarantined", "unknown"),
+                committed_now.gpu,
+                committed_now.host,
                 fits,
                 _memory_log_fields(
                     capacity_now, usage_now, reserved_now, unknown_now
                 ),
             )
             return fits, capacity_now, unknown_now
+
+        async def verified_fit(
+            name: str, target: int, phase: str, info: dict
+        ) -> tuple[bool, Memory, Memory]:
+            try:
+                return measured_fit(name, target, phase, info)
+            except (OSError, RuntimeError, ValueError, KeyError) as error:
+                limits = self.resources[name]["adaptive_cache"]
+                minimum = limits["minimum_capacity_bytes"]
+                current = self.cache_allocations.get(
+                    name, limits["maximum_capacity_bytes"]
+                )
+                if current > minimum:
+                    try:
+                        _accepted, restored = await issue_resize(
+                            name, minimum, f"{phase}_budget_unverified_shrink"
+                        )
+                    except AdmissionError:
+                        raise
+                    if restored["capacity_bytes"] != minimum:
+                        self.cache_allocations[name] = limits[
+                            "maximum_capacity_bytes"
+                        ]
+                        self.cache_unready.add(name)
+                        raise AdmissionError(
+                            503,
+                            "expert cache could not shrink after memory verification failed",
+                            "cache_resize_failed",
+                        ) from error
+                # The worker reported a settled capacity, but the host budget
+                # is unknown. Keep this cache out of future transfers until a
+                # later refresh can reconcile it against a fresh memory view.
+                self.cache_unready.add(name)
+                LOG.error(
+                    "cache_resize_budget_unverified id=%s request_id=%s model=%s phase=%s capacity_bytes=%d shrunk_to_minimum=%s reason=%s",
+                    rebalance_id,
+                    request_id or "-",
+                    name,
+                    phase,
+                    self.cache_allocations.get(name, -1),
+                    current > minimum,
+                    type(error).__name__,
+                )
+                raise AdmissionError(
+                    503,
+                    "host memory budget could not be verified after expert-cache resize",
+                    "capacity_unavailable",
+                ) from error
 
         async def resize(
             name: str, target: int, phase: str
@@ -1862,6 +2089,10 @@ class Scheduler:
             initial = self.cache_allocations.get(name, limits["maximum_capacity_bytes"])
             accepted, info = await issue_resize(name, target, f"{phase}_initial")
             actual = info["capacity_bytes"]
+            if info.get("growth_budget_blocked"):
+                capacity_now = info["growth_budget_capacity"]
+                unknown_now = info["growth_budget_unknown"]
+                return False, capacity_now, unknown_now
             if actual != initial:
                 LOG.info(
                     "expert cache resized model=%s from_mib=%.1f to_mib=%.1f target_mib=%.1f active_moe=%s",
@@ -1876,9 +2107,52 @@ class Scheduler:
                 # A successful HTTP response is not enough when allocator
                 # granularity leaves more bytes reserved than the target.
                 accepted = False
-            fits, capacity_now, unknown_now = measured_fit(
+            fits, capacity_now, unknown_now = await verified_fit(
                 name, target, f"{phase}_initial", info
             )
+            if target > initial and not fits and actual > initial:
+                # A new external allocation can appear after preflight while
+                # the worker is resizing. Roll back growth before another
+                # model can use it, then replan against the new snapshot.
+                restore_phase = f"{phase}_growth_rollback"
+                _restored, restore_info = await issue_resize(
+                    name, initial, restore_phase
+                )
+                if restore_info["capacity_bytes"] != initial:
+                    self.cache_allocations[name] = limits["maximum_capacity_bytes"]
+                    self.cache_unready.add(name)
+                    raise AdmissionError(
+                        503,
+                        "expert cache could not safely restore its prior reservation",
+                        "cache_resize_failed",
+                    )
+                fits, capacity_now, unknown_now = await verified_fit(
+                    name, initial, restore_phase, restore_info
+                )
+                rollback_capacity, rollback_usage = self.runtime.capacity()
+                rollback_reserved = self.reserved()
+                rollback_unknown = Memory(
+                    max(0, rollback_usage.gpu - rollback_reserved.gpu),
+                    max(0, rollback_usage.host - rollback_reserved.host),
+                )
+                LOG.error(
+                    "cache_growth_rolled_back id=%s operation_id=%s request_id=%s model=%s phase=%s requested_bytes=%d restored_bytes=%d fits=%s %s",
+                    rebalance_id,
+                    last_operation_id,
+                    request_id or "-",
+                    name,
+                    phase,
+                    target,
+                    initial,
+                    fits,
+                    _memory_log_fields(
+                        rollback_capacity,
+                        rollback_usage,
+                        rollback_reserved,
+                        rollback_unknown,
+                    ),
+                )
+                return False, capacity_now, unknown_now
             if accepted or (
                 target < initial and actual <= target
             ) or (
@@ -1933,7 +2207,7 @@ class Scheduler:
                         actual = candidate_info["capacity_bytes"]
                         if actual > candidate:
                             candidate_accepted = False
-                        fits, capacity_now, unknown_now = measured_fit(
+                        fits, capacity_now, unknown_now = await verified_fit(
                             name, candidate, candidate_phase, candidate_info
                         )
 
@@ -1958,7 +2232,7 @@ class Scheduler:
                                         "cache_resize_failed",
                                     )
                                 actual = restore_info["capacity_bytes"]
-                                fits, capacity_now, unknown_now = measured_fit(
+                                fits, capacity_now, unknown_now = await verified_fit(
                                     name, lower, restore_phase, restore_info
                                 )
                             elif actual < lower:
@@ -2035,7 +2309,7 @@ class Scheduler:
                                 "cache_resize_failed",
                             )
                     remember_fallback_cap(name, lower, target)
-                    fits, capacity_now, unknown_now = measured_fit(
+                    fits, capacity_now, unknown_now = await verified_fit(
                         name, target, f"{phase}_growth_capped", settled_info
                     )
                     LOG.warning(
@@ -2115,7 +2389,7 @@ class Scheduler:
                 lower = actual
 
             remember_fallback_cap(name, lower, target)
-            fits, capacity_now, unknown_now = measured_fit(
+            fits, capacity_now, unknown_now = await verified_fit(
                 name, target, f"{phase}_shrink_complete", info
             )
             LOG.warning(
@@ -2232,6 +2506,7 @@ class Scheduler:
                 )
                 if not (fixed + unknown + planned_extra).fits(capacity_now):
                     return finish(False, "planned_growth_exceeds_capacity")
+                growth_retry = False
                 for name in sorted(targets):
                     if name not in self.states or name in self.cache_unready:
                         continue
@@ -2242,7 +2517,10 @@ class Scheduler:
                         name, targets[name], "growth"
                     )
                     if not fits:
-                        return finish(False, f"physical_fit_failed:{name}")
+                        growth_retry = True
+                        break
+                if growth_retry:
+                    continue
                 return finish(
                     minimum_fits,
                     "balanced" if minimum_fits else "minimum_reservations_exceed_capacity",
@@ -2347,7 +2625,9 @@ class Scheduler:
     async def _wait_for_idle_worker(self, name: str) -> None:
         """Protect this worker from overlap with its unmanaged backend jobs."""
         while True:
-            await self.refresh()
+            # Reconciliation writes live cache capacities. Keep it inside the
+            # transition lock so it cannot overwrite a resize's reservation
+            # with an in-flight worker snapshot.
             if name not in self.states:
                 return
             if self.states[name] != "ready":
@@ -2411,12 +2691,15 @@ class Scheduler:
                     max(0, usage.gpu - reserved.gpu),
                     max(0, usage.host - reserved.host),
                 )
+                committed = self.committed_reservation(name)
                 LOG.info(
-                    "admission_memory_check request_id=%s model=%s stage=before_rebalance required_gpu_bytes=%d required_host_bytes=%d state=%s %s",
+                    "admission_memory_check request_id=%s model=%s stage=before_rebalance required_gpu_bytes=%d required_host_bytes=%d committed_gpu_bytes=%d committed_host_bytes=%d state=%s %s",
                     request_id or "-",
                     name,
                     required.gpu,
                     required.host,
+                    committed.gpu,
+                    committed.host,
                     self.states.get(name, "unloaded"),
                     _memory_log_fields(capacity, usage, reserved, unknown),
                 )
@@ -2431,17 +2714,23 @@ class Scheduler:
                         capacity.host,
                     )
                     raise AdmissionError(503, "model reservation exceeds this host's memory budget", "model_exceeds_budget", retry_after=None)
-                await self._rebalance_caches(
+                balanced = await self._rebalance_caches(
                     name,
                     capacity,
                     unknown,
                     request_id=request_id,
                     reason="admission_preload",
                 )
+                if not balanced:
+                    raise AdmissionError(
+                        503,
+                        "shared memory could not be safely rebalanced before model load",
+                        "capacity_unavailable",
+                    )
                 capacity, usage = self.runtime.capacity()
                 reserved = self.reserved()
                 unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
-                planned = reserved + unknown + (Memory(0, 0) if name in self.states else required)
+                planned = self.committed_reservation(name) + unknown
                 candidates = sorted((other for other in self.states if other != name), key=lambda other: (self.last_used[other], other))
                 LOG.info(
                     "admission_memory_plan request_id=%s model=%s planned_gpu_bytes=%d planned_host_bytes=%d incoming_gpu_bytes=%d incoming_host_bytes=%d victims=%s %s",
@@ -2497,7 +2786,7 @@ class Scheduler:
                 capacity, usage = self.runtime.capacity()
                 reserved = self.reserved()
                 unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
-                if not (reserved + unknown + (Memory(0, 0) if name in self.states else required)).fits(capacity):
+                if not (self.committed_reservation(name) + unknown).fits(capacity):
                     LOG.warning(
                         "admission_memory_rejected request_id=%s model=%s reason=memory_not_returned_after_eviction %s",
                         request_id or "-",
@@ -2528,13 +2817,28 @@ class Scheduler:
                         max(0, usage.gpu - reserved.gpu),
                         max(0, usage.host - reserved.host),
                     )
+                    committed = self.committed_reservation(name)
                     LOG.info(
-                        "model_load_ready request_id=%s model=%s duration_s=%.3f %s",
+                        "model_load_ready request_id=%s model=%s duration_s=%.3f committed_gpu_bytes=%d committed_host_bytes=%d %s",
                         request_id or "-",
                         name,
                         time.monotonic() - load_started,
+                        committed.gpu,
+                        committed.host,
                         _memory_log_fields(capacity, usage, reserved, unknown),
                     )
+                    if not (committed + unknown).fits(capacity):
+                        LOG.error(
+                            "model_load_memory_rejected request_id=%s model=%s reason=actual_load_exceeds_reservation %s",
+                            request_id or "-",
+                            name,
+                            _memory_log_fields(capacity, usage, reserved, unknown),
+                        )
+                        raise AdmissionError(
+                            503,
+                            "backend load exceeded the host memory reservation",
+                            "capacity_unavailable",
+                        )
                 if self.resources[name].get("adaptive_cache"):
                     capacity, usage = self.runtime.capacity()
                     reserved = self.reserved()
@@ -2550,7 +2854,7 @@ class Scheduler:
                     capacity, usage = self.runtime.capacity()
                     reserved = self.reserved()
                     unknown = Memory(max(0, usage.gpu - reserved.gpu), max(0, usage.host - reserved.host))
-                    if not (reserved + unknown).fits(capacity):
+                    if not (self.committed_reservation(name) + unknown).fits(capacity):
                         raise AdmissionError(503, "memory is not yet available after expert-cache expansion", "capacity_unavailable")
                 self.last_used[name] = self.clock()
                 self.recovery.pop(name, None)

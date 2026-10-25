@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 
 GIB = 1024**3
@@ -22,6 +23,7 @@ MIN_HOST_AVAILABLE = 8 * GIB
 PREFILL_HEADROOM = 5 * GIB
 LEASE_DIRECTORY = Path("/srv/ai/model-router/run/leases")
 RECOVERY_STATES = {"recovering", "quarantined"}
+INFERENCE_SLICE = "ai-inference.slice"
 
 
 def required_path(name: str, *, executable: bool = False) -> Path:
@@ -100,6 +102,65 @@ def check_memory(gtt_peak: int, host_peak: int, *, admission: bool) -> tuple[int
     return used_gtt, available_host
 
 
+def start_qualified_process(
+    command: list[str], *, stdout=None, stderr=None, env=None
+) -> tuple[subprocess.Popen, str]:
+    """Put standalone qualification workers under the inference slice cap."""
+    unit = f"redqueen-moe-qualification-{os.getpid()}-{uuid.uuid4().hex}.scope"
+    scoped = [
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        f"--slice={INFERENCE_SLICE}",
+        f"--unit={unit}",
+        "--quiet",
+        "--",
+        *command,
+    ]
+    return subprocess.Popen(scoped, stdout=stdout, stderr=stderr, env=env), unit
+
+
+def stop_qualified_process(process: subprocess.Popen, unit: str) -> None:
+    """Stop the whole transient scope before returning from a failed probe."""
+    if process.poll() is not None:
+        return
+    try:
+        stopped = subprocess.run(
+            ["/usr/bin/systemctl", "--user", "stop", unit],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        stopped = None
+    if stopped is None or stopped.returncode != 0:
+        try:
+            subprocess.run(
+                [
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "kill",
+                    "--kill-who=all",
+                    "--signal=SIGKILL",
+                    unit,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
 def validate_host_state(run_directory: Path) -> None:
     for name in ("deployment.json", "maintenance.json", "comfyui-restore.json"):
         marker = run_directory / name
@@ -120,7 +181,7 @@ def run_monitored(command: list[str], gtt_peak: int, host_peak: int, context_tok
     check_memory(gtt_peak, host_peak, admission=True)
     environment = os.environ.copy()
     environment["MOE_PROBE_CONTEXT_TOKENS"] = str(context_tokens)
-    process = subprocess.Popen(command, env=environment)
+    process, unit = start_qualified_process(command, env=environment)
     try:
         while True:
             try:
@@ -130,24 +191,13 @@ def run_monitored(command: list[str], gtt_peak: int, host_peak: int, context_tok
                 try:
                     check_memory(gtt_peak, host_peak, admission=False)
                 except BaseException:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                    stop_qualified_process(process, unit)
                     raise
         if return_code:
             raise RuntimeError(f"qualification process exited with status {return_code}")
         check_memory(gtt_peak, host_peak, admission=False)
     except BaseException:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+        stop_qualified_process(process, unit)
         raise
 
 
@@ -181,7 +231,7 @@ def run_concurrent_monitored(
     baseline_gtt, baseline_host_available = check_memory(gtt_peak, host_peak, admission=False)
     observed_peak_gtt = baseline_gtt
     observed_min_host_available = baseline_host_available
-    processes: list[subprocess.Popen[bytes]] = []
+    processes: list[tuple[subprocess.Popen, str]] = []
     handles = []
     try:
         for command, log_path in zip(commands, log_paths, strict=True):
@@ -191,13 +241,18 @@ def run_concurrent_monitored(
             environment["MOE_PROBE_BARRIER"] = str(barrier)
             environment["MOE_PROBE_CONTEXT_TOKENS"] = str(context_tokens)
             processes.append(
-                subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, env=environment)
+                start_qualified_process(
+                    command,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    env=environment,
+                )
             )
 
         deadline = time.monotonic() + 900
         ready: set[int] = set()
         while len(ready) < len(processes):
-            for index, (process, log_path) in enumerate(zip(processes, log_paths, strict=True)):
+            for index, ((process, _unit), log_path) in enumerate(zip(processes, log_paths, strict=True)):
                 if index in ready:
                     continue
                 if process.poll() is not None:
@@ -221,14 +276,14 @@ def run_concurrent_monitored(
         barrier.touch(exist_ok=False)
         print("all streamed workers are loaded; concurrent decode started", flush=True)
         deadline = time.monotonic() + 1800
-        while any(process.poll() is None for process in processes):
+        while any(process.poll() is None for process, _unit in processes):
             used_gtt, host_available = check_memory(gtt_peak, host_peak, admission=False)
             observed_peak_gtt = max(observed_peak_gtt, used_gtt)
             observed_min_host_available = min(observed_min_host_available, host_available)
             if time.monotonic() >= deadline:
                 raise RuntimeError("concurrent streamed generation exceeded 30 minutes")
             time.sleep(0.5)
-        for index, (process, log_path) in enumerate(zip(processes, log_paths, strict=True)):
+        for index, ((process, _unit), log_path) in enumerate(zip(processes, log_paths, strict=True)):
             if process.returncode:
                 raise RuntimeError(
                     f"worker {index + 1} exited with status {process.returncode}:\n{log_tail(log_path)}"
@@ -276,15 +331,9 @@ def run_concurrent_monitored(
         )
         return results
     except BaseException:
-        for process in processes:
+        for process, unit in processes:
             if process.poll() is None:
-                process.terminate()
-        for process in processes:
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+                stop_qualified_process(process, unit)
         for index, log_path in enumerate(log_paths[:len(processes)], start=1):
             print(f"worker {index} log tail:\n{log_tail(log_path)}", file=sys.stderr, flush=True)
         raise
