@@ -32,6 +32,27 @@ from redqueen_adapters.scheduler_client import (
 
 
 class SSEFrameMetricsTests(unittest.TestCase):
+    def test_chat_completion_terminal_markers_are_recognized(self):
+        done = b"data: [DONE]\n\n"
+        finish = b'data: {"choices":[{"finish_reason":"stop"}]}\n\n'
+
+        self.assertTrue(scheduler_api._sse_frame_is_terminal(done, "/v1/chat/completions"))
+        self.assertTrue(scheduler_api._sse_frame_is_terminal(finish, "/v1/chat/completions"))
+        self.assertFalse(
+            scheduler_api._sse_frame_is_terminal(
+                b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n',
+                "/v1/chat/completions",
+            )
+        )
+
+    def test_responses_terminal_event_is_recognized(self):
+        frame = (
+            b"event: response.completed\n"
+            b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+        )
+
+        self.assertTrue(scheduler_api._sse_frame_is_terminal(frame, "/v1/responses"))
+
     def test_stream_shape_counters_distinguish_tool_calls_without_logging_arguments(self):
         payload = {
             "choices": [{
@@ -1334,6 +1355,11 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             if payload.get("stream"):
                 response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
                 await response.prepare(request)
+                if payload.get("truncated_stream"):
+                    await response.write(
+                        b'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n'
+                    )
+                    return response
                 if payload.get("fragmented"):
                     await response.write(b'data: {"content":"hel')
                     self.started.set()
@@ -1341,6 +1367,7 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
                     await response.write(b'lo"}\r\n\r')
                     await asyncio.sleep(0)
                     await response.write(b'\n')
+                    await response.write(b'data: [DONE]\n\n')
                     return response
                 await response.write(b'data: {"content":"hello"}\n\n')
                 self.started.set()
@@ -1601,8 +1628,26 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.release.set()
         raw = await stream.read()
         self.assertIn(b": ping\n\n", raw)
-        frames = [line[6:] for line in raw.splitlines() if line.startswith(b"data: ")]
+        frames = [
+            line[6:]
+            for line in raw.splitlines()
+            if line.startswith(b"data: ") and line[6:] != b"[DONE]"
+        ]
         self.assertEqual([json.loads(frame) for frame in frames], [{"content": "hello"}])
+
+    async def test_incomplete_chat_stream_is_reported_as_an_error_not_complete(self):
+        with self.assertLogs("redqueen.scheduler", level="WARNING") as captured:
+            stream = await self.post("a", stream=True, truncated_stream=True)
+            raw = await stream.read()
+
+        self.assertEqual(stream.status, 200)
+        self.assertIn(b"upstream_invalid_response", raw)
+        self.assertNotIn(b"[DONE]", raw)
+        output = "\n".join(captured.output)
+        self.assertIn("upstream_stream_incomplete", output)
+        self.assertIn("text_chars=0", output)
+        self.assertIn("reasoning_chars=8", output)
+        self.assertNotIn("outcome=complete", output)
 
     async def test_new_model_waits_for_active_stream_then_evicts_it(self):
         stream = await self.post("a", stream=True)

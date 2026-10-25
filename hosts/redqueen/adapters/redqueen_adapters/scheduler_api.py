@@ -85,6 +85,12 @@ NON_IMAGE_MEDIA_TYPES = {
 }
 SSE_BOUNDARY = re.compile(rb"\r\n\r\n|\n\n|\r\r")
 MAX_SSE_FRAME = 256 * 1024
+OPENAI_STREAM_ENDPOINTS = {
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/responses",
+    "/completion",
+}
 
 
 @dataclass(frozen=True)
@@ -264,6 +270,29 @@ def _sse_frame_metrics(frame: bytes) -> dict:
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 metrics[metric] = value
     return metrics
+
+
+def _sse_frame_is_terminal(frame: bytes, endpoint: str) -> bool:
+    """Recognize the protocol's terminal marker for supported OpenAI streams."""
+    lines = frame.splitlines()
+    data_lines = [line[5:].strip() for line in lines if line.startswith(b"data:")]
+    if b"[DONE]" in data_lines:
+        return True
+
+    if endpoint in {"/v1/chat/completions", "/v1/completions", "/completion"}:
+        return bool(_sse_frame_metrics(frame)["finish_reasons"])
+
+    if endpoint == "/v1/responses":
+        terminal_events = {"response.completed", "response.incomplete", "response.failed"}
+        event_headers = {
+            line[6:].strip().decode("utf-8", "replace")
+            for line in lines
+            if line.startswith(b"event:")
+        }
+        if event_headers.intersection(terminal_events):
+            return True
+        return _sse_frame_metrics(frame)["event_type"] in terminal_events
+    return False
 
 
 def footprint(spec: dict) -> Memory:
@@ -3080,6 +3109,7 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
             first_byte_at = None
             first_data_at = None
             first_output_at = None
+            stream_terminal_seen = False
             response_bytes = 0
             sse_frames = 0
             sse_data_frames = 0
@@ -3295,12 +3325,15 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                 return task.result()
 
             def observe_sse_frame(frame: bytes) -> None:
+                nonlocal stream_terminal_seen
                 nonlocal first_output_at
                 nonlocal sse_frames
                 nonlocal first_data_at, sse_data_frames, text_chars
                 nonlocal reasoning_chars, prompt_tokens, completion_tokens
                 nonlocal tool_call_deltas, function_call_deltas
                 sse_frames += 1
+                if _sse_frame_is_terminal(frame, request.path):
+                    stream_terminal_seen = True
                 metrics = _sse_frame_metrics(frame)
                 if not metrics["has_data"]:
                     return
@@ -3421,6 +3454,26 @@ def create_apps(policy: dict, resources: dict, api_key: str, *, runtime_factory=
                             raise UpstreamError(502, "upstream stream frame exceeds its byte limit", "upstream_invalid_response")
                     if fragment.strip():
                         raise UpstreamError(502, "upstream stream ended with an incomplete event", "upstream_invalid_response")
+                    if request.path in OPENAI_STREAM_ENDPOINTS and not stream_terminal_seen:
+                        LOG.warning(
+                            "upstream_stream_incomplete id=%s model=%s endpoint=%s status=%d response_bytes=%d sse_frames=%d sse_data_frames=%d text_chars=%d reasoning_chars=%d finish_reasons=%s event_types=%s",
+                            request.get("request_id", "-"),
+                            model or "-",
+                            request.path,
+                            upstream.status,
+                            response_bytes,
+                            sse_frames,
+                            sse_data_frames,
+                            text_chars,
+                            reasoning_chars,
+                            ",".join(sorted(sse_finish_reasons)) or "none",
+                            ",".join(sorted(sse_event_types)) or "none",
+                        )
+                        raise UpstreamError(
+                            502,
+                            "upstream stream ended before its terminal event",
+                            "upstream_invalid_response",
+                        )
                     await response.write_eof()
                     stream_duration = time.monotonic() - forward_started
                     generation_duration = (
