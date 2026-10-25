@@ -106,11 +106,20 @@ qwen36_command="$(awk '
   /^  [^ ]/ { if (in_model) exit }
   in_model { print }
 ' "${router_config}")"
+glm53_command="$(awk '
+  /^  glm-5\.3-flash-abliterated:$/ { in_model = 1; next }
+  /^  [^ ]/ { if (in_model) exit }
+  in_model { print }
+' "${router_config}")"
 cache_max_gib="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["gpu_budget_mib"] // 1024)' "${scheduler_policy}")"
 if [[ "${qwen36_command}" != *'--ubatch-size 1'* ]] || \
   [[ "${qwen36_command}" != *'--moe-stream'* ]] || \
   [[ "${qwen36_command}" != *"--moe-stream-cache-max ${cache_max_gib}g"* ]]; then
   printf 'Qwen3.6 must use the adaptive streamed expert-cache configuration\n' >&2
+  exit 1
+fi
+if [[ "${glm53_command}" != *'--reasoning off'* ]]; then
+  printf 'GLM must disable internal reasoning so short completion budgets yield visible answers\n' >&2
   exit 1
 fi
 
