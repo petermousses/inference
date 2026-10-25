@@ -713,6 +713,18 @@ class Runtime:
                     r"[a-z0-9_]{1,80}", reason
                 ):
                     reason = "none"
+                phase = result.get("phase") if isinstance(result, dict) else None
+                if not isinstance(phase, str) or not re.fullmatch(
+                    r"[a-z0-9_]{1,80}", phase
+                ):
+                    phase = "unknown"
+
+                def progress_counter(field: str) -> int:
+                    value = result.get(field) if isinstance(result, dict) else None
+                    if isinstance(value, bool) or not isinstance(value, int):
+                        return -1
+                    return value
+
                 status_code = operation.get("status_code")
                 if isinstance(status_code, bool) or not isinstance(status_code, int):
                     status_code = 0
@@ -722,14 +734,21 @@ class Runtime:
                 if isinstance(reported_capacity, bool) or not isinstance(reported_capacity, int):
                     reported_capacity = -1
                 LOG.info(
-                    "worker_cache_resize_progress operation_id=%s model=%s status=%s status_code=%d reason=%s requested_bytes=%d reported_capacity_bytes=%d elapsed_s=%.1f %s",
+                    "worker_cache_resize_progress operation_id=%s model=%s status=%s status_code=%d phase=%s reason=%s requested_bytes=%d reported_capacity_bytes=%d current_slots=%d target_slots=%d queued_loads=%d loading_slots=%d claimed_slots=%d resident_slots=%d elapsed_s=%.1f %s",
                     operation_id,
                     name,
                     status,
                     status_code,
+                    phase,
                     reason,
                     requested_capacity_bytes,
                     reported_capacity,
+                    progress_counter("current_slots"),
+                    progress_counter("target_slots"),
+                    progress_counter("queued_loads"),
+                    progress_counter("loading_slots"),
+                    progress_counter("claimed_slots"),
+                    progress_counter("resident_slots"),
                     time.monotonic() - started_at,
                     memory_fields,
                 )
@@ -1326,6 +1345,12 @@ class Scheduler:
             if self.resources[name].get("adaptive_cache")
         ]
         adaptive_names.extend(
+            name for name, count in self.active.items()
+            if count > 0
+            and name not in self.states
+            and self.resources.get(name, {}).get("adaptive_cache")
+        )
+        adaptive_names.extend(
             name for name, count in self.pending_requests.items()
             if count > 0
             and name not in self.states
@@ -1487,6 +1512,19 @@ class Scheduler:
             # plan so earlier FIFO tickets cannot consume their future allocation.
             for name, count in self.pending_requests.items():
                 if count <= 0 or name in self.states or name == incoming:
+                    continue
+                fixed += self.minimum_reservation(name, active=True)
+            # A request may own its lease before its backend has been loaded.
+            # It is no longer pending at that point, but still consumes its
+            # mandatory weights, minimum cache, and request peak in idle
+            # rebalances started by another request's cleanup.
+            for name, count in self.active.items():
+                if (
+                    count <= 0
+                    or name in self.states
+                    or name == incoming
+                    or self.pending_requests.get(name, 0) > 0
+                ):
                     continue
                 fixed += self.minimum_reservation(name, active=True)
             if incoming is not None and incoming not in self.states:

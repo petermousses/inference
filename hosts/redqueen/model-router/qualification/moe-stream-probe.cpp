@@ -123,7 +123,7 @@ int main(int argc, char ** argv) {
                 throw std::runtime_error("MOE_PROBE_RESIZE_BYTES is outside the model's expert-cache range");
             }
             llama_moe_stream_info resized{};
-            if (!llama_moe_stream_resize_cache(context.get(), resize_bytes, &resized)) {
+            if (!llama_moe_stream_resize_cache(context.get(), resize_bytes, nullptr, nullptr, &resized)) {
                 throw std::runtime_error("expert-cache resize was rejected");
             }
             if (resized.cache_bytes > resize_bytes ||

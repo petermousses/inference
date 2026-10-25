@@ -408,6 +408,34 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.resize_calls, [("qwen", 30)])
         self.assertEqual(runtime.cache_capacities["qwen"], 30)
 
+    async def test_idle_rebalance_keeps_unloaded_active_moe_in_demand(self):
+        resources = {name: adaptive_resource() for name in ("qwen", "deepseek")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=150)
+        scheduler = Scheduler(
+            resources,
+            runtime,
+            Path(self.directory.name) / "active-unloaded-cache-leases",
+            self.policy,
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"qwen": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        scheduler.active = {"deepseek": 1}
+        scheduler.last_used = {"qwen": 1000}
+        runtime.cache_capacities["qwen"] = 130
+        runtime.physical_cache_capacities["qwen"] = 130
+        scheduler.cache_allocations["qwen"] = 130
+
+        self.assertTrue(
+            await scheduler._rebalance_caches(
+                None, runtime.limit, Memory(0, 0), reason="post_request_idle"
+            )
+        )
+
+        self.assertEqual(runtime.resize_calls, [("qwen", 10)])
+        self.assertEqual(scheduler.cache_allocations["qwen"], 10)
+        self.assertEqual(scheduler.active["deepseek"], 1)
+
     async def test_cancelled_fifo_waiter_releases_pending_model_demand(self):
         resources = {"deepseek": adaptive_resource()}
         runtime = FakeAdaptiveRuntime(resources, capacity=150)
@@ -1307,7 +1335,16 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
                     "operation_id": operation_id,
                     "status": "completed",
                     "status_code": 200,
-                    "result": {"reason": "resize_done"},
+                    "result": {
+                        "reason": "resize_done",
+                        "phase": "restoring_residents",
+                        "current_slots": 4,
+                        "target_slots": 8,
+                        "queued_loads": 2,
+                        "loading_slots": 1,
+                        "claimed_slots": 1,
+                        "resident_slots": 6,
+                    },
                 })
             if request.method == "POST":
                 payload = await request.json()
@@ -1417,6 +1454,13 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(any(
             "status=completed" in line
+            and "phase=restoring_residents" in line
+            and "current_slots=4" in line
+            and "target_slots=8" in line
+            and "queued_loads=2" in line
+            and "loading_slots=1" in line
+            and "claimed_slots=1" in line
+            and "resident_slots=6" in line
             and "capacity_gpu_bytes=100" in line
             and "usage_gpu_bytes=50" in line
             and "usage_host_bytes=80" in line
