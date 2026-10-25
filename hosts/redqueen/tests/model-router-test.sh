@@ -144,9 +144,9 @@ grep -Fq 'readonly capacity_patch_file="${runtime_metadata}/capacity-sizing.patc
   "${host_root}/model-router/install-moe-runtime.sh"
 grep -Fq 'readonly capacity_patch_file="${runtime_metadata}/capacity-sizing.patch"' \
   "${host_root}/model-router/install-deepseek41-runtime.sh"
-grep -Fq 'target_slots == 5' \
+grep -Fq 'target_slots == 3' \
   "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v13/capacity-sizing.patch"
-grep -Fq 'target_slots == 5' \
+grep -Fq 'target_slots == 3' \
   "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v17/capacity-sizing.patch"
 (cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v12" && sha256sum --check --quiet PATCH_SHA256)
 (cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v16" && sha256sum --check --quiet PATCH_SHA256)

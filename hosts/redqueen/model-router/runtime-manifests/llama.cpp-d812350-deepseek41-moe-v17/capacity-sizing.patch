@@ -93,19 +93,19 @@ diff --git a/tests/test-moe-stream.cpp b/tests/test-moe-stream.cpp
 +        llama_moe_stream resizable(1, 2, 1, true, planned.cache_bytes, planned.cache_bytes * 4);
 +        make_cache(resizable, meta);
 +        resizable.alloc_bufs(false);
-+        resizable.resize_cache(slot_bytes * 6);
++        resizable.resize_cache(slot_bytes * 4);
 +        llama_moe_stream_info expanded{};
 +        resizable.get_info(expanded);
-+        require(expanded.slots_per_layer == 6, "cache did not grow to the requested slot count");
++        require(expanded.slots_per_layer == 4, "cache did not grow to the requested slot count");
 +        resize_progress_state shrink_progress;
-+        resizable.resize_cache(slot_bytes * 5, record_resize_progress, &shrink_progress);
++        resizable.resize_cache(slot_bytes * 3, record_resize_progress, &shrink_progress);
 +        llama_moe_stream_info shrunk{};
 +        resizable.get_info(shrunk);
-+        require(shrink_progress.saw_allocation && shrink_progress.current_slots == 6,
++        require(shrink_progress.saw_allocation && shrink_progress.current_slots == 4,
 +                "cache shrink did not report its live allocation transition");
-+        require(shrink_progress.target_slots == 5,
++        require(shrink_progress.target_slots == 3,
 +                "live cache sizing selected the wrong slot count for a shrink");
-+        require(shrunk.slots_per_layer == 5 && shrunk.cache_bytes == slot_bytes * 5,
++        require(shrunk.slots_per_layer == 3 && shrunk.cache_bytes == slot_bytes * 3,
 +                "cache shrink exceeded or underused its requested byte capacity");
 +
          {
