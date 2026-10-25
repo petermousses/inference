@@ -1,0 +1,430 @@
+diff --git a/tests/test-mtmd-impl.cpp b/tests/test-mtmd-impl.cpp
+index 5321f2ed1..333a4b9c7 100644
+--- a/tests/test-mtmd-impl.cpp
++++ b/tests/test-mtmd-impl.cpp
+@@ -1,5 +1,7 @@
+ #include "testing.h"
+ 
++#include "clip-impl.h"
++
+ #include "mtmd-audio.h"
+ #include "mtmd-image.h"
+ #include "mtmd-internal.h"
+@@ -45,6 +47,28 @@ struct test_registry {
+ // mtmd_image
+ //
+ 
++MAKE_TEST(test_deepseek41_image_layout) {
++    struct layout_case {
++        int n_llm_h;
++        int n_llm_w;
++        std::vector<int32_t> expected;
++    };
++    const std::vector<layout_case> cases = {
++        { 1, 1, { 1, 0, 3, 2 } },
++        { 2, 2, { 4, 0, 1, 6, 2, 3, 6, 5 } },
++        { 2, 1, { 2, 0, 4, 1, 4, 3 } },
++    };
++
++    for (const auto & c : cases) {
++        const auto actual = dsv41_get_image_layout_idx(c.n_llm_w, c.n_llm_h);
++        const std::string shape = std::to_string(c.n_llm_h) + "x" + std::to_string(c.n_llm_w);
++        t.assert_equal("image token count " + shape,
++                       (int64_t) c.expected.size(),
++                       (int64_t) dsv41_get_num_image_tokens(c.n_llm_h, c.n_llm_w));
++        t.assert_true("row-major start/newline/end layout " + shape, actual == c.expected);
++    }
++}
++
+ MAKE_TEST(test_image_preprocessor_lfm2) {
+     clip_hparams hparams;
+     hparams.patch_size = 16;
+diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
+index 9aec2a25b..c501dd800 100644
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -486,6 +486,7 @@ enum projector_type {
+     PROJECTOR_TYPE_DEEPSEEKOCR,
+     PROJECTOR_TYPE_DEEPSEEKOCR2,
+     PROJECTOR_TYPE_DEEPSEEK4V,
++    PROJECTOR_TYPE_DEEPSEEK41V,
+     PROJECTOR_TYPE_LFM2A,
+     PROJECTOR_TYPE_GLM4V,
+     PROJECTOR_TYPE_GLM5V,
+@@ -553,6 +554,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
+     { PROJECTOR_TYPE_DEEPSEEKOCR,       "deepseekocr"},
+     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
+     { PROJECTOR_TYPE_DEEPSEEK4V,        "deepseek4v"},
++    { PROJECTOR_TYPE_DEEPSEEK41V,       "deepseek41v"},
+     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},
+     { PROJECTOR_TYPE_GLM4V,             "glm4v"},
+     { PROJECTOR_TYPE_GLM5V,             "glm5v"},
+@@ -800,6 +802,30 @@ static inline dsv4_block_layout dsv4_get_block_layout(int n_llm_w, int n_llm_h,
+     return bl;
+ }
+ 
++// DeepSeek-V4.1 places image rows in reading order without V4's compression padding.
++static inline int dsv41_get_num_image_tokens(int n_llm_h, int n_llm_w) {
++    return n_llm_h * (n_llm_w + 1) + 2;
++}
++
++static inline std::vector<int32_t> dsv41_get_image_layout_idx(int n_llm_w, int n_llm_h) {
++    const int n_grid = n_llm_w * n_llm_h;
++    const int idx_start = n_grid;
++    const int idx_end = n_grid + 1;
++    const int idx_newline = n_grid + 2;
++
++    std::vector<int32_t> idx;
++    idx.reserve(dsv41_get_num_image_tokens(n_llm_h, n_llm_w));
++    idx.push_back(idx_start);
++    for (int row = 0; row < n_llm_h; ++row) {
++        for (int col = 0; col < n_llm_w; ++col) {
++            idx.push_back(row * n_llm_w + col);
++        }
++        idx.push_back(idx_newline);
++    }
++    idx.push_back(idx_end);
++    return idx;
++}
++
+ //
+ // logging
+ //
+diff --git a/tools/mtmd/clip-model.h b/tools/mtmd/clip-model.h
+index 33f679fc0..cb6166f3e 100644
+--- a/tools/mtmd/clip-model.h
++++ b/tools/mtmd/clip-model.h
+@@ -102,9 +102,9 @@ struct clip_hparams {
+     std::unordered_set<int32_t> wa_layer_indexes; // explicit layer indexes that use full attention (for irregular patterns like YoutuVL)
+     std::vector<int32_t> wa_pattern_mode; // mimovl: per-layer window-attention mode
+ 
+-    // deepseek4v: resize solver caps the LLM token count of the aligner grid
+-    int32_t dsv4_max_n_token  = 0;
+-    int32_t dsv4_max_wh_ratio = 0;
++    // DeepSeek V4/V4.1: resize caps for the aligner grid and aspect ratio
++    int32_t deepseek_vision_max_n_token  = 0;
++    int32_t deepseek_vision_max_wh_ratio = 0;
+ 
+     // deepseek-ocr (sam)
+     int32_t sam_n_layer = 0;
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 50fb6c408..dc7c927f8 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -1044,6 +1044,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const
+                 builder = std::make_unique<clip_graph_kimik25>(ctx, img);
+             } break;
+         case PROJECTOR_TYPE_DEEPSEEK4V:
++        case PROJECTOR_TYPE_DEEPSEEK41V:
+             {
+                 builder = std::make_unique<clip_graph_deepseek4v>(ctx, img);
+             } break;
+@@ -1613,8 +1614,8 @@ struct clip_model_loader {
+                         hparams.rope_theta = 10000.0f;
+                         get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
+                         get_u32(KEY_IMAGE_MIN_PIXELS,  hparams.image_min_pixels);
+-                        hparams.dsv4_max_n_token  = 384;
+-                        hparams.dsv4_max_wh_ratio = 8;
++                        hparams.deepseek_vision_max_n_token  = 384;
++                        hparams.deepseek_vision_max_wh_ratio = 8;
+                         const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
+                         // handle min/max token counts from CLI
+                         if (hparams.custom_image_min_tokens > 0) {
+@@ -1622,13 +1623,37 @@ struct clip_model_loader {
+                         }
+                         if (hparams.custom_image_max_tokens > 0) {
+                             // the cap is on the whole token block, keep some room for the resize solver
+-                            hparams.dsv4_max_n_token = std::max(hparams.custom_image_max_tokens, 16);
++                            hparams.deepseek_vision_max_n_token = std::max(hparams.custom_image_max_tokens, 16);
+                         }
+-                        hparams.image_max_pixels = hparams.dsv4_max_n_token * patch_area;
++                        hparams.image_max_pixels = hparams.deepseek_vision_max_n_token * patch_area;
+                         // a small custom max token count also lowers the min-pixel upscale threshold
+                         hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
+                         // avoid OOM on warmup
+-                        const int warmup_side = (int) std::sqrt((double) std::min(256, hparams.dsv4_max_n_token));
++                        const int warmup_side = (int) std::sqrt((double) std::min(256, hparams.deepseek_vision_max_n_token));
++                        hparams.set_warmup_n_tokens(warmup_side * warmup_side);
++                    } break;
++                case PROJECTOR_TYPE_DEEPSEEK41V:
++                    {
++                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
++                        hparams.image_pad_color   = {127, 127, 127};
++                        hparams.rope_theta = 10000.0f;
++                        hparams.n_merge = 3;
++                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
++                        hparams.image_min_pixels = 544 * 544;
++                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels, false);
++                        hparams.deepseek_vision_max_n_token = 1024;
++                        hparams.deepseek_vision_max_wh_ratio = 0;
++                        const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
++                        if (hparams.custom_image_min_tokens > 0) {
++                            hparams.image_min_pixels = hparams.custom_image_min_tokens * patch_area;
++                        }
++                        if (hparams.custom_image_max_tokens > 0) {
++                            hparams.deepseek_vision_max_n_token = std::min(hparams.custom_image_max_tokens, 1024);
++                        }
++                        hparams.deepseek_vision_max_n_token = std::max(hparams.deepseek_vision_max_n_token, 4);
++                        hparams.image_max_pixels = hparams.deepseek_vision_max_n_token * patch_area;
++                        hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
++                        const int warmup_side = (int) std::sqrt((double) std::min(256, hparams.deepseek_vision_max_n_token));
+                         hparams.set_warmup_n_tokens(warmup_side * warmup_side);
+                     } break;
+                 case PROJECTOR_TYPE_GEMMA3:
+@@ -2795,6 +2820,16 @@ struct clip_model_loader {
+                     model.token_embd_img_end   = get_tensor(TN_TOK_IMG_END);
+                     model.token_embd_img_pad   = get_tensor(TN_TOK_IMG_PAD);
+                 } break;
++            case PROJECTOR_TYPE_DEEPSEEK41V:
++                {
++                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
++                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
++                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
++                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
++                    model.image_newline        = get_tensor(TN_IMAGE_NEWLINE);
++                    model.token_embd_img_start = get_tensor(TN_TOK_IMG_START);
++                    model.token_embd_img_end   = get_tensor(TN_TOK_IMG_END);
++                } break;
+             case PROJECTOR_TYPE_PIXTRAL:
+                 {
+                     model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+@@ -4063,8 +4098,8 @@ struct clip_cap clip_get_cap(const char * fname) {
+ 
+ int clip_get_image_max_tokens(const clip_ctx * ctx) {
+     const auto & hparams = ctx->model.hparams;
+-    if (ctx->proj_type() == PROJECTOR_TYPE_DEEPSEEK4V) {
+-        return hparams.dsv4_max_n_token;
++    if (ctx->proj_type() == PROJECTOR_TYPE_DEEPSEEK4V || ctx->proj_type() == PROJECTOR_TYPE_DEEPSEEK41V) {
++        return hparams.deepseek_vision_max_n_token;
+     }
+     if (hparams.image_max_pixels <= 0) {
+         return -1;
+@@ -4257,6 +4292,13 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
+                 const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
+                 n_patches = dsv4_get_block_layout(n_llm_w, n_llm_h, img->lead_pad).n_out;
+             } break;
++        case PROJECTOR_TYPE_DEEPSEEK41V:
++            {
++                const int out_patch_size = params.patch_size * params.n_merge;
++                const int n_llm_w = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
++                const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
++                n_patches = dsv41_get_num_image_tokens(n_llm_h, n_llm_w);
++            } break;
+         case PROJECTOR_TYPE_PADDLEOCR:
+         case PROJECTOR_TYPE_DOTS_OCR:
+         case PROJECTOR_TYPE_DOTS3NOTE_V:
+@@ -5187,6 +5229,22 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+                 idx.push_back(idx_end);
+                 set_input_i32("layout_idx", idx);
+             } break;
++        case PROJECTOR_TYPE_DEEPSEEK41V:
++            {
++                int n_patches_per_row = image_size_width / patch_size;
++                std::vector<int32_t> positions(n_pos * 4, 0);
++                for (int i = 0; i < n_pos; i++) {
++                    positions[i]         = i / n_patches_per_row;
++                    positions[n_pos + i] = i % n_patches_per_row;
++                }
++                set_input_i32("positions", positions);
++
++                const int n_merge = hparams.n_merge;
++                const int n_llm_w = CLIP_ALIGN(pos_w, n_merge) / n_merge;
++                const int n_llm_h = CLIP_ALIGN(pos_h, n_merge) / n_merge;
++                std::vector<int32_t> layout_idx = dsv41_get_image_layout_idx(n_llm_w, n_llm_h);
++                set_input_i32("layout_idx", layout_idx);
++            } break;
+         case PROJECTOR_TYPE_GLM_EDGE:
+         {
+             // llava and other models
+@@ -6048,6 +6106,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
+         case PROJECTOR_TYPE_KIMIK25:
+         case PROJECTOR_TYPE_YASA2:
+         case PROJECTOR_TYPE_DEEPSEEK4V:
++        case PROJECTOR_TYPE_DEEPSEEK41V:
+             return ctx->model.mm_2_w->ne[1];
+         case PROJECTOR_TYPE_HUNYUANVL:
+             return ctx->model.mm_model_proj->ne[1];
+diff --git a/tools/mtmd/models/deepseek4v.cpp b/tools/mtmd/models/deepseek4v.cpp
+index ffe8f59d9..ee433033b 100644
+--- a/tools/mtmd/models/deepseek4v.cpp
++++ b/tools/mtmd/models/deepseek4v.cpp
+@@ -72,22 +72,36 @@ ggml_cgraph * clip_graph_deepseek4v::build() {
+         const int64_t n_embd_out = cur->ne[0];
+         const int64_t n_grid     = cur->ne[1]; // n_llm_w * n_llm_h
+ 
+-        // rows n_grid + 0..3, keep in sync with the index computation in set_input
+-        ggml_tensor * sentinels[] = {
+-            model.token_embd_img_start,
+-            model.token_embd_img_end,
+-            model.image_newline,
+-            model.token_embd_img_pad,
+-        };
+-        for (ggml_tensor * tok : sentinels) {
+-            cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, tok, n_embd_out, 1), 1);
+-        }
+-
+         const int n_llm_w = CLIP_ALIGN(n_patches_x, n_merge) / n_merge;
+         const int n_llm_h = CLIP_ALIGN(n_patches_y, n_merge) / n_merge;
+-        const int n_out   = dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out;
+         GGML_ASSERT(n_grid == n_llm_w * n_llm_h);
+ 
++        int n_out = 0;
++        if (proj_type == PROJECTOR_TYPE_DEEPSEEK41V) {
++            // V4.1 emits [START] + (grid row + NEWLINE)* + [END], with no V4 pad embeddings.
++            ggml_tensor * sentinels[] = {
++                model.token_embd_img_start,
++                model.token_embd_img_end,
++                model.image_newline,
++            };
++            for (ggml_tensor * tok : sentinels) {
++                cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, tok, n_embd_out, 1), 1);
++            }
++            n_out = dsv41_get_num_image_tokens(n_llm_h, n_llm_w);
++        } else {
++            // V4 rows n_grid + 0..3: start, end, newline, pad.
++            ggml_tensor * sentinels[] = {
++                model.token_embd_img_start,
++                model.token_embd_img_end,
++                model.image_newline,
++                model.token_embd_img_pad,
++            };
++            for (ggml_tensor * tok : sentinels) {
++                cur = ggml_concat(ctx0, cur, ggml_reshape_2d(ctx0, tok, n_embd_out, 1), 1);
++            }
++            n_out = dsv4_get_block_layout(n_llm_w, n_llm_h, img.lead_pad).n_out;
++        }
++
+         ggml_tensor * layout_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_out);
+         ggml_set_name(layout_idx, "layout_idx");
+         ggml_set_input(layout_idx);
+diff --git a/tools/mtmd/mtmd-image.cpp b/tools/mtmd/mtmd-image.cpp
+index ea67ec3b8..f5acd81d7 100644
+--- a/tools/mtmd/mtmd-image.cpp
++++ b/tools/mtmd/mtmd-image.cpp
+@@ -1286,8 +1286,8 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip
+ 
+     const int p           = hparams.patch_size;
+     const int r           = hparams.n_merge;
+-    const int max_n_token = hparams.dsv4_max_n_token;
+-    const int max_wh      = hparams.dsv4_max_wh_ratio;
++    const int max_n_token = hparams.deepseek_vision_max_n_token;
++    const int max_wh      = hparams.deepseek_vision_max_wh_ratio;
+ 
+     const clip_image_size orig = img.get_size();
+     int width  = orig.width;
+@@ -1319,6 +1319,82 @@ mtmd_image_preproc_out mtmd_image_preprocessor_deepseek4v::preprocess(const clip
+     return out;
+ }
+ 
++// DeepSeek-V4.1 image resize and token-budget policy, matching inference/image_processor.py.
++static int dsv41_llm_grid_h(int height, int patch_size, int downsample_ratio) {
++    return (height / patch_size + downsample_ratio - 1) / downsample_ratio;
++}
++
++static int dsv41_llm_grid_w(int width, int patch_size, int downsample_ratio) {
++    return (width / patch_size + downsample_ratio - 1) / downsample_ratio;
++}
++
++static clip_image_size dsv41_solve_resize_ratio(int height, int width, int patch_size,
++                                                int downsample_ratio, int max_n_token) {
++    const double ratio = (double) height / width;
++    const double max_w_float = std::sqrt((max_n_token - 2) / ratio + 0.25) - 0.5;
++    const double max_h_float = max_w_float * ratio;
++    const int cell = patch_size * downsample_ratio;
++
++    if (max_w_float < 1.0) {
++        return { cell, ((max_n_token - 2) / 2) * cell };
++    }
++    if (max_h_float < 1.0) {
++        return { (max_n_token - 3) * cell, cell };
++    }
++
++    const int max_w = (int) std::floor(max_w_float);
++    const int max_h = (int) std::floor(max_h_float);
++    const double beta = std::min((double) max_w * cell / width, (double) max_h * cell / height);
++    const int best_height = (int) std::floor(height * beta / patch_size) * patch_size;
++    const int best_width = (int) std::floor(width * beta / patch_size) * patch_size;
++    return { best_width, best_height };
++}
++
++mtmd_image_preproc_out mtmd_image_preprocessor_deepseek41v::preprocess(const clip_image_u8 & img) const {
++    mtmd_image_preproc_out out;
++    const int patch_size = hparams.patch_size;
++    const int downsample_ratio = hparams.n_merge;
++    const int max_n_token = hparams.deepseek_vision_max_n_token;
++
++    const clip_image_size orig = img.get_size();
++    int width = orig.width;
++    int height = orig.height;
++    const int max_wh_ratio = hparams.deepseek_vision_max_wh_ratio;
++    if (max_wh_ratio > 0 && width > height * max_wh_ratio) {
++        width = height * max_wh_ratio;
++    }
++    const int64_t n_pixels = (int64_t) width * height;
++    if (n_pixels > 0 && n_pixels < hparams.image_min_pixels) {
++        const double up = std::sqrt((double) hparams.image_min_pixels / n_pixels);
++        width = (int) (width * up);
++        height = (int) (height * up);
++    }
++
++    int best_width = CLIP_ALIGN(width, patch_size);
++    int best_height = CLIP_ALIGN(height, patch_size);
++    const int grid_h = dsv41_llm_grid_h(best_height, patch_size, downsample_ratio);
++    const int grid_w = dsv41_llm_grid_w(best_width, patch_size, downsample_ratio);
++    if (dsv41_get_num_image_tokens(grid_h, grid_w) > max_n_token) {
++        const clip_image_size safe = dsv41_solve_resize_ratio(height, width, patch_size, downsample_ratio, max_n_token);
++        best_width = safe.width;
++        best_height = safe.height;
++    }
++
++    const int final_h = dsv41_llm_grid_h(best_height, patch_size, downsample_ratio);
++    const int final_w = dsv41_llm_grid_w(best_width, patch_size, downsample_ratio);
++    GGML_ASSERT(dsv41_get_num_image_tokens(final_h, final_w) <= max_n_token);
++
++    clip_image_u8 resized;
++    if (max_wh_ratio > 0 && orig.width >= max_wh_ratio * orig.height) {
++        img_tool::resize(img, resized, { best_width, best_height }, hparams.image_resize_algo, PAD_NONE);
++    } else {
++        img_tool::resize(img, resized, { best_width, best_height }, hparams.image_resize_algo,
++                         PAD_NEAREST, hparams.image_pad_color);
++    }
++    out.append(hparams, resized);
++    return out;
++}
++
+ mtmd_image_preproc_out mtmd_image_preprocessor_deepseekocr::preprocess(const clip_image_u8 & img) const {
+     mtmd_image_preproc_out output;
+     int grid_w = 0;
+diff --git a/tools/mtmd/mtmd-image.h b/tools/mtmd/mtmd-image.h
+index 4fa6207d0..961a22f5c 100644
+--- a/tools/mtmd/mtmd-image.h
++++ b/tools/mtmd/mtmd-image.h
+@@ -151,6 +151,12 @@ private:
+     static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token);
+ };
+ 
++// DeepSeek-V4.1 uses a row-major image span with one newline token per row and no V4 padding.
++struct mtmd_image_preprocessor_deepseek41v : mtmd_image_preprocessor {
++    mtmd_image_preprocessor_deepseek41v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
++    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
++};
++
+ // custom llava-uhd slicing logic for MiniCPM-V
+ struct mtmd_image_preprocessor_minicpmv : mtmd_image_preprocessor_llava_uhd {
+     using mtmd_image_preprocessor_llava_uhd::mtmd_image_preprocessor_llava_uhd;
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 9e7b1cc80..d3f8a7909 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -832,6 +832,11 @@ struct mtmd_context {
+                     // no vocab tokens are added; the start/end/newline markers are learned embeddings emitted by the encoder
+                     image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek4v>(ctx_v);
+                 } break;
++            case PROJECTOR_TYPE_DEEPSEEK41V:
++                {
++                    // V4.1's start/end/newline markers are learned embeddings emitted by the encoder.
++                    image_preproc = std::make_unique<mtmd_image_preprocessor_deepseek41v>(ctx_v);
++                } break;
+             case PROJECTOR_TYPE_DOTS_OCR:
+             case PROJECTOR_TYPE_DOTS3NOTE_V:
+                 {
