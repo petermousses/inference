@@ -85,7 +85,7 @@ models:
 
   gemma-4-26b-a4b-it:
     cmd: >-
-      /srv/ai/runtimes/llama.cpp-d812350-moe-v12/bin/llama-server
+      /srv/ai/runtimes/llama.cpp-d812350-moe-v13/bin/llama-server
       --model /srv/ai/models/gemma-4-26b-a4b-it/gemma-4-26B-A4B-it-Q4_0.gguf
       --mmproj /srv/ai/models/gemma-4-26b-a4b-it/mmproj-gemma-4-26B-A4B-it-Q8_0.gguf
       --alias gemma-4-26b-a4b-it
@@ -119,7 +119,7 @@ models:
 
   qwen3.6-35b-a3b:
     cmd: >-
-      /srv/ai/runtimes/llama.cpp-d812350-moe-v12/bin/llama-server
+      /srv/ai/runtimes/llama.cpp-d812350-moe-v13/bin/llama-server
       --model /srv/ai/models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-Q4_K_M.gguf
       --mmproj /srv/ai/models/qwen3.6-35b-a3b/mmproj-Qwen3.6-35B-A3B-Q8_0.gguf
       --alias qwen3.6-35b-a3b
@@ -153,7 +153,7 @@ models:
 
   deepseek-v4.1-flash-1017-unsloth:
     cmd: >-
-      /srv/ai/runtimes/llama.cpp-d812350-deepseek41-moe-v16/bin/llama-server
+      /srv/ai/runtimes/llama.cpp-d812350-deepseek41-moe-v17/bin/llama-server
       --model /srv/ai/models/deepseek-v4.1-flash-1017-unsloth/UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf
       --mmproj /srv/ai/models/deepseek-v4.1-flash-1017-unsloth/mmproj-BF16.gguf
       --alias deepseek-v4.1-flash-1017-unsloth
@@ -189,7 +189,7 @@ models:
 
   glm-5.3-flash-abliterated:
     cmd: >-
-      /srv/ai/runtimes/llama.cpp-d812350-moe-v12/bin/llama-server
+      /srv/ai/runtimes/llama.cpp-d812350-moe-v13/bin/llama-server
       --model /srv/ai/models/huihui-glm-5.3-flash-abliterated-gguf/UD-IQ1_S/GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf
       --mmproj /srv/ai/models/huihui-glm-5.3-flash-abliterated-gguf/mmproj-model-bf16.gguf
       --alias glm-5.3-flash-abliterated

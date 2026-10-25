@@ -1,0 +1,113 @@
+diff --git a/src/llama-moe-stream.cpp b/src/llama-moe-stream.cpp
+--- a/src/llama-moe-stream.cpp
++++ b/src/llama-moe-stream.cpp
+@@ -3,36 +3,34 @@
+         ggml_tensor * tensor;
+         int64_t ne2;
+         size_t nb3;
++        ggml_backend_buffer_t buffer;
+         void * data;
+     };
+     std::vector<tensor_state> old_states;
+-    for (const auto & layer : layers) {
+-        if (!layer) {
+-            continue;
+-        }
+-        for (const auto & weight : layer->weights) {
+-            ggml_tensor * tensor = weight.cache;
+-            old_states.push_back({tensor, tensor->ne[2], tensor->nb[3], tensor->data});
+-        }
+-    }
+-
+-    for (const auto & old : old_states) {
+-        ggml_tensor * tensor = old.tensor;
+-        tensor->ne[2] = slots;
+-        tensor->nb[3] = tensor->nb[2] * slots;
+-        // GGML's size planner counts only tensors whose backing pointer is null.
+-        tensor->data = nullptr;
+-    }
+-
+     const auto restore = [&]() {
+-        for (const auto & old : old_states) {
+-            old.tensor->ne[2] = old.ne2;
+-            old.tensor->nb[3] = old.nb3;
+-            old.tensor->data = old.data;
++        for (auto old = old_states.rbegin(); old != old_states.rend(); ++old) {
++            old->tensor->ne[2] = old->ne2;
++            old->tensor->nb[3] = old->nb3;
++            old->tensor->buffer = old->buffer;
++            old->tensor->data = old->data;
+         }
+     };
+     size_t total = 0;
+     try {
++        for (const auto & layer : layers) {
++            if (!layer) {
++                continue;
++            }
++            for (const auto & weight : layer->weights) {
++                ggml_tensor * tensor = weight.cache;
++                old_states.push_back({tensor, tensor->ne[2], tensor->nb[3], tensor->buffer, tensor->data});
++                tensor->ne[2] = slots;
++                tensor->nb[3] = tensor->nb[2] * slots;
++                // Make the size query independent of any currently allocated backing.
++                tensor->buffer = nullptr;
++                tensor->data = nullptr;
++            }
++        }
+         for (const auto & cache_ctx : ctxs) {
+             const size_t size = ggml_backend_alloc_ctx_tensors_from_buft_size(
+                     cache_ctx.ctx.get(), cache_ctx.buft);
+diff --git a/tests/test-moe-stream.cpp b/tests/test-moe-stream.cpp
+--- a/tests/test-moe-stream.cpp
++++ b/tests/test-moe-stream.cpp
+@@ -27,6 +27,23 @@
+ 
+ static void make_cache(llama_moe_stream & stream, const ggml_tensor * meta) {
+     stream.create_cache_tensor(0, ggml_backend_cpu_buffer_type(), meta, 0, 0, 2);
++}
++
++struct resize_progress_state {
++    bool saw_allocation = false;
++    uint32_t current_slots = 0;
++    uint32_t target_slots = 0;
++};
++
++static void record_resize_progress(void * user_data, const char * phase,
++        uint32_t current_slots, uint32_t target_slots,
++        uint32_t, uint32_t, uint32_t, uint32_t) {
++    auto * state = static_cast<resize_progress_state *>(user_data);
++    if (std::string(phase) == "allocating_backing") {
++        state->saw_allocation = true;
++        state->current_slots = current_slots;
++        state->target_slots = target_slots;
++    }
+ }
+ 
+ static bool parse_cache_arg(const std::string & value, common_params & params) {
+@@ -95,6 +112,25 @@
+         require(actual.cache_bytes == planned.cache_bytes, "planned/live cache bytes differ");
+         require(actual.host_overhead_bytes == planned.host_overhead_bytes, "planned/live staging bytes differ");
+ 
++        const uint64_t slot_bytes = planned.cache_bytes / 2;
++        llama_moe_stream resizable(1, 2, 1, true, planned.cache_bytes, planned.cache_bytes * 4);
++        make_cache(resizable, meta);
++        resizable.alloc_bufs(false);
++        resizable.resize_cache(slot_bytes * 6);
++        llama_moe_stream_info expanded{};
++        resizable.get_info(expanded);
++        require(expanded.slots_per_layer == 6, "cache did not grow to the requested slot count");
++        resize_progress_state shrink_progress;
++        resizable.resize_cache(slot_bytes * 5, record_resize_progress, &shrink_progress);
++        llama_moe_stream_info shrunk{};
++        resizable.get_info(shrunk);
++        require(shrink_progress.saw_allocation && shrink_progress.current_slots == 6,
++                "cache shrink did not report its live allocation transition");
++        require(shrink_progress.target_slots == 5,
++                "live cache sizing selected the wrong slot count for a shrink");
++        require(shrunk.slots_per_layer == 5 && shrunk.cache_bytes == slot_bytes * 5,
++                "cache shrink exceeded or underused its requested byte capacity");
++
+         {
+             llama_moe_stream_context_lease first(live);
+             rejects([&] { llama_moe_stream_context_lease second(live); }, "second model context was accepted");

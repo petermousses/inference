@@ -3,13 +3,14 @@ set -euo pipefail
 umask 0027
 
 readonly revision=d81235049384534c167caea52b85a694f6103d14
-readonly runtime=llama.cpp-d812350-moe-v12
+readonly runtime=llama.cpp-d812350-moe-v13
 readonly target="/srv/ai/runtimes/${runtime}"
 readonly repository=https://github.com/ggml-org/llama.cpp.git
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly runtime_metadata="${script_dir}/runtime-manifests/${runtime}"
 readonly patch_file="${runtime_metadata}/moe-stream.patch"
 readonly adaptive_patch_file="${runtime_metadata}/adaptive-cache.patch"
+readonly capacity_patch_file="${runtime_metadata}/capacity-sizing.patch"
 (cd -- "${runtime_metadata}" && sha256sum --check PATCH_SHA256)
 readonly patch_sha="$(sha256sum "${runtime_metadata}/PATCH_SHA256" | cut -d ' ' -f 1)"
 
@@ -113,6 +114,11 @@ if [[ "$("${cmake_bin}" --version | sed -n '1s/.*version //p')" != '3.31.6' ]] &
   printf 'CMake 3.31.6 or newer is required\n' >&2
   exit 1
 fi
+ctest_bin="$(dirname -- "${cmake_bin}")/ctest"
+if [[ ! -x "${ctest_bin}" ]]; then
+  printf 'CTest is required to run the live-resize regression\n' >&2
+  exit 1
+fi
 
 source_root="${temporary_root}/source"
 build_root="${temporary_root}/build"
@@ -130,6 +136,8 @@ git -C "${source_root}" apply --check "${patch_file}"
 git -C "${source_root}" apply "${patch_file}"
 git -C "${source_root}" apply --check "${adaptive_patch_file}"
 git -C "${source_root}" apply "${adaptive_patch_file}"
+git -C "${source_root}" apply --check "${capacity_patch_file}"
+git -C "${source_root}" apply "${capacity_patch_file}"
 
 export HIPCXX="$(hipconfig -l)/clang"
 export HIP_PATH="$(hipconfig -R)"
@@ -145,7 +153,7 @@ readonly install_rpath='$ORIGIN/../lib;/opt/rocm/lib;/opt/rocm/core-7.14/lib'
   -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=ON \
   -DGGML_HIP=ON \
   -DAMDGPU_TARGETS=gfx1151 \
-  -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_TESTS=ON \
   -DLLAMA_BUILD_EXAMPLES=OFF \
   -DLLAMA_BUILD_TOOLS=ON \
   -DLLAMA_BUILD_SERVER=ON \
@@ -154,6 +162,7 @@ readonly install_rpath='$ORIGIN/../lib;/opt/rocm/lib;/opt/rocm/core-7.14/lib'
   -DLLAMA_BUILD_UI=OFF \
   -DLLAMA_USE_PREBUILT_UI=OFF
 "${cmake_bin}" --build "${build_root}" --parallel "${build_jobs}"
+"${ctest_bin}" --test-dir "${build_root}" --no-tests=error --output-on-failure -R '^test-moe-stream$'
 
 install -d -m 0755 -- /srv/ai/runtimes
 stage="$(mktemp -d /srv/ai/runtimes/.${runtime}.XXXXXXXX)"

@@ -133,11 +133,21 @@ for model in gemma-4-26b-a4b-it qwen3.6-35b-a3b deepseek-v4.1-flash-1017-unsloth
     exit 1
   fi
 done
-grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v12/bin/llama-fit-params' "${scheduler_policy}"
-grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-deepseek41-moe-v16/bin/llama-server' "${router_config}"
-grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v12/bin/llama-server' "${router_config}"
-grep -Fq 'readonly runtime=llama.cpp-d812350-moe-v12' "${host_root}/model-router/install-moe-runtime.sh"
-grep -Fq 'readonly runtime=llama.cpp-d812350-deepseek41-moe-v16' "${host_root}/model-router/install-deepseek41-runtime.sh"
+grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v13/bin/llama-fit-params' "${scheduler_policy}"
+grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-deepseek41-moe-v17/bin/llama-server' "${router_config}"
+grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v13/bin/llama-server' "${router_config}"
+grep -Fq 'readonly runtime=llama.cpp-d812350-moe-v13' "${host_root}/model-router/install-moe-runtime.sh"
+grep -Fq 'readonly runtime=llama.cpp-d812350-deepseek41-moe-v17' "${host_root}/model-router/install-deepseek41-runtime.sh"
+(cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v13" && sha256sum --check --quiet PATCH_SHA256)
+(cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v17" && sha256sum --check --quiet PATCH_SHA256)
+grep -Fq 'readonly capacity_patch_file="${runtime_metadata}/capacity-sizing.patch"' \
+  "${host_root}/model-router/install-moe-runtime.sh"
+grep -Fq 'readonly capacity_patch_file="${runtime_metadata}/capacity-sizing.patch"' \
+  "${host_root}/model-router/install-deepseek41-runtime.sh"
+grep -Fq 'target_slots == 5' \
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v13/capacity-sizing.patch"
+grep -Fq 'target_slots == 5' \
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v17/capacity-sizing.patch"
 (cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v12" && sha256sum --check --quiet PATCH_SHA256)
 (cd "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v16" && sha256sum --check --quiet PATCH_SHA256)
 grep -Fq 'actual_capacity_bytes <= capacity_bytes' \
