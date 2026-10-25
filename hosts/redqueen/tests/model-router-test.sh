@@ -118,8 +118,8 @@ if [[ "${qwen36_command}" != *'--ubatch-size 1'* ]] || \
   printf 'Qwen3.6 must use the adaptive streamed expert-cache configuration\n' >&2
   exit 1
 fi
-if [[ "${glm53_command}" != *'--reasoning off'* ]]; then
-  printf 'GLM must disable internal reasoning so short completion budgets yield visible answers\n' >&2
+if [[ "${glm53_command}" != *'--reasoning-effort low'* ]]; then
+  printf 'GLM must use low reasoning effort so bounded completion budgets yield visible answers\n' >&2
   exit 1
 fi
 

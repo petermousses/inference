@@ -209,7 +209,7 @@ models:
       --flash-attn auto
       --image-max-tokens 1024
       --jinja
-      --reasoning off
+      --reasoning-effort low
       --chat-template-kwargs '{"clear_thinking":true}'
       --metrics
       --slots
