@@ -206,7 +206,7 @@ class IngressGate:
         if request.path in {"/healthz", "/readyz", "/scheduler", "/v1/models", "/models", "/health", "/running", "/metrics"}:
             return await handler(request)
         if self.active >= self.limit:
-            raise AdmissionError(429, "request admission limit reached", "frontend_busy")
+            raise AdmissionError(429, "too many requests", "frontend_busy")
         self.active += 1
         try:
             response = await handler(request)
