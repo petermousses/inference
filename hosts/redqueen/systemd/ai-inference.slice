@@ -3,6 +3,6 @@ Description=Aggregate limits for redqueen AI inference services
 
 [Slice]
 CPUQuota=3000%
-MemoryHigh=104G
-MemoryMax=112G
+MemoryHigh=112G
+MemoryMax=120G
 TasksMax=8192

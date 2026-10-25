@@ -26,8 +26,8 @@ KillMode=mixed
 OOMPolicy=stop
 
 CPUQuota=2800%
-MemoryHigh=96G
-MemoryMax=104G
+MemoryHigh=112G
+MemoryMax=120G
 TasksMax=4096
 LimitNOFILE=1048576
 UMask=0077
