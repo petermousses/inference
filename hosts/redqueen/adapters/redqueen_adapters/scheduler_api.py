@@ -1200,6 +1200,7 @@ class Scheduler:
         self.states: dict[str, str] = {}
         self.last_used: dict[str, float] = {}
         self.active: dict[str, int] = {}
+        self.pending_requests: dict[str, int] = {}
         self.cache_allocations: dict[str, int] = {
             name: spec["adaptive_cache"]["minimum_capacity_bytes"]
             for name, spec in resources.items()
@@ -1324,12 +1325,20 @@ class Scheduler:
             name for name in self.states
             if self.resources[name].get("adaptive_cache")
         ]
+        adaptive_names.extend(
+            name for name, count in self.pending_requests.items()
+            if count > 0
+            and name not in self.states
+            and self.resources.get(name, {}).get("adaptive_cache")
+        )
         if (
             incoming is not None
             and incoming not in self.states
             and self.resources[incoming].get("adaptive_cache")
         ):
-            adaptive_names.append(incoming)
+            if incoming not in adaptive_names:
+                adaptive_names.append(incoming)
+        adaptive_names = list(dict.fromkeys(adaptive_names))
         if not adaptive_names:
             LOG.info(
                 "cache_rebalance_skipped id=%s request_id=%s reason=%s incoming=%s cause=no_adaptive_workers",
@@ -1342,7 +1351,9 @@ class Scheduler:
         adjustable_names = [name for name in adaptive_names if name not in self.cache_unready]
         demand_names = [
             name for name in adjustable_names
-            if self.active.get(name, 0) > 0 or name == incoming
+            if self.active.get(name, 0) > 0
+            or self.pending_requests.get(name, 0) > 0
+            or name == incoming
         ]
         # With no in-flight request, keep the most recently used resident MoE
         # warm. A later request to another model will rebalance around it.
@@ -1367,7 +1378,7 @@ class Scheduler:
         except (OSError, RuntimeError, ValueError) as error:
             memory_fields = f"snapshot_error={type(error).__name__}"
         LOG.info(
-            "cache_rebalance_start id=%s request_id=%s reason=%s incoming=%s demand=%s active=%s resident=%s decision_capacity_gpu_bytes=%d decision_capacity_host_bytes=%d decision_unknown_gpu_bytes=%d decision_unknown_host_bytes=%d %s",
+            "cache_rebalance_start id=%s request_id=%s reason=%s incoming=%s demand=%s active=%s pending=%s resident=%s decision_capacity_gpu_bytes=%d decision_capacity_host_bytes=%d decision_unknown_gpu_bytes=%d decision_unknown_host_bytes=%d %s",
             rebalance_id,
             request_id or "-",
             reason,
@@ -1375,6 +1386,10 @@ class Scheduler:
             ",".join(demand_signature) or "none",
             ",".join(
                 f"{name}:{self.active.get(name, 0)}" for name in sorted(adjustable_names)
+            ) or "none",
+            ",".join(
+                f"{name}:{self.pending_requests.get(name, 0)}"
+                for name in sorted(adjustable_names)
             ) or "none",
             ",".join(
                 f"{name}:{self.states.get(name, 'unloaded')}:{self.cache_allocations.get(name, 0)}"
@@ -1461,11 +1476,19 @@ class Scheduler:
                     fixed += Memory(reclaimable["gpu_bytes"], reclaimable["host_bytes"])
                 if (
                     self.active.get(name, 0) > 0
+                    or self.pending_requests.get(name, 0) > 0
                     or name == incoming
                     or not is_openai_worker(spec)
                 ):
                     peak = profile["transient_peak"]
                     fixed += Memory(peak["gpu_bytes"], peak["host_bytes"])
+            # Pending workers have not loaded yet, but their mandatory weights,
+            # minimum expert cache, and transient request peak must remain in the
+            # plan so earlier FIFO tickets cannot consume their future allocation.
+            for name, count in self.pending_requests.items():
+                if count <= 0 or name in self.states or name == incoming:
+                    continue
+                fixed += self.minimum_reservation(name, active=True)
             if incoming is not None and incoming not in self.states:
                 fixed += self.minimum_reservation(incoming, active=True)
             return fixed
@@ -2501,6 +2524,8 @@ class Scheduler:
             raise AdmissionError(404, "model is not configured", "model_not_found")
         request_id = request_id or uuid.uuid4().hex
         request_started = time.monotonic()
+        self.pending_requests[name] = self.pending_requests.get(name, 0) + 1
+        pending_registered = True
         execution_admission = (
             self.execution.hold()
             if spec.get("exclusive_execution") is True
@@ -2509,12 +2534,19 @@ class Scheduler:
         rebalance_after = False
         try:
             LOG.info(
-                "request_waiting_for_execution id=%s model=%s exclusive=%s",
+                "request_waiting_for_execution id=%s model=%s exclusive=%s pending_requests=%d",
                 request_id,
                 name,
                 spec.get("exclusive_execution") is True,
+                self.pending_requests[name],
             )
             async with execution_admission as execution:
+                pending_count = self.pending_requests.get(name, 0)
+                if pending_count <= 1:
+                    self.pending_requests.pop(name, None)
+                else:
+                    self.pending_requests[name] = pending_count - 1
+                pending_registered = False
                 LOG.info(
                     "request_execution_acquired id=%s model=%s wait_s=%.3f",
                     request_id,
@@ -2626,6 +2658,18 @@ class Scheduler:
                     )
                     rebalance_after = True
         finally:
+            if pending_registered:
+                pending_count = self.pending_requests.get(name, 0)
+                if pending_count <= 1:
+                    self.pending_requests.pop(name, None)
+                else:
+                    self.pending_requests[name] = pending_count - 1
+                LOG.info(
+                    "request_pending_released id=%s model=%s pending_requests=%d",
+                    request_id,
+                    name,
+                    self.pending_requests.get(name, 0),
+                )
             if rebalance_after:
                 self._schedule_cache_rebalance(request_id)
 

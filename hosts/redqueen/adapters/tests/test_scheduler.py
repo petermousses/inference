@@ -386,6 +386,56 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             if scheduler.cache_rebalance_tasks:
                 await asyncio.gather(*list(scheduler.cache_rebalance_tasks), return_exceptions=True)
 
+    async def test_pending_moe_requests_share_cache_before_fifo_admission(self):
+        resources = {name: adaptive_resource() for name in ("qwen", "glm", "deepseek")}
+        runtime = FakeAdaptiveRuntime(resources, capacity=150)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "pending-moe-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"qwen": "ready"}
+        scheduler.states = dict(runtime.loaded)
+        scheduler.active = {"qwen": 1}
+        scheduler.pending_requests = {"glm": 1, "deepseek": 1}
+        runtime.cache_capacities["qwen"] = 130
+        runtime.physical_cache_capacities["qwen"] = 130
+        scheduler.cache_allocations["qwen"] = 130
+
+        self.assertTrue(
+            await scheduler._rebalance_caches("glm", runtime.limit, Memory(0, 0))
+        )
+
+        self.assertEqual(runtime.resize_calls, [("qwen", 30)])
+        self.assertEqual(runtime.cache_capacities["qwen"], 30)
+
+    async def test_cancelled_fifo_waiter_releases_pending_model_demand(self):
+        resources = {"deepseek": adaptive_resource()}
+        runtime = FakeAdaptiveRuntime(resources, capacity=150)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "pending-cancel-leases", self.policy
+        )
+        gate = ResourceLock(scheduler.lock_dir, "global-execution", exclusive=True)
+        self.assertTrue(gate.acquire())
+
+        async def wait_for_request_slot():
+            async with scheduler.request("deepseek", "pending-cancel"):
+                self.fail("request must remain behind the held execution gate")
+
+        task = asyncio.create_task(wait_for_request_slot())
+        try:
+            deadline = asyncio.get_running_loop().time() + 1
+            while not scheduler.pending_requests and not task.done():
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail("request did not register as pending")
+                await asyncio.sleep(0.005)
+            self.assertEqual(scheduler.pending_requests, {"deepseek": 1})
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(scheduler.pending_requests, {})
+        finally:
+            gate.close()
+
     async def test_new_moe_load_reserves_equal_cache_share_during_startup(self):
         resources = {name: adaptive_resource() for name in ("deepseek", "glm")}
         runtime = FakeAdaptiveRuntime(resources, capacity=150)
