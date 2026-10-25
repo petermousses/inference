@@ -156,7 +156,15 @@ grep -Fq 'llama_moe_stream_resize_cache(context.get(), resize_bytes, nullptr, nu
   "${host_root}/model-router/qualification/moe-stream-probe.cpp"
 grep -Fq 'waiting_for_quiescence' \
   "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v8/adaptive-cache.patch"
+grep -Fq 'using llama_moe_stream_progress_callback = void (*' \
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v8/adaptive-cache.patch"
+grep -Fq 'llama_moe_stream_progress_callback progress_callback = nullptr' \
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v8/adaptive-cache.patch"
 grep -Fq 'restoring_residents' \
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v12/adaptive-cache.patch"
+grep -Fq 'using llama_moe_stream_progress_callback = void (*' \
+  "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v12/adaptive-cache.patch"
+grep -Fq 'llama_moe_stream_progress_callback progress_callback = nullptr' \
   "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-deepseek41-moe-v12/adaptive-cache.patch"
 grep -Fq 'queued_loads' \
   "${host_root}/model-router/runtime-manifests/llama.cpp-d812350-moe-v8/adaptive-cache.patch"

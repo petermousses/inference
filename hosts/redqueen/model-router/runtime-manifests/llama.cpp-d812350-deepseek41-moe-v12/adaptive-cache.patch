@@ -547,7 +547,7 @@ index 9693b40..89aa506 100644
 +}
 +
 +void llama_moe_stream::resize_cache(uint64_t capacity_bytes,
-+        llama_moe_stream_resize_progress_callback progress_callback, void * progress_user_data) {
++        llama_moe_stream_progress_callback progress_callback, void * progress_user_data) {
 +    std::unique_lock<std::mutex> lock(mtx);
 +    configure_capacity_bounds();
 +    if (load_failed || shutting_down) {
@@ -807,13 +807,15 @@ diff --git a/src/llama-moe-stream.h b/src/llama-moe-stream.h
 index 06d395e..602f460 100644
 --- a/src/llama-moe-stream.h
 +++ b/src/llama-moe-stream.h
-@@ -17,7 +17,7 @@
+@@ -17,7 +17,9 @@
  #include <utility>
  #include <vector>
  
 -// Fixed expert caches for one context with one token per ubatch.
 +// Resizable expert caches for one context with one token per ubatch.
  
++using llama_moe_stream_progress_callback = void (*)(void *, const char *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
++
  struct llama_moe_stream;
  struct llama_moe_stream_info;
 @@ -89,11 +89,14 @@ struct llama_moe_stream_work {
@@ -836,7 +838,7 @@ index 06d395e..602f460 100644
      size_t host_overhead_bytes() const;
      std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
      void get_info(llama_moe_stream_info & info) const;
-+    void resize_cache(uint64_t capacity_bytes, llama_moe_stream_resize_progress_callback progress_callback = nullptr, void * progress_user_data = nullptr);
++    void resize_cache(uint64_t capacity_bytes, llama_moe_stream_progress_callback progress_callback = nullptr, void * progress_user_data = nullptr);
 +    void quarantine();
  
      uint64_t cache_budget = 0;
