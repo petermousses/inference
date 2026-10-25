@@ -403,7 +403,7 @@ index 9693b40..4636eb7 100644
      if (n_layer == 0 || n_layer > 2048 || n_slots == 0 || n_slots > 65535 || n_io_threads < 0 || n_io_threads > 18) {
          throw std::runtime_error("invalid expert stream dimensions or I/O thread count");
      }
-@@ -276,6 +281,7 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
+@@ -276,7 +281,8 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
  }
  
  void llama_moe_stream::alloc_bufs(bool no_alloc) {
@@ -412,7 +412,7 @@ index 9693b40..4636eb7 100644
      for (const auto & cache_ctx : ctxs) {
          const size_t size = ggml_backend_alloc_ctx_tensors_from_buft_size(
                  cache_ctx.ctx.get(), cache_ctx.buft);
-@@ -316,6 +322,382 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
+@@ -316,6 +322,383 @@ void llama_moe_stream::alloc_bufs(bool no_alloc) {
      }
  }
  
