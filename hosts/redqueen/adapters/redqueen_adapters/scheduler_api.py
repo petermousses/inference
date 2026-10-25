@@ -390,9 +390,17 @@ def capacity_limits(policy: dict, *, gpu_total: int, host_total: int) -> Memory:
 class ExpertCacheResizeError(RuntimeError):
     """A worker rejected an expert-cache resize over HTTP."""
 
-    def __init__(self, status_code: int):
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        reason_code: str | None = None,
+        detail: str | None = None,
+    ):
         super().__init__("expert-cache resize was not accepted")
         self.status_code = status_code
+        self.reason_code = reason_code
+        self.detail = detail
 
 
 class ExpertCacheStateError(RuntimeError):
@@ -881,7 +889,9 @@ class Runtime:
             )
             if event_name == "resize.failed":
                 if status == 503:
-                    raise ExpertCacheResizeError(status)
+                    raise ExpertCacheResizeError(
+                        status, reason_code=reason, detail=detail
+                    )
                 raise ExpertCacheStateError("resize_failed")
             if event_name == "resize.cancelled":
                 raise ExpertCacheStateError("resize_cancelled")
@@ -1701,6 +1711,12 @@ class Scheduler:
                     raise AdmissionError(503, "expert cache could not safely transfer its reservation", "cache_resize_failed") from state_error
                 self.cache_allocations[name] = info["capacity_bytes"]
                 self.cache_unready.discard(name)
+                info = dict(info)
+                info["resize_failure_signature"] = (
+                    error.status_code,
+                    error.reason_code,
+                    error.detail,
+                )
                 LOG.warning(
                     "cache_resize_rejected id=%s operation_id=%s request_id=%s model=%s phase=%s requested_bytes=%d capacity_bytes=%d status=%d pending_loads=%s pending_backing_release=%s quarantined=%s",
                     rebalance_id,
@@ -1845,6 +1861,7 @@ class Scheduler:
                     upper = target
                     growth_probes = 1
                     settled_info = info
+                    previous_failure = info.get("resize_failure_signature")
                     for _ in range(12):
                         candidate = lower + (upper - lower) // 2
                         if candidate <= lower or candidate >= upper:
@@ -1882,6 +1899,7 @@ class Scheduler:
                                         "expert cache could not safely restore its prior reservation",
                                         "cache_resize_failed",
                                     )
+                                actual = restore_info["capacity_bytes"]
                                 fits, capacity_now, unknown_now = measured_fit(
                                     name, lower, restore_phase, restore_info
                                 )
@@ -1906,6 +1924,33 @@ class Scheduler:
                                     self.cache_fallback_caps.get(name, lower),
                                 )
                                 return fits, capacity_now, unknown_now
+                            candidate_failure = candidate_info.get(
+                                "resize_failure_signature"
+                            )
+                            if (
+                                not candidate_accepted
+                                and candidate_failure == previous_failure
+                                and isinstance(candidate_failure, tuple)
+                                and len(candidate_failure) == 3
+                                and candidate_failure[1] == "runtime_resize_failed"
+                                and candidate_failure[2] not in {None, "", "-"}
+                                and actual == lower
+                            ):
+                                LOG.warning(
+                                    "cache_resize_search_stopped id=%s operation_id=%s request_id=%s model=%s phase=%s reason=repeated_allocator_failure requested_bytes=%d capacity_bytes=%d probes=%d failure_detail=%s",
+                                    rebalance_id,
+                                    last_operation_id,
+                                    request_id or "-",
+                                    name,
+                                    phase,
+                                    target,
+                                    lower,
+                                    growth_probes,
+                                    candidate_failure[2],
+                                )
+                                upper = candidate
+                                break
+                            previous_failure = candidate_failure
                             continue
 
                         if actual > lower:

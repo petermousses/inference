@@ -597,6 +597,39 @@ class SchedulerTest(unittest.IsolatedAsyncioTestCase):
             scheduler.cache_fallback_demands["deepseek"], ("deepseek", "qwen")
         )
 
+    async def test_repeated_runtime_allocation_failure_stops_growth_search(self):
+        class RuntimeWithRepeatedAllocationFailure(FakeAdaptiveRuntime):
+            async def resize_expert_cache(self, name, capacity_bytes, *, operation_id=None):
+                self.resize_calls.append((name, capacity_bytes))
+                if capacity_bytes > self.cache_capacities[name]:
+                    raise ExpertCacheResizeError(
+                        503,
+                        reason_code="runtime_resize_failed",
+                        detail="unable to allocate ROCm0 expert cache tensor blk.37.weight.stream_cache",
+                    )
+                return await super().resize_expert_cache(
+                    name, capacity_bytes, operation_id=operation_id
+                )
+
+        resources = {"deepseek": adaptive_resource()}
+        runtime = RuntimeWithRepeatedAllocationFailure(resources, capacity=100)
+        scheduler = Scheduler(
+            resources, runtime, Path(self.directory.name) / "repeated-allocation-failure-leases", self.policy
+        )
+        runtime.scheduler = scheduler
+        runtime.loaded = {"deepseek": "ready"}
+        scheduler.states = dict(runtime.loaded)
+
+        self.assertTrue(await scheduler._rebalance_caches(None, runtime.limit, Memory(0, 0)))
+
+        self.assertEqual(runtime.resize_calls, [("deepseek", 100), ("deepseek", 55)])
+        self.assertEqual(runtime.cache_capacities["deepseek"], 10)
+        self.assertEqual(scheduler.cache_fallback_caps["deepseek"], 10)
+
+        resize_calls = list(runtime.resize_calls)
+        self.assertTrue(await scheduler._rebalance_caches(None, runtime.limit, Memory(0, 0)))
+        self.assertEqual(runtime.resize_calls, resize_calls)
+
     async def test_failed_cache_growth_stops_when_physical_usage_no_longer_fits(self):
         class RuntimeWithExternalPressure(FakeAdaptiveRuntime):
             async def resize_expert_cache(self, name, capacity_bytes, *, operation_id=None):
@@ -2565,12 +2598,17 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
 
         with self.assertLogs(scheduler_api.LOG, level="INFO") as captured:
-            with self.assertRaises(ExpertCacheResizeError):
+            with self.assertRaises(ExpertCacheResizeError) as raised:
                 await runtime.resize_expert_cache(
                     "moe", limits["minimum_capacity_bytes"] + 1,
                     operation_id="a" * 32,
                 )
 
+        self.assertEqual(raised.exception.reason_code, "runtime_resize_failed")
+        self.assertEqual(
+            raised.exception.detail,
+            "std::bad_alloc: unable to commit backing",
+        )
         self.assertTrue(any(
             "event=resize.failed" in line
             and "detail=std::bad_alloc: unable to commit backing" in line
