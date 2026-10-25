@@ -1251,6 +1251,14 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             name = request.match_info["node_class"]
             return web.json_response({name: self.custom_nodes[name]} if name in self.custom_nodes else {})
         async def expert_cache(request):
+            operation_id = request.query.get("operation_id")
+            if operation_id:
+                return web.json_response({
+                    "operation_id": operation_id,
+                    "status": "completed",
+                    "status_code": 200,
+                    "result": {"reason": "resize_done"},
+                })
             if request.method == "POST":
                 payload = await request.json()
                 self.expert_cache_state["capacity_bytes"] = (
@@ -1337,6 +1345,33 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(progress["metrics_error"])
         self.assertNotIn("private request text", repr(progress))
         self.assertNotIn("private generated text", repr(progress))
+
+    async def test_resize_progress_logs_live_memory_snapshot(self):
+        self.resources["a"]["expert_cache_url"] = str(
+            self.upstream.make_url("/expert-cache")
+        )
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+        with patch.object(
+            runtime,
+            "capacity",
+            return_value=(Memory(100, 200), Memory(50, 80)),
+        ), patch("redqueen_adapters.scheduler_api.asyncio.sleep", new=AsyncMock()), self.assertLogs(
+            scheduler_api.LOG, level="INFO"
+        ) as captured:
+            await runtime._log_expert_cache_resize_progress(
+                str(self.upstream.make_url("/expert-cache")),
+                "a" * 32,
+                "a",
+                64,
+            )
+
+        self.assertTrue(any(
+            "status=completed" in line
+            and "capacity_gpu_bytes=100" in line
+            and "usage_gpu_bytes=50" in line
+            and "usage_host_bytes=80" in line
+            for line in captured.output
+        ))
 
     async def test_stalled_stream_logs_correlated_worker_progress(self):
         self.policy["heartbeat_s"] = 0.01

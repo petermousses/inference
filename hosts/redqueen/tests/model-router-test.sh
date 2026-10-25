@@ -121,6 +121,18 @@ for flag in '--moe-stream' '--moe-stream-direct' '--moe-stream-cache 4g' "--moe-
     exit 1
   fi
 done
+for model in gemma-4-26b-a4b-it qwen3.6-35b-a3b deepseek-v4.1-flash-1017-unsloth glm-5.3-flash-abliterated; do
+  concurrency_limit="$(awk -v model="${model}" '
+    $0 == "  " model ":" { in_model = 1; next }
+    /^  [^ ]/ { if (in_model) exit }
+    in_model && /concurrencyLimit:/ { print $2; exit }
+  ' "${router_config}")"
+  if [[ "${concurrency_limit}" != 2 ]]; then
+    printf 'adaptive worker %s must allow one resize progress request alongside its resize stream\n' \
+      "${model}" >&2
+    exit 1
+  fi
+done
 grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v7/bin/llama-fit-params' "${scheduler_policy}"
 grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-deepseek41-moe-v11/bin/llama-server' "${router_config}"
 grep -Fq '/srv/ai/runtimes/llama.cpp-d812350-moe-v7/bin/llama-server' "${router_config}"

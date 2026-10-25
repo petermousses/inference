@@ -115,7 +115,7 @@ models:
       --host 127.0.0.1
       --port ${PORT}
     ttl: 0
-    concurrencyLimit: 1
+    concurrencyLimit: 2
 
   qwen3.6-35b-a3b:
     cmd: >-
@@ -149,7 +149,7 @@ models:
       --host 127.0.0.1
       --port ${PORT}
     ttl: 0
-    concurrencyLimit: 1
+    concurrencyLimit: 2
 
   deepseek-v4.1-flash-1017-unsloth:
     cmd: >-
@@ -185,7 +185,7 @@ models:
       --host 127.0.0.1
       --port ${PORT}
     ttl: 0
-    concurrencyLimit: 1
+    concurrencyLimit: 2
 
   glm-5.3-flash-abliterated:
     cmd: >-
@@ -220,7 +220,7 @@ models:
       --host 127.0.0.1
       --port ${PORT}
     ttl: 0
-    concurrencyLimit: 1
+    concurrencyLimit: 2
 
   embeddinggemma-2:
     cmd: >-

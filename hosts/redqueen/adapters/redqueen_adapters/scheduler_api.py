@@ -673,6 +673,16 @@ class Runtime:
         while True:
             await asyncio.sleep(10)
             try:
+                memory_capacity, usage = self.capacity()
+                memory_fields = (
+                    f"capacity_gpu_bytes={memory_capacity.gpu} "
+                    f"capacity_host_bytes={memory_capacity.host} "
+                    f"usage_gpu_bytes={usage.gpu} "
+                    f"usage_host_bytes={usage.host}"
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                memory_fields = f"memory_snapshot_error={type(error).__name__}"
+            try:
                 async with self.session.get(
                     url,
                     params={"operation_id": operation_id},
@@ -706,21 +716,22 @@ class Runtime:
                 status_code = operation.get("status_code")
                 if isinstance(status_code, bool) or not isinstance(status_code, int):
                     status_code = 0
-                capacity = (
+                reported_capacity = (
                     result.get("capacity_bytes") if isinstance(result, dict) else None
                 )
-                if isinstance(capacity, bool) or not isinstance(capacity, int):
-                    capacity = -1
+                if isinstance(reported_capacity, bool) or not isinstance(reported_capacity, int):
+                    reported_capacity = -1
                 LOG.info(
-                    "worker_cache_resize_progress operation_id=%s model=%s status=%s status_code=%d reason=%s requested_bytes=%d reported_capacity_bytes=%d elapsed_s=%.1f",
+                    "worker_cache_resize_progress operation_id=%s model=%s status=%s status_code=%d reason=%s requested_bytes=%d reported_capacity_bytes=%d elapsed_s=%.1f %s",
                     operation_id,
                     name,
                     status,
                     status_code,
                     reason,
                     requested_capacity_bytes,
-                    capacity,
+                    reported_capacity,
                     time.monotonic() - started_at,
+                    memory_fields,
                 )
                 if status in terminal_states:
                     return
@@ -728,12 +739,13 @@ class Runtime:
                 raise
             except (aiohttp.ClientError, TimeoutError, OSError, RuntimeError, ValueError) as error:
                 LOG.warning(
-                    "worker_cache_resize_progress_unavailable operation_id=%s model=%s requested_bytes=%d elapsed_s=%.1f reason=%s",
+                    "worker_cache_resize_progress_unavailable operation_id=%s model=%s requested_bytes=%d elapsed_s=%.1f reason=%s %s",
                     operation_id,
                     name,
                     requested_capacity_bytes,
                     time.monotonic() - started_at,
                     getattr(error, "reason_code", type(error).__name__),
+                    memory_fields,
                 )
 
     async def _resume_expert_cache_resize(
