@@ -845,6 +845,12 @@ class Runtime:
             reason = payload.get("reason")
             if not isinstance(reason, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", reason):
                 reason = "none"
+            detail = payload.get("detail")
+            if not isinstance(detail, str):
+                detail = "-"
+            else:
+                detail = "".join(character for character in detail if character.isprintable())
+                detail = " ".join(detail.split())[:256] or "-"
             safe_event_name = (
                 event_name
                 if re.fullmatch(r"[a-z0-9_.-]{1,80}", event_name)
@@ -860,12 +866,13 @@ class Runtime:
             pending_release = payload.get("pending_backing_release")
             quarantined = payload.get("quarantined")
             LOG.info(
-                "worker_cache_resize_event operation_id=%s model=%s event=%s status=%d reason=%s requested_bytes=%d reported_capacity_bytes=%d pending_loads=%s pending_backing_release=%s quarantined=%s",
+                "worker_cache_resize_event operation_id=%s model=%s event=%s status=%d reason=%s detail=%s requested_bytes=%d reported_capacity_bytes=%d pending_loads=%s pending_backing_release=%s quarantined=%s",
                 operation_id,
                 name,
                 safe_event_name,
                 status,
                 reason,
+                detail,
                 requested_capacity_bytes,
                 actual,
                 pending_loads if isinstance(pending_loads, int) else "unknown",

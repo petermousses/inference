@@ -3,7 +3,7 @@ set -euo pipefail
 umask 0027
 
 readonly revision=d81235049384534c167caea52b85a694f6103d14
-readonly runtime=llama.cpp-d812350-deepseek41-moe-v13
+readonly runtime=llama.cpp-d812350-deepseek41-moe-v14
 readonly target="/srv/ai/runtimes/${runtime}"
 readonly repository=https://github.com/ggml-org/llama.cpp.git
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"

@@ -1284,6 +1284,7 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.api_ready = False
         self.expert_cache_state = {}
         self.expert_cache_post_capacity = None
+        self.expert_cache_resize_failure = None
         self.progress_slots = []
         self.progress_metrics = ""
         self.custom_nodes = {}
@@ -1348,6 +1349,21 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
                 })
             if request.method == "POST":
                 payload = await request.json()
+                if self.expert_cache_resize_failure is not None:
+                    event_payload = {
+                        "operation_id": payload.get("operation_id"),
+                        "reason": "runtime_resize_failed",
+                        "detail": self.expert_cache_resize_failure,
+                        "status_code": 503,
+                    }
+                    response = web.StreamResponse(
+                        headers={"Content-Type": "text/event-stream"}
+                    )
+                    await response.prepare(request)
+                    await response.write(
+                        f"event: resize.failed\ndata: {json.dumps(event_payload)}\n\n".encode()
+                    )
+                    return response
                 self.expert_cache_state["capacity_bytes"] = (
                     self.expert_cache_post_capacity
                     if self.expert_cache_post_capacity is not None
@@ -2530,6 +2546,36 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         info = await runtime.resize_expert_cache("moe", 30)
 
         self.assertEqual(info["capacity_bytes"], 35)
+
+    async def test_resize_failure_logs_backend_detail_without_newlines(self):
+        limits = adaptive_resource()["adaptive_cache"]
+        self.resources["moe"] = adaptive_resource()
+        self.resources["moe"].update(
+            expert_cache_url=str(self.upstream.make_url("/expert-cache")),
+            expert_cache_resize_events=True,
+            health_url=str(self.upstream.make_url("/health")),
+        )
+        self.expert_cache_state = {
+            **limits,
+            "capacity_bytes": limits["minimum_capacity_bytes"],
+            "pending_backing_release": False,
+            "quarantined": False,
+        }
+        self.expert_cache_resize_failure = "std::bad_alloc:\n \x1bunable to commit backing"
+        runtime = Runtime(self.policy, self.resources, self.client.session, "secret")
+
+        with self.assertLogs(scheduler_api.LOG, level="INFO") as captured:
+            with self.assertRaises(ExpertCacheResizeError):
+                await runtime.resize_expert_cache(
+                    "moe", limits["minimum_capacity_bytes"] + 1,
+                    operation_id="a" * 32,
+                )
+
+        self.assertTrue(any(
+            "event=resize.failed" in line
+            and "detail=std::bad_alloc: unable to commit backing" in line
+            for line in captured.output
+        ))
 
     async def test_comfy_start_command_waits_past_systemd_readiness_deadline(self):
         self.resources["comfyui"].update(
