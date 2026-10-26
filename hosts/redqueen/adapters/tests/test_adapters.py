@@ -408,6 +408,7 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
 
         unknown = __import__("aiohttp").FormData()
         unknown.add_field("prompt", "make it blue")
+        unknown.add_field("size", "512x512")
         unknown.add_field("disable_fallbacks", "true")
         unknown.add_field("extra_headers", "must-not-be-logged")
         unknown.add_field(
