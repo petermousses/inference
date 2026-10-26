@@ -58,9 +58,6 @@ IMAGE_REQUEST_FIELDS = frozenset(
         "size",
         "quality",
         "background",
-        "response_format",
-        "seed",
-        "user",
     }
 )
 LOG = logging.getLogger("redqueen.image")
@@ -194,8 +191,6 @@ def normalize_request(
     background = payload.get("background", "auto")
     if not isinstance(background, str) or background not in BACKGROUNDS:
         raise ValueError(f"background must be one of {', '.join(sorted(BACKGROUNDS))}")
-    if payload.get("response_format", "b64_json") != "b64_json":
-        raise ValueError("only response_format=b64_json is supported")
     normalized = {
         "model": model,
         "prompt": _text(payload.get("prompt"), "prompt"),
@@ -204,10 +199,7 @@ def normalize_request(
         "background": background,
         "seed": _integer(payload.get("seed", secrets.randbits(63)), "seed"),
         "n": 1,
-        "response_format": "b64_json",
     }
-    if "user" in payload:
-        normalized["user"] = _text(payload["user"], "user", maximum=256)
     return normalized
 
 

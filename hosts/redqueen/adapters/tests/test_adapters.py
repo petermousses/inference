@@ -212,29 +212,26 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
                 "size": "1024x1024",
                 "quality": "high",
                 "background": "transparent",
-                "seed": 42,
                 "n": 1,
-                "response_format": "b64_json",
             },
         )
         self.assertEqual(response.status, 200)
         body = await response.json()
         self.assertEqual(base64.b64decode(body["data"][0]["b64_json"]), png())
         self.assertEqual(
-            backend.requests,
-            [
-                {
-                    "model": "qwen-image-2.1",
-                    "prompt": "a red cube",
-                    "size": "1024x1024",
-                    "quality": "high",
-                    "background": "transparent",
-                    "seed": 42,
-                    "n": 1,
-                    "response_format": "b64_json",
-                }
-            ],
+            {key: value for key, value in backend.requests[0].items() if key != "seed"},
+            {
+                "model": "qwen-image-2.1",
+                "prompt": "a red cube",
+                "size": "1024x1024",
+                "quality": "high",
+                "background": "transparent",
+                "n": 1,
+            },
         )
+        self.assertIsInstance(backend.requests[0]["seed"], int)
+        self.assertGreaterEqual(backend.requests[0]["seed"], 0)
+        self.assertLessEqual(backend.requests[0]["seed"], 2**63 - 1)
 
     async def test_image_generation_rejects_unsupported_or_oversized_input(
         self,
@@ -245,9 +242,7 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
         for payload in (
             {"prompt": "x", "n": 2},
             {"prompt": "x", "size": "640x640"},
-            {"prompt": "x", "response_format": "url"},
             {"prompt": "x", "model": "arbitrary"},
-            {"prompt": "x", "seed": 1.5},
             {"prompt": "x" * 10_001},
         ):
             with self.subTest(payload=payload):
@@ -273,6 +268,10 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
                     "size": "1024x1024",
                     "disable_fallbacks": True,
                     "extra_headers": {"x-private-token": "must-not-be-logged"},
+                    "seed": "must-not-be-logged-seed",
+                    "response_format": "url",
+                    "user": "private-user-value",
+                    "safety_identifier": "private-safety-value",
                 },
             )
 
@@ -281,10 +280,21 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(backend.requests[0]["prompt"], "a red cube")
         self.assertNotIn("disable_fallbacks", backend.requests[0])
         self.assertNotIn("extra_headers", backend.requests[0])
+        self.assertNotIn("response_format", backend.requests[0])
+        self.assertNotIn("user", backend.requests[0])
+        self.assertNotIn("safety_identifier", backend.requests[0])
+        self.assertIsInstance(backend.requests[0]["seed"], int)
+        self.assertNotEqual(backend.requests[0]["seed"], "must-not-be-logged-seed")
         log_output = "\n".join(captured.output)
         self.assertIn("disable_fallbacks", log_output)
         self.assertIn("extra_headers", log_output)
+        self.assertIn("response_format", log_output)
+        self.assertIn("user", log_output)
+        self.assertIn("safety_identifier", log_output)
+        self.assertIn("seed", log_output)
         self.assertNotIn("must-not-be-logged", log_output)
+        self.assertNotIn("private-user-value", log_output)
+        self.assertNotIn("private-safety-value", log_output)
 
     async def test_image_model_catalog_contains_both_fixed_backends(self) -> None:
         client = await self.client(
@@ -309,7 +319,6 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
             "model": "qwen-image-2.1",
             "prompt": "make it green",
             "size": "512x512",
-            "response_format": "b64_json",
         }
         data = __import__("aiohttp").FormData()
         for key, value in form.items():
@@ -411,6 +420,7 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
         unknown.add_field("size", "512x512")
         unknown.add_field("disable_fallbacks", "true")
         unknown.add_field("extra_headers", "must-not-be-logged")
+        unknown.add_field("response_format", "url")
         unknown.add_field(
             "image[]", png((64, 64)), filename="one.png", content_type="image/png"
         )
@@ -427,6 +437,7 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
         log_output = "\n".join(captured.output)
         self.assertIn("disable_fallbacks", log_output)
         self.assertIn("extra_headers", log_output)
+        self.assertIn("response_format", log_output)
         self.assertIn("image[0]", log_output)
         self.assertNotIn("must-not-be-logged", log_output)
 
