@@ -256,6 +256,36 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(response.status, 400)
 
+    async def test_image_generation_drops_unknown_fields_without_logging_values(
+        self,
+    ) -> None:
+        backend = FakeImageBackend()
+        client = await self.client(
+            create_image_app(ImageSettings(api_key=TOKEN), backend)
+        )
+        with self.assertLogs("redqueen.image", level="INFO") as captured:
+            response = await client.post(
+                "/v1/images/generations",
+                headers=self.auth(),
+                json={
+                    "model": "qwen-image-2.1",
+                    "prompt": "a red cube",
+                    "size": "1024x1024",
+                    "disable_fallbacks": True,
+                    "extra_headers": {"x-private-token": "must-not-be-logged"},
+                },
+            )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(backend.requests), 1)
+        self.assertEqual(backend.requests[0]["prompt"], "a red cube")
+        self.assertNotIn("disable_fallbacks", backend.requests[0])
+        self.assertNotIn("extra_headers", backend.requests[0])
+        log_output = "\n".join(captured.output)
+        self.assertIn("disable_fallbacks", log_output)
+        self.assertIn("extra_headers", log_output)
+        self.assertNotIn("must-not-be-logged", log_output)
+
     async def test_image_model_catalog_contains_both_fixed_backends(self) -> None:
         client = await self.client(
             create_image_app(ImageSettings(api_key=TOKEN), FakeImageBackend())
@@ -378,15 +408,26 @@ class AdapterTestCase(unittest.IsolatedAsyncioTestCase):
 
         unknown = __import__("aiohttp").FormData()
         unknown.add_field("prompt", "make it blue")
+        unknown.add_field("disable_fallbacks", "true")
+        unknown.add_field("extra_headers", "must-not-be-logged")
         unknown.add_field(
-            "image[0]", png((64, 64)), filename="one.png", content_type="image/png"
+            "image[]", png((64, 64)), filename="one.png", content_type="image/png"
         )
-        response = await client.post(
-            "/v1/images/edits", headers=self.auth(), data=unknown
+        unknown.add_field(
+            "image[0]", jpeg(), filename="ignored.jpg", content_type="image/jpeg"
         )
-        self.assertEqual(response.status, 400)
-        self.assertIn("unsupported multipart field", (await response.json())["error"]["message"])
-        self.assertEqual(len(backend.requests), 1)
+        with self.assertLogs("redqueen.image", level="INFO") as captured:
+            response = await client.post(
+                "/v1/images/edits", headers=self.auth(), data=unknown
+            )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(backend.requests), 2)
+        self.assertEqual(len(backend.requests[1]["images"]), 1)
+        log_output = "\n".join(captured.output)
+        self.assertIn("disable_fallbacks", log_output)
+        self.assertIn("extra_headers", log_output)
+        self.assertIn("image[0]", log_output)
+        self.assertNotIn("must-not-be-logged", log_output)
 
     async def test_image_output_contract_rejects_wrong_size_or_alpha(self) -> None:
         class BadBackend(FakeImageBackend):

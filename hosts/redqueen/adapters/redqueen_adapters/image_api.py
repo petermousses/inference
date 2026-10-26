@@ -50,6 +50,19 @@ MAX_REFERENCE_PIXELS = 16_777_216
 MAX_CLEANUP_ENTRIES = 256
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp"}
 IMAGE_FORMATS = {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}
+IMAGE_REQUEST_FIELDS = frozenset(
+    {
+        "model",
+        "prompt",
+        "n",
+        "size",
+        "quality",
+        "background",
+        "response_format",
+        "seed",
+        "user",
+    }
+)
 LOG = logging.getLogger("redqueen.image")
 _OWNED: contextvars.ContextVar[OwnedRequest | None] = contextvars.ContextVar("image_request", default=None)
 
@@ -140,23 +153,32 @@ def _integer(value: object, field: str) -> int:
     return parsed
 
 
-def normalize_request(payload: dict, *, edit: bool) -> dict:
+def _drop_unsupported_fields(
+    payload: dict, *, route: str, request_id: str
+) -> dict:
+    unsupported = sorted(set(payload) - IMAGE_REQUEST_FIELDS)
+    if unsupported:
+        LOG.info(
+            "image_request_fields_dropped request_id=%s route=%s fields=%s",
+            request_id,
+            route,
+            ",".join(unsupported),
+        )
+    return {
+        key: value for key, value in payload.items() if key in IMAGE_REQUEST_FIELDS
+    }
+
+
+def normalize_request(
+    payload: dict, *, edit: bool, request_id: str = "-"
+) -> dict:
     if not isinstance(payload, dict):
         raise ValueError("request body must be a JSON object")
-    allowed = {
-        "model",
-        "prompt",
-        "n",
-        "size",
-        "quality",
-        "background",
-        "response_format",
-        "seed",
-        "user",
-    }
-    unknown = sorted(set(payload) - allowed)
-    if unknown:
-        raise ValueError(f"unsupported fields: {', '.join(unknown)}")
+    payload = _drop_unsupported_fields(
+        payload,
+        route="edit" if edit else "generation",
+        request_id=request_id,
+    )
     model = payload.get("model", MODEL)
     if model not in SUPPORTED_MODELS:
         raise ValueError(f"model must be one of {', '.join(SUPPORTED_MODELS)}")
@@ -262,6 +284,7 @@ async def parse_edit(request: web.Request) -> tuple[dict, list[tuple[str, bytes,
         raise ValueError("image edits require multipart/form-data")
     fields: dict[str, object] = {}
     images: list[tuple[str, bytes, str]] = []
+    unsupported_fields: set[str] = set()
     reader = await request.multipart()
     async for part in reader:
         if not isinstance(part, BodyPartReader):
@@ -283,17 +306,7 @@ async def parse_edit(request: web.Request) -> tuple[dict, list[tuple[str, bytes,
             images.append(
                 (part.filename or f"image-{len(images) + 1}", data, content_type)
             )
-        elif part.name in {
-            "model",
-            "prompt",
-            "n",
-            "size",
-            "quality",
-            "background",
-            "response_format",
-            "seed",
-            "user",
-        }:
+        elif part.name in IMAGE_REQUEST_FIELDS:
             if part.name in fields:
                 raise ValueError(f"duplicate field: {part.name}")
             data = await _read_bounded_part(part, MAX_TEXT_FIELD_BYTES, part.name)
@@ -302,10 +315,19 @@ async def parse_edit(request: web.Request) -> tuple[dict, list[tuple[str, bytes,
             except (LookupError, UnicodeDecodeError) as error:
                 raise ValueError(f"{part.name} must be valid text") from error
         else:
-            raise ValueError(f"unsupported multipart field: {part.name}")
+            await part.release()
+            if part.name:
+                unsupported_fields.add(part.name)
     if not images:
         raise ValueError("at least one reference image is required")
-    return normalize_request(fields, edit=True), images
+    request_id = request.get("request_id", "-")
+    if unsupported_fields:
+        LOG.info(
+            "image_request_fields_dropped request_id=%s route=edit fields=%s",
+            request_id,
+            ",".join(sorted(unsupported_fields)),
+        )
+    return normalize_request(fields, edit=True, request_id=request_id), images
 
 
 class ComfyBackend:
@@ -851,7 +873,9 @@ def create_image_app(
 
     async def generations(request: web.Request) -> web.Response:
         payload = await read_json(request)
-        normalized = normalize_request(payload, edit=False)
+        normalized = normalize_request(
+            payload, edit=False, request_id=request.get("request_id", "-")
+        )
         return await run_job(lambda: actual_backend.generate(normalized), normalized)
 
     async def edits(request: web.Request) -> web.Response:
