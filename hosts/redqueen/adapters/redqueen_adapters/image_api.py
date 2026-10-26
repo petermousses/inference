@@ -892,6 +892,7 @@ def create_image_app(
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="10.9.20.242")
     parser.add_argument("--port", type=int, default=8190)
