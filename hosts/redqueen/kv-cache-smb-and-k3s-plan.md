@@ -1,5 +1,23 @@
 # glm kv cache on omv smb and redqueen k3s placement plan
 
+## tainted-node onboarding gate
+
+redqueen stays outside k3s until the host/runtime, reboot-recovery, and mixed-load acceptance gates in the [AI inference plan](https://github.com/petermousses/kubernetes/blob/d4d5ed1ccc353359f4f8a10b1be8836d724146f2/AI_INFERENCE_PLAN.md) pass. when admitted, it joins as a **k3s agent** for host-managed inference support; do not deploy GPU Operator, claim GPU resources, or schedule inference engines in Pods.
+
+do not join or enable redqueen or other additional nodes during NAS-backed volume migration stages 1–3. finish those stages and obtain the NAS plan's explicit approval before making nodes available. the `litellm` backup/restore row is still pending: complete and verify its backup and isolated restore before moving the gateway. after stage 3, moving each workload still needs its own explicit approval; this plan proposes LiteLLM as a follow-on and does not itself grant that approval. see the [NAS migration plan](https://github.com/petermousses/kubernetes/blob/d4d5ed1ccc353359f4f8a10b1be8836d724146f2/nas-backed-volume-migration-plan.md).
+
+after those gates and approval, label and taint the joined agent as defined by the AI inference plan:
+
+```sh
+kubectl label node <redqueen-node> \
+  ai.mousses.xyz/accelerator=strix-halo \
+  node-role.kubernetes.io/ai=true
+kubectl taint node <redqueen-node> \
+  ai.mousses.xyz/inference=true:NoSchedule
+```
+
+only explicitly approved monitoring agents and, after its separate move approval, the LiteLLM gateway may tolerate this taint. tolerations permit scheduling but do not select redqueen, so LiteLLM also needs required node affinity or a node selector for the AI label. keep ordinary workloads repelled.
+
 ## status and scope
 
 this is a proposal, not a deployment record. it does not authorize joining redqueen, creating an smb share, changing host services, moving the litellm pod, or changing the database.
@@ -73,24 +91,7 @@ benchmark cold prefill, warm in-memory prefix reuse, and SMB restore separately 
 
 ## phase 4 — satisfy cluster and migration gates
 
-do not begin node enrollment or LiteLLM placement changes until all of these hold:
-
-1. the NAS backup plan's stages 1–3 are complete, including LiteLLM's initial backup and isolated restore; obtain the plan's explicit approval before making other nodes available.
-2. all applicable Redqueen host/runtime, reboot, and mixed-load exit criteria in `AI_INFERENCE_PLAN.md` pass. preserve its GPU policy: no AMD GPU Operator, no GPU resource claims, and no inference engine Pods.
-3. validate the K3s agent version, Redqueen node IP/hostname, cluster join path, Pod-CIDR routing, firewall rules, node allocatable resources, and monitoring agents before joining. transfer the agent join token through a private owner-managed path; never put it in Git.
-4. reserve the LiteLLM Pod's actual CPU and memory use in Redqueen's host budget. its current Kubernetes request and limit are 1 CPU and 4 GiB; account for the K3s agent and host scheduler before admitting GPU workloads.
-
-join redqueen as an **agent**, then apply the existing labels and taint from `AI_INFERENCE_PLAN.md` (replace the placeholder with the node's verified Kubernetes name):
-
-```sh
-kubectl label node <redqueen-node> \
-  ai.mousses.xyz/accelerator=strix-halo \
-  node-role.kubernetes.io/ai=true
-kubectl taint node <redqueen-node> \
-  ai.mousses.xyz/inference=true:NoSchedule
-```
-
-allow only approved monitoring agents and the LiteLLM gateway to tolerate that exact taint. require LiteLLM node affinity/selector for the AI label as well as the toleration; leave all unrelated workloads repelled. keep inference processes host-managed and keep raw host API ports private to the cluster/host firewall allowlist.
+the onboarding and NAS sequencing gates at the beginning of this plan are mandatory. before joining, validate the K3s agent version, Redqueen node IP/hostname, cluster join path, Pod-CIDR routing, firewall rules, node allocatable resources, and monitoring agents. transfer the agent join token through a private owner-managed path; never put it in Git. reserve the LiteLLM Pod's actual CPU and memory use in Redqueen's host budget: its current Kubernetes request and limit are 1 CPU and 4 GiB, in addition to the K3s agent and host scheduler. after approval, join redqueen as an agent and apply the labels and taint defined in the opening section. keep raw host API ports private to the cluster/host firewall allowlist.
 
 ## phase 5 — move the LiteLLM gateway, not its database
 
